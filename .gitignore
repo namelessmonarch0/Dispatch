@@ -13,3 +13,4 @@ vendor/libghostty-vt/.zig-cache/
 
 # Zig fetches dependencies into the vendored tree on first build
 vendor/libghostty-vt/zig-pkg/
+vendor/libghostty-vt/zig-out/

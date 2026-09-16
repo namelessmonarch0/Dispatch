@@ -89,9 +89,19 @@ fn main() {
     let target = env::var("TARGET").expect("TARGET is always set");
     let zig = env::var("ZIG").unwrap_or_else(|_| "zig".into());
 
+    // Zig installs into `zig-out` inside the source tree by default. That
+    // directory is shared by every target, so building for two of them (a host
+    // test run plus a Windows cross-build, say) has each overwrite the other's
+    // libghostty-vt.a. OUT_DIR is unique per target and per crate, so install
+    // there instead and link from there.
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is always set"));
+    let prefix = out_dir.join("libghostty-vt");
+
     let mut command = Command::new(&zig);
     command
         .arg("build")
+        .arg("--prefix")
+        .arg(&prefix)
         .arg("-Demit-lib-vt")
         .arg(format!("-Doptimize={optimize}"))
         .arg(format!("-Dsimd={simd}"))
@@ -127,7 +137,7 @@ fn main() {
          matching binary."
     );
 
-    let lib_dir = vendored.join("zig-out/lib");
+    let lib_dir = prefix.join("lib");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
 
     // Zig emits both a static archive and a dylib into the same directory. On
@@ -141,8 +151,5 @@ fn main() {
     } else {
         println!("cargo:rustc-link-lib=static=ghostty-vt");
     }
-    println!(
-        "cargo:include={}",
-        vendored.join("zig-out/include").display()
-    );
+    println!("cargo:include={}", prefix.join("include").display());
 }
