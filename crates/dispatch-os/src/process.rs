@@ -167,9 +167,10 @@ mod tests {
 
     /// Spawns a shell that is its own session leader and forks a grandchild.
     ///
-    /// Returns `(child_pid, grandchild_pid)`. The grandchild is what makes this
-    /// test worth having: killing the shell alone would leave it running.
-    fn spawn_tree_with_grandchild(pid_file: &std::path::Path) -> (u32, u32) {
+    /// Returns the shell's [`Child`] plus the grandchild's pid. The grandchild
+    /// is what makes this test worth having: killing the shell alone would
+    /// leave it running.
+    fn spawn_tree_with_grandchild(pid_file: &std::path::Path) -> (std::process::Child, u32) {
         let script = format!("sleep 30 & echo $! > {}; sleep 30", pid_file.display());
 
         let mut command = Command::new("sh");
@@ -191,23 +192,24 @@ mod tests {
             });
         }
 
-        let child = command.spawn().expect("sh is available");
-        let child_pid = child.id();
+        let mut child = command.spawn().expect("sh is available");
 
         // Wait for the shell to record the grandchild's pid.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the shell never wrote the grandchild pid"
-            );
+        while std::time::Instant::now() < deadline {
             if let Ok(contents) = std::fs::read_to_string(pid_file)
                 && let Ok(pid) = contents.trim().parse::<u32>()
             {
-                return (child_pid, pid);
+                return (child, pid);
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+
+        // Do not leak the shell into the rest of the suite just because the
+        // setup step failed.
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the shell never wrote the grandchild pid");
     }
 
     #[test]
@@ -216,16 +218,15 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir is writable");
         let pid_file = dir.join("grandchild.pid");
 
-        let (child, grandchild) = spawn_tree_with_grandchild(&pid_file);
-        assert!(pid_is_alive(child), "the shell should be running");
+        let (mut child, grandchild) = spawn_tree_with_grandchild(&pid_file);
+        let child_pid = child.id();
+        assert!(pid_is_alive(child_pid), "the shell should be running");
         assert!(pid_is_alive(grandchild), "the grandchild should be running");
 
-        terminate_tree(child, DEFAULT_GRACE).expect("terminating the tree succeeds");
+        terminate_tree(child_pid, DEFAULT_GRACE).expect("terminating the tree succeeds");
 
         // Reap the shell so it does not linger as a zombie and report alive.
-        // SAFETY: waitpid writes only through the null status pointer it is
-        // given, which it is documented to accept.
-        unsafe { libc::waitpid(child as libc::pid_t, std::ptr::null_mut(), 0) };
+        child.wait().expect("the shell can be reaped");
 
         assert!(
             !pid_is_alive(grandchild),
@@ -237,12 +238,12 @@ mod tests {
 
     #[test]
     fn terminating_an_exited_tree_succeeds() {
-        let child = Command::new("true").spawn().expect("true is available");
+        let mut child = Command::new("true").spawn().expect("true is available");
         let pid = child.id();
 
-        // SAFETY: reaping the child before asking for its group to be killed
-        // is what makes this the "already gone" case.
-        unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) };
+        // Reaping the child before asking for its group to be killed is what
+        // makes this the "already gone" case.
+        child.wait().expect("true can be reaped");
 
         terminate_tree(pid, DEFAULT_GRACE).expect("a tree that has already exited is not an error");
     }
