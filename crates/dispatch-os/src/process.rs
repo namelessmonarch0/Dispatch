@@ -24,6 +24,12 @@ pub enum ProcessError {
 /// How long a tree is given to exit on its own before it is killed outright.
 pub const DEFAULT_GRACE: Duration = Duration::from_millis(250);
 
+/// How long to wait for a tree to disappear after it has been killed outright.
+///
+/// Only bounds the wait; a process that ignores SIGKILL is stuck in the
+/// kernel and no amount of waiting will change that.
+const KILL_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Terminates `pid` and every process in its group or job.
 ///
 /// Asks politely first, waits up to `grace`, then kills what is left. A tree
@@ -35,7 +41,7 @@ pub fn terminate_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
 
 #[cfg(unix)]
 mod imp {
-    use super::{Duration, ProcessError};
+    use super::{Duration, KILL_TIMEOUT, ProcessError};
 
     /// Sends `signal` to the process group led by `pid`.
     ///
@@ -68,6 +74,22 @@ mod imp {
         matches!(signal_group(pid, 0), Ok(true))
     }
 
+    /// Polls until the group has no members, or `timeout` elapses.
+    ///
+    /// Returns whether the group is gone.
+    fn wait_for_group_to_exit(pid: u32, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if !group_is_alive(pid) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     pub(super) fn terminate_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
         let map = |source| ProcessError::Terminate { pid, source };
 
@@ -78,15 +100,17 @@ mod imp {
         // Poll rather than sleep the whole grace period: a well-behaved agent
         // exits in a few milliseconds and the caller is closing a pane, which
         // should feel immediate.
-        let deadline = std::time::Instant::now() + grace;
-        while std::time::Instant::now() < deadline {
-            if !group_is_alive(pid) {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(10));
+        if wait_for_group_to_exit(pid, grace) {
+            return Ok(());
         }
 
         signal_group(pid, libc::SIGKILL).map_err(map)?;
+
+        // SIGKILL is delivered asynchronously, so returning here would let the
+        // caller observe a process that is dead but not yet torn down. Callers
+        // close a pane expecting the tree to be gone, so wait for it.
+        wait_for_group_to_exit(pid, KILL_TIMEOUT);
+
         Ok(())
     }
 }

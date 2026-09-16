@@ -138,7 +138,6 @@ fn main() {
     );
 
     let lib_dir = prefix.join("lib");
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
 
     // Zig names its output by the target's own convention -- libghostty-vt.a
     // on Unix, ghostty-vt-static.lib on Windows -- and puts a shared library
