@@ -19,6 +19,15 @@ brew install zig        # macOS
 cargo build --workspace
 ```
 
+The first build runs `zig build` against `vendor/libghostty-vt`, which fetches
+Zig dependencies into `vendor/libghostty-vt/zig-pkg/` (gitignored) and needs
+network access. For an offline or hermetic build, point Zig at a pre-fetched
+package set:
+
+```sh
+LIBGHOSTTY_VT_ZIG_SYSTEM_DIR=/path/to/packages cargo build --workspace
+```
+
 On Windows, build for the GNU ABI so Zig supplies its own MinGW libc and no
 Visual Studio install is needed:
 

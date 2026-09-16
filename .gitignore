@@ -10,3 +10,6 @@ vendor/libghostty-vt/.zig-cache/
 **/*.snap.new
 
 .DS_Store
+
+# Zig fetches dependencies into the vendored tree on first build
+vendor/libghostty-vt/zig-pkg/

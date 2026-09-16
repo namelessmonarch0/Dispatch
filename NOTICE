@@ -23,7 +23,10 @@ Copyright the herdr authors, licensed under the Apache License, Version 2.0.
 Derived files retain their original Apache-2.0 headers and are listed here as
 they are added:
 
-  (none yet)
+  crates/dispatch-pty/build.rs
+      The Zig build invocation, Rust-to-Zig target mapping, boolean environment
+      parsing, and the LIBGHOSTTY_VT_ZIG_SYSTEM_DIR offline-build escape hatch
+      are derived from herdr's build.rs.
 
 You may obtain a copy of the Apache License at
 http://www.apache.org/licenses/LICENSE-2.0
