@@ -141,22 +141,36 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
 
     // Zig emits a static library and a shared library side by side, and names
-    // them differently per platform.
-    if target.contains("apple-darwin") {
-        // Both are in one directory and a plain `-l ghostty-vt` resolves to
-        // the dylib, which is then not found at run time. Name the archive.
-        println!(
-            "cargo:rustc-link-arg={}",
-            lib_dir.join("libghostty-vt.a").display()
-        );
-    } else if target.contains("windows") {
-        // On Windows the static library is `ghostty-vt-static.lib`;
-        // `ghostty-vt.lib` is the import library for `ghostty-vt.dll`. Linking
-        // `ghostty-vt` would pick the import library and require the DLL
-        // alongside the binary at run time.
-        println!("cargo:rustc-link-lib=static=ghostty-vt-static");
-    } else {
-        println!("cargo:rustc-link-lib=static=ghostty-vt");
-    }
+    // them by the target's own convention: libghostty-vt.a on Unix,
+    // ghostty-vt-static.lib on Windows. Neither matches what `-l static=NAME`
+    // would look for on every host, so name the archive by path instead.
+    //
+    // This also avoids two traps. On macOS a plain `-l ghostty-vt` resolves to
+    // the dylib sitting beside the archive, which is then missing at run time.
+    // On Windows `ghostty-vt.lib` is the import library for ghostty-vt.dll,
+    // so linking by that name would require shipping the DLL.
+    const STATIC_LIB_NAMES: &[&str] = &["libghostty-vt.a", "ghostty-vt-static.lib"];
+
+    let archive = STATIC_LIB_NAMES
+        .iter()
+        .map(|name| lib_dir.join(name))
+        .find(|path| path.exists())
+        .unwrap_or_else(|| {
+            let found: Vec<_> = std::fs::read_dir(&lib_dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            panic!(
+                "no libghostty-vt static archive in {}\n\
+                 looked for: {STATIC_LIB_NAMES:?}\n\
+                 found: {found:?}",
+                lib_dir.display()
+            );
+        });
+
+    println!("cargo:rustc-link-arg={}", archive.display());
+
     println!("cargo:include={}", prefix.join("include").display());
 }
