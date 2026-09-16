@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Vendored Zig build artifacts
+vendor/libghostty-vt/zig-out/
+vendor/libghostty-vt/.zig-cache/
+
+# Snapshot test rejects
+**/*.snap.new
+
+.DS_Store

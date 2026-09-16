@@ -1,0 +1,29 @@
+Dispatch
+Copyright 2026 The Dispatch Authors
+
+This product includes software developed as part of other projects.
+
+--------------------------------------------------------------------------------
+libghostty-vt
+--------------------------------------------------------------------------------
+vendor/libghostty-vt/ contains a pinned copy of libghostty-vt from the Ghostty
+project (https://github.com/ghostty-org/ghostty), used as the terminal state
+engine and VT parser. It is built from source at compile time and statically
+linked.
+
+Licensed under the MIT License. See vendor/libghostty-vt/LICENSE for the full
+text and the vendored VERSION file for the exact revision.
+
+--------------------------------------------------------------------------------
+herdr
+--------------------------------------------------------------------------------
+Portions of this product are derived from herdr (https://github.com/rksm/herdr),
+Copyright the herdr authors, licensed under the Apache License, Version 2.0.
+
+Derived files retain their original Apache-2.0 headers and are listed here as
+they are added:
+
+  (none yet)
+
+You may obtain a copy of the Apache License at
+http://www.apache.org/licenses/LICENSE-2.0
