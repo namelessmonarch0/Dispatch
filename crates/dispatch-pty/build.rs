@@ -140,14 +140,21 @@ fn main() {
     let lib_dir = prefix.join("lib");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
 
-    // Zig emits both a static archive and a dylib into the same directory. On
-    // macOS a plain `-l ghostty-vt` resolves to the dylib, which then is not
-    // found at run time, so name the archive directly.
+    // Zig emits a static library and a shared library side by side, and names
+    // them differently per platform.
     if target.contains("apple-darwin") {
+        // Both are in one directory and a plain `-l ghostty-vt` resolves to
+        // the dylib, which is then not found at run time. Name the archive.
         println!(
             "cargo:rustc-link-arg={}",
             lib_dir.join("libghostty-vt.a").display()
         );
+    } else if target.contains("windows") {
+        // On Windows the static library is `ghostty-vt-static.lib`;
+        // `ghostty-vt.lib` is the import library for `ghostty-vt.dll`. Linking
+        // `ghostty-vt` would pick the import library and require the DLL
+        // alongside the binary at run time.
+        println!("cargo:rustc-link-lib=static=ghostty-vt-static");
     } else {
         println!("cargo:rustc-link-lib=static=ghostty-vt");
     }
