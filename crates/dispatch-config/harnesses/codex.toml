@@ -1,0 +1,20 @@
+id = "codex"
+display_name = "Codex"
+command = "codex"
+args = []
+
+[platform.windows]
+command = "cmd.exe"
+args = ["/c", "codex"]
+
+[[settings]]
+key = "model"
+label = "Model"
+kind = "text"
+
+[[settings]]
+key = "effort"
+label = "Reasoning effort"
+kind = "choice"
+options = ["low", "medium", "high"]
+default = "medium"

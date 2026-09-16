@@ -1,0 +1,13 @@
+id = "opencode"
+display_name = "opencode"
+command = "opencode"
+args = []
+
+[platform.windows]
+command = "cmd.exe"
+args = ["/c", "opencode"]
+
+[[settings]]
+key = "model"
+label = "Model"
+kind = "text"
