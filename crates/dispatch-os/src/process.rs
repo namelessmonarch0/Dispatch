@@ -24,12 +24,6 @@ pub enum ProcessError {
 /// How long a tree is given to exit on its own before it is killed outright.
 pub const DEFAULT_GRACE: Duration = Duration::from_millis(250);
 
-/// How long to wait for a tree to disappear after it has been killed outright.
-///
-/// Only bounds the wait; a process that ignores SIGKILL is stuck in the
-/// kernel and no amount of waiting will change that.
-const KILL_TIMEOUT: Duration = Duration::from_secs(2);
-
 /// Terminates `pid` and every process in its group or job.
 ///
 /// Asks politely first, waits up to `grace`, then kills what is left. A tree
@@ -41,7 +35,14 @@ pub fn terminate_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
 
 #[cfg(unix)]
 mod imp {
-    use super::{Duration, KILL_TIMEOUT, ProcessError};
+    use super::{Duration, ProcessError};
+
+    /// How long to wait for a tree to disappear after it has been killed
+    /// outright.
+    ///
+    /// Only bounds the wait; a process that ignores SIGKILL is stuck in the
+    /// kernel and no amount of waiting will change that.
+    const KILL_TIMEOUT: Duration = Duration::from_secs(2);
 
     /// Sends `signal` to the process group led by `pid`.
     ///
