@@ -140,15 +140,21 @@ fn main() {
     let lib_dir = prefix.join("lib");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
 
-    // Zig emits a static library and a shared library side by side, and names
-    // them by the target's own convention: libghostty-vt.a on Unix,
-    // ghostty-vt-static.lib on Windows. Neither matches what `-l static=NAME`
-    // would look for on every host, so name the archive by path instead.
+    // Zig names its output by the target's own convention -- libghostty-vt.a
+    // on Unix, ghostty-vt-static.lib on Windows -- and puts a shared library
+    // beside it. Neither fact suits rustc directly:
     //
-    // This also avoids two traps. On macOS a plain `-l ghostty-vt` resolves to
-    // the dylib sitting beside the archive, which is then missing at run time.
-    // On Windows `ghostty-vt.lib` is the import library for ghostty-vt.dll,
-    // so linking by that name would require shipping the DLL.
+    // - `-l static=ghostty-vt` on Unix can resolve to the dylib sitting in the
+    //   same directory, which is then missing at run time.
+    // - On windows-gnu rustc looks for libghostty-vt-static.a and never finds
+    //   ghostty-vt-static.lib.
+    // - Naming the archive with `-l` alone leaves link order to chance, and
+    //   ld resolves left to right, so the archive has to precede the system
+    //   libraries that satisfy it.
+    //
+    // Copy the archive alone into its own directory under the GNU name, then
+    // let rustc link it normally. rustc then orders it against the system
+    // libraries correctly, which `cargo:rustc-link-arg` does not.
     const STATIC_LIB_NAMES: &[&str] = &["libghostty-vt.a", "ghostty-vt-static.lib"];
 
     let archive = STATIC_LIB_NAMES
@@ -170,7 +176,25 @@ fn main() {
             );
         });
 
-    println!("cargo:rustc-link-arg={}", archive.display());
+    let link_dir = out_dir.join("link");
+    fs::create_dir_all(&link_dir)
+        .unwrap_or_else(|err| panic!("failed to create {}: {err}", link_dir.display()));
+    let linked = link_dir.join("libghostty-vt.a");
+    fs::copy(&archive, &linked).unwrap_or_else(|err| {
+        panic!(
+            "failed to copy {} to {}: {err}",
+            archive.display(),
+            linked.display()
+        )
+    });
+
+    println!("cargo:rustc-link-search=native={}", link_dir.display());
+    println!("cargo:rustc-link-lib=static=ghostty-vt");
+
+    if target.contains("windows") {
+        // libghostty-vt's allocator calls the native memory API directly.
+        println!("cargo:rustc-link-lib=dylib=ntdll");
+    }
 
     println!("cargo:include={}", prefix.join("include").display());
 }
