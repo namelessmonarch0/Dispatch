@@ -193,15 +193,27 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use std::io::{Read, Write};
+    use std::os::windows::io::FromRawHandle;
     use std::path::Path;
+    use std::sync::Mutex;
+
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
+    };
+    use windows_sys::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+        PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    };
 
     use super::IpcError;
 
-    /// Named pipes are addressed by name, not by a filesystem path, so the
-    /// endpoint path is hashed into one.
+    /// Named pipes are addressed by name rather than by a filesystem path, so
+    /// the endpoint is hashed into one. Two configurations therefore get two
+    /// pipes, matching how the Unix socket lives under the config directory.
     fn pipe_name(path: &Path) -> String {
-        // A stable, filesystem-safe name derived from the endpoint, so two
-        // configurations get two pipes.
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for byte in path.display().to_string().bytes() {
             hash ^= u64::from(byte);
@@ -230,62 +242,55 @@ mod imp {
 
     pub(super) struct Listener {
         name: String,
+        /// The instance waiting for the next client.
+        ///
+        /// An instance has to exist before a client can connect, so one is
+        /// always kept open: creating it inside `accept` would leave a window
+        /// where a client that connected first found nothing.
+        ///
+        /// Stored as a raw handle because `HANDLE` is a pointer and therefore
+        /// not `Send`; the pipe is owned solely by this listener.
+        pending: Mutex<isize>,
     }
 
-    pub(super) fn connect(path: &Path) -> Result<Stream, IpcError> {
-        let name = pipe_name(path);
+    // SAFETY: the handle is owned exclusively by this listener and is only
+    // touched under the mutex.
+    unsafe impl Send for Listener {}
+    unsafe impl Sync for Listener {}
 
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&name)
-            .map(Stream)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => IpcError::NotRunning(name.clone()),
-                _ => IpcError::io(format!("connecting to {name}"), e),
-            })
-    }
+    impl Drop for Listener {
+        fn drop(&mut self) {
+            use windows_sys::Win32::Foundation::CloseHandle;
 
-    pub(super) fn bind(path: &Path) -> Result<Listener, IpcError> {
-        let name = pipe_name(path);
-
-        // A named pipe exists only while its server holds it, so unlike a
-        // Unix socket there is no stale file to clean up: if a connection
-        // succeeds a daemon is running, and otherwise nothing is.
-        if connect(path).is_ok() {
-            return Err(IpcError::AlreadyRunning(name));
+            let handle = *self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if handle != INVALID_HANDLE_VALUE as isize {
+                // SAFETY: the handle came from CreateNamedPipeW and is closed
+                // exactly once, here.
+                unsafe { CloseHandle(handle as HANDLE) };
+            }
         }
-
-        Ok(Listener { name })
     }
 
-    pub(super) fn accept(listener: &Listener) -> Result<Stream, IpcError> {
-        // Creating a pipe instance and waiting for a client is a single
-        // operation on Windows, so each accept makes a new instance.
-        imp_accept(&listener.name)
-    }
-
-    fn imp_accept(name: &str) -> Result<Stream, IpcError> {
-        use std::os::windows::io::FromRawHandle;
-
-        use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE};
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
-        };
-        use windows_sys::Win32::System::Pipes::{
-            ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
-            PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
-        };
-
+    /// Creates one pipe instance.
+    ///
+    /// `first` asks the kernel to fail if an instance already exists, which is
+    /// how a second daemon is detected without a lock file of its own.
+    fn create_instance(name: &str, first: bool) -> Result<isize, std::io::Error> {
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
 
+        let mut flags = PIPE_ACCESS_DUPLEX;
+        if first {
+            flags |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+        }
+
         // SAFETY: `wide` is a NUL-terminated wide string that outlives the
-        // call, and a null security descriptor gives the pipe the default,
-        // which grants access to the creating user only.
+        // call. A null security descriptor gives the pipe the default, which
+        // grants access to the creating user only -- the same boundary the
+        // Unix socket's 0600 mode provides.
         let handle = unsafe {
             CreateNamedPipeW(
                 wide.as_ptr(),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                flags,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
                 64 * 1024,
@@ -296,26 +301,77 @@ mod imp {
         };
 
         if handle == INVALID_HANDLE_VALUE {
-            return Err(IpcError::io(
-                format!("creating the pipe {name}"),
-                std::io::Error::last_os_error(),
-            ));
+            return Err(std::io::Error::last_os_error());
         }
 
-        // SAFETY: `handle` is a live pipe instance from CreateNamedPipeW.
-        let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
+        Ok(handle as isize)
+    }
+
+    pub(super) fn connect(path: &Path) -> Result<Stream, IpcError> {
+        let name = pipe_name(path);
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&name)
+            .map(Stream)
+            .map_err(|e| match e.raw_os_error() {
+                // Every instance is busy serving someone, which still means a
+                // daemon is there.
+                Some(code) if code == ERROR_PIPE_BUSY as i32 => {
+                    IpcError::io(format!("connecting to {name}"), e)
+                }
+                _ if e.kind() == std::io::ErrorKind::NotFound => IpcError::NotRunning(name.clone()),
+                _ => IpcError::io(format!("connecting to {name}"), e),
+            })
+    }
+
+    pub(super) fn bind(path: &Path) -> Result<Listener, IpcError> {
+        let name = pipe_name(path);
+
+        // Unlike a Unix socket there is no file to go stale: a pipe exists
+        // only while its server holds it, so a refusal here means a daemon is
+        // genuinely running.
+        let pending = create_instance(&name, true).map_err(|e| match e.raw_os_error() {
+            Some(code) if code == ERROR_ACCESS_DENIED as i32 => {
+                IpcError::AlreadyRunning(name.clone())
+            }
+            _ => IpcError::io(format!("listening on {name}"), e),
+        })?;
+
+        Ok(Listener {
+            name,
+            pending: Mutex::new(pending),
+        })
+    }
+
+    pub(super) fn accept(listener: &Listener) -> Result<Stream, IpcError> {
+        let mut pending = listener.pending.lock().unwrap_or_else(|e| e.into_inner());
+
+        let handle = *pending;
+
+        // SAFETY: `handle` is a live pipe instance held by this listener.
+        let connected = unsafe { ConnectNamedPipe(handle as HANDLE, std::ptr::null_mut()) };
 
         if connected == 0 {
             let error = std::io::Error::last_os_error();
-            // A client that connected between creation and this call is a
-            // success, not a failure.
+            // A client that connected between creation and this call has
+            // already succeeded; that is not a failure.
             if error.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
-                return Err(IpcError::io(format!("accepting on {name}"), error));
+                return Err(IpcError::io(
+                    format!("accepting on {}", listener.name),
+                    error,
+                ));
             }
         }
 
-        // SAFETY: the handle is a connected pipe instance and ownership moves
-        // into the File, which closes it exactly once.
+        // Open the next instance before handing this one over, so the pipe is
+        // never absent between clients.
+        *pending = create_instance(&listener.name, false)
+            .map_err(|e| IpcError::io(format!("reopening {}", listener.name), e))?;
+
+        // SAFETY: the handle is a connected instance and ownership moves into
+        // the File, which closes it exactly once.
         Ok(Stream(unsafe {
             std::fs::File::from_raw_handle(handle as _)
         }))
