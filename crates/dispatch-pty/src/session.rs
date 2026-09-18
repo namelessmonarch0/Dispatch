@@ -61,6 +61,9 @@ pub enum RunState {
 /// One agent, its pseudoterminal, and its screen.
 pub struct PtySession {
     master: Box<dyn MasterPty + Send>,
+    /// Held only on Windows, where dropping the slave closes the ConPTY
+    /// pseudoconsole and leaves the child writing into a dead console.
+    _slave: Option<Box<dyn portable_pty::SlavePty + Send>>,
     writer: Box<dyn Write + Send>,
     events: Receiver<PtyEvent>,
     terminal: VtTerminal,
@@ -106,10 +109,19 @@ impl PtySession {
                 source,
             })?;
 
-        // The slave is held open by the child. Dropping our copy is what lets
-        // the reader see end-of-file when the child exits; without this the
-        // read blocks forever.
-        drop(pair.slave);
+        // On Unix the slave is held open by the child, and dropping our copy
+        // is what lets the reader see end-of-file when the child exits.
+        //
+        // On Windows the same drop closes the ConPTY pseudoconsole out from
+        // under the child, which then blocks writing into a dead console: no
+        // output ever arrives and it never exits on its own. Hold it instead.
+        // Exit is detected by waiting on the child either way, so nothing here
+        // depends on end-of-file.
+        let slave = if cfg!(windows) {
+            Some(pair.slave)
+        } else {
+            None
+        };
 
         let pid = child.process_id();
 
@@ -122,6 +134,7 @@ impl PtySession {
 
         Ok(Self {
             master: pair.master,
+            _slave: slave,
             writer,
             events,
             terminal: VtTerminal::new(size)?,
