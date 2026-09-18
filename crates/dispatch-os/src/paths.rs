@@ -23,8 +23,22 @@ fn project_dirs() -> Result<ProjectDirs, PathError> {
     ProjectDirs::from("", "", "dispatch").ok_or(PathError::NoHomeDirectory)
 }
 
+/// Environment variable that overrides where configuration is read from.
+///
+/// Useful for a portable install, for running two configurations side by
+/// side, and for tests, which must not read or write the developer's own
+/// harnesses. It is an explicit variable rather than XDG_CONFIG_HOME because
+/// that is ignored on macOS and Windows.
+pub const CONFIG_DIR_ENV: &str = "DISPATCH_CONFIG_DIR";
+
 /// Directory holding `config.toml`.
 pub fn config_dir() -> Result<PathBuf, PathError> {
+    if let Some(path) = std::env::var_os(CONFIG_DIR_ENV)
+        && !path.is_empty()
+    {
+        return Ok(PathBuf::from(path));
+    }
+
     Ok(project_dirs()?.config_dir().to_path_buf())
 }
 
@@ -41,7 +55,16 @@ pub fn harnesses_dir() -> Result<PathBuf, PathError> {
 /// Path to the log file.
 ///
 /// A TUI owns the screen, so diagnostics cannot go to stdout or stderr.
+///
+/// Follows [`CONFIG_DIR_ENV`] when it is set, so a redirected configuration
+/// keeps its logs with it rather than writing into the real data directory.
 pub fn log_file() -> Result<PathBuf, PathError> {
+    if let Some(path) = std::env::var_os(CONFIG_DIR_ENV)
+        && !path.is_empty()
+    {
+        return Ok(PathBuf::from(path).join("dispatch.log"));
+    }
+
     Ok(project_dirs()?.data_dir().join("dispatch.log"))
 }
 
@@ -75,6 +98,13 @@ mod tests {
         ] {
             assert!(path.is_absolute(), "{} is not absolute", path.display());
         }
+    }
+
+    #[test]
+    fn the_override_variable_is_named_for_dispatch() {
+        // XDG_CONFIG_HOME would not do: macOS and Windows ignore it, so a
+        // redirected configuration has to have its own variable.
+        assert_eq!(CONFIG_DIR_ENV, "DISPATCH_CONFIG_DIR");
     }
 
     #[test]

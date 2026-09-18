@@ -105,6 +105,9 @@ impl PtySession {
         let mut command = CommandBuilder::new(&launch.command);
         command.args(&launch.args);
         command.cwd(cwd);
+        for (key, value) in &launch.env {
+            command.env(key, value);
+        }
 
         let child = pair
             .slave

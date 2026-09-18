@@ -12,11 +12,13 @@ fn shell(script: &str) -> Launch {
         Launch {
             command: "cmd.exe".into(),
             args: vec!["/c".into(), script.into()],
+            env: Default::default(),
         }
     } else {
         Launch {
             command: "sh".into(),
             args: vec!["-c".into(), script.into()],
+            env: Default::default(),
         }
     }
 }
@@ -27,11 +29,13 @@ fn interactive_shell() -> Launch {
         Launch {
             command: "cmd.exe".into(),
             args: Vec::new(),
+            env: Default::default(),
         }
     } else {
         Launch {
             command: "sh".into(),
             args: Vec::new(),
+            env: Default::default(),
         }
     }
 }
@@ -228,6 +232,7 @@ fn a_missing_command_is_reported_rather_than_panicking() {
     let launch = Launch {
         command: "dispatch-no-such-binary".into(),
         args: Vec::new(),
+        env: Default::default(),
     };
 
     let error = PtySession::spawn(&launch, &cwd(), Size::new(80, 24))

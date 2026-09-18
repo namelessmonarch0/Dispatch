@@ -60,6 +60,10 @@ pub struct Launch {
     /// Arguments, which may contain `{placeholder}` templates.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Environment variables to set for the child, on top of what it
+    /// inherits.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 /// A registered coding agent.
@@ -97,7 +101,7 @@ impl HarnessDef {
 
     /// The launch configuration for the platform Dispatch is running on.
     #[must_use]
-    pub fn launch_for_current_platform(&self) -> &Launch {
+    pub fn launch_for_current_platform(&self) -> Launch {
         self.launch_for(std::env::consts::OS)
     }
 
@@ -105,8 +109,21 @@ impl HarnessDef {
     ///
     /// Falls back to the default when the platform has no override, so a
     /// harness that behaves the same everywhere needs only one entry.
+    ///
+    /// The harness-level environment is merged in, with any platform-specific
+    /// entry winning, so `env` can be declared once and still be overridden
+    /// where a platform needs something different.
     #[must_use]
-    pub fn launch_for(&self, os: &str) -> &Launch {
-        self.platform.get(os).unwrap_or(&self.launch)
+    pub fn launch_for(&self, os: &str) -> Launch {
+        let base = self.platform.get(os).unwrap_or(&self.launch);
+
+        let mut launch = base.clone();
+        for (key, value) in &self.env {
+            launch
+                .env
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+        launch
     }
 }

@@ -71,7 +71,7 @@ fn every_built_in_has_a_windows_launch_override() {
         let def: HarnessDef = toml::from_str(built_in.toml).expect("built-ins parse");
         let windows = def.launch_for("windows");
         assert_ne!(
-            windows, &def.launch,
+            windows.command, def.launch.command,
             "{} has no windows override",
             built_in.id
         );
@@ -252,6 +252,66 @@ default = true
             default: Some(true)
         }
     ));
+}
+
+#[test]
+fn harness_environment_reaches_the_launch() {
+    let def: HarnessDef = toml::from_str(
+        r#"
+id = "demo"
+display_name = "Demo"
+command = "demo"
+
+[env]
+DEMO_MODE = "on"
+"#,
+    )
+    .expect("valid harness");
+
+    assert_eq!(
+        def.launch_for("linux")
+            .env
+            .get("DEMO_MODE")
+            .map(String::as_str),
+        Some("on"),
+        "env declared on the harness must reach the spawned child"
+    );
+}
+
+#[test]
+fn a_platform_override_wins_over_the_harness_environment() {
+    let def: HarnessDef = toml::from_str(
+        r#"
+id = "demo"
+display_name = "Demo"
+command = "demo"
+
+[env]
+SHELL_KIND = "posix"
+
+[platform.windows]
+command = "cmd.exe"
+
+[platform.windows.env]
+SHELL_KIND = "windows"
+"#,
+    )
+    .expect("valid harness");
+
+    assert_eq!(
+        def.launch_for("linux")
+            .env
+            .get("SHELL_KIND")
+            .map(String::as_str),
+        Some("posix")
+    );
+    assert_eq!(
+        def.launch_for("windows")
+            .env
+            .get("SHELL_KIND")
+            .map(String::as_str),
+        Some("windows")
+    );
 }
 
 #[test]

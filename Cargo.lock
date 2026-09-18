@@ -283,13 +283,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "crossterm",
  "dispatch-config",
  "dispatch-core",
  "dispatch-layout",
  "dispatch-os",
  "dispatch-pty",
  "dispatch-tui",
- "tokio",
+ "ratatui",
  "tracing",
  "tracing-subscriber",
 ]

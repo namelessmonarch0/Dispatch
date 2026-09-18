@@ -16,8 +16,15 @@ dispatch-layout = { workspace = true }
 dispatch-os = { workspace = true }
 dispatch-pty = { workspace = true }
 dispatch-tui = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+dispatch-os = { workspace = true }
+dispatch-pty = { workspace = true }
+dispatch-config = { workspace = true }
+dispatch-tui = { workspace = true }
