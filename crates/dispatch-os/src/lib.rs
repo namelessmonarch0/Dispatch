@@ -4,6 +4,7 @@
 //! workspace carries a `#[cfg(windows)]`.
 
 pub mod dll;
+pub mod ipc;
 pub mod paths;
 pub mod process;
 pub mod signal;

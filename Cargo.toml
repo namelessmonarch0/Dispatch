@@ -5,6 +5,7 @@ members = [
     "crates/dispatch-layout",
     "crates/dispatch-config",
     "crates/dispatch-os",
+    "crates/dispatch-proto",
     "crates/dispatch-pty",
     "crates/dispatch-tui",
     "dispatch",
@@ -24,6 +25,7 @@ dispatch-core = { path = "crates/dispatch-core" }
 dispatch-layout = { path = "crates/dispatch-layout" }
 dispatch-config = { path = "crates/dispatch-config" }
 dispatch-os = { path = "crates/dispatch-os" }
+dispatch-proto = { path = "crates/dispatch-proto" }
 dispatch-pty = { path = "crates/dispatch-pty" }
 dispatch-tui = { path = "crates/dispatch-tui" }
 
