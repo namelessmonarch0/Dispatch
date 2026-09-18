@@ -301,6 +301,19 @@ fn sidebar_panes(lines: &[String]) -> usize {
     sidebar.iter().filter(|l| l.contains("Test Shell")).count()
 }
 
+/// Whether the sidebar — not a pane — shows `needle`.
+///
+/// A pane echoes what is typed at it, so a test that types a title and then
+/// looks at the whole screen would pass whether or not the title was read.
+fn sidebar_contains(lines: &[String], needle: &str) -> bool {
+    let width = dispatch_tui::sidebar::WIDTH as usize;
+
+    lines.iter().any(|line| {
+        let column: String = line.chars().take(width).collect();
+        column.contains(needle)
+    })
+}
+
 fn contains(lines: &[String], needle: &str) -> bool {
     lines.iter().any(|l| l.contains(needle))
 }
@@ -671,4 +684,52 @@ fn a_client_waits_for_a_daemon_that_is_restarted() {
         "the view should be rebuilt from what the new daemon says"
     );
     dispatch.spawn_shell();
+}
+
+#[test]
+fn a_pane_is_named_by_what_its_agent_calls_itself() {
+    // An agent says what it is doing with a title sequence. The sidebar should
+    // say that rather than the harness's name for the rest of the session.
+    let mut app = Harness::start(Size::new(100, 30));
+    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    app.spawn_shell();
+    assert!(
+        app.wait_for(|lines| contains(lines, "$")),
+        "the shell should print a prompt"
+    );
+
+    // Short enough to survive the sidebar's width once the row's markers are
+    // accounted for.
+    app.send(b"printf '\\033]2;on-task\\007'\r");
+
+    assert!(
+        app.wait_for(|lines| sidebar_contains(lines, "on-task")),
+        "the sidebar should show the title the child set"
+    );
+}
+
+#[test]
+fn an_attached_pane_is_named_by_its_agent_too() {
+    // The title travels as ordinary output, so it costs the protocol nothing and
+    // works the same on a pane the daemon owns.
+    let fixture = Fixture::new("d4");
+    let _daemon = Daemon::start(&fixture);
+    let mut dispatch = Harness::attached(&fixture, Size::new(100, 30));
+
+    assert!(
+        dispatch.wait_for(|lines| contains(lines, "project")),
+        "the daemon's project should be listed"
+    );
+    dispatch.spawn_shell();
+    assert!(
+        dispatch.wait_for(|lines| contains(lines, "$")),
+        "the shell should print a prompt"
+    );
+
+    dispatch.send(b"printf '\\033]2;on-task\\007'\r");
+
+    assert!(
+        dispatch.wait_for(|lines| sidebar_contains(lines, "on-task")),
+        "the sidebar should show the title the child set"
+    );
 }

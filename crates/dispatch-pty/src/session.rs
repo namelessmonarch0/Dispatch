@@ -183,10 +183,10 @@ impl PtySession {
 
     /// Feeds pending output into the emulator and returns the raw bytes.
     ///
-    /// The daemon forwards these to its clients, which run their own
-    /// emulators. The bytes are still fed here as well, so the daemon can hand
-    /// a client that attaches later the screen as it currently stands rather
-    /// than replaying the whole session.
+    /// Two callers want the bytes themselves: the daemon forwards them to its
+    /// clients, which run their own emulators, and a client reads the child's
+    /// title out of them, since the emulator models the screen and a title is
+    /// not on it.
     pub fn drain_output(&mut self) -> Vec<u8> {
         let mut output = Vec::new();
 

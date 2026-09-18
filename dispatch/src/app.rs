@@ -14,7 +14,7 @@ use dispatch_layout::{tile, tile_zoomed};
 use dispatch_proto::{ClientMessage, PaneUpdate, ServerMessage};
 use dispatch_pty::{
     KeyEncoder, MouseEncoder, MouseInput, PtySession, RunState, Screen, ScreenReader, ScrollTo,
-    Size,
+    Size, TitleScanner,
 };
 
 use crate::backend::{Backend, RemotePane};
@@ -57,6 +57,8 @@ struct Pane {
     /// Last screen read, redrawn each frame without re-reading when nothing
     /// changed.
     screen: Screen,
+    /// Watches the output for the title the child sets for itself.
+    titles: TitleScanner,
 }
 
 /// What the picker on screen is choosing, which decides what a selection
@@ -241,6 +243,7 @@ impl App {
                 scrolled_back: false,
                 reader,
                 screen,
+                titles: TitleScanner::new(),
             },
         );
 
@@ -340,6 +343,15 @@ impl App {
                     target.screen = screen;
                 }
 
+                // Read here as well as for a local pane: the same bytes carry
+                // the title whichever side the process is on, and a client that
+                // has just been replayed a pane's output learns its name from
+                // it.
+                let title = target.titles.scan(&bytes);
+                if let Some(title) = title {
+                    let _ = self.state.set_pane_title(pane, &title);
+                }
+
                 true
             }
 
@@ -424,21 +436,30 @@ impl App {
     pub fn poll_panes(&mut self) -> bool {
         let mut changed = false;
         let mut exited = Vec::new();
+        let mut renamed = Vec::new();
 
         for (id, pane) in &mut self.panes {
-            if !pane.backend.drain() {
-                continue;
-            }
+            let output = pane.backend.drain();
 
-            changed = true;
+            if !output.is_empty() {
+                changed = true;
 
-            if let Ok(screen) = pane.reader.read(pane.backend.terminal()) {
-                pane.screen = screen;
+                if let Some(title) = pane.titles.scan(&output) {
+                    renamed.push((*id, title));
+                }
+
+                if let Ok(screen) = pane.reader.read(pane.backend.terminal()) {
+                    pane.screen = screen;
+                }
             }
 
             if let RunState::Exited(code) = pane.backend.state() {
                 exited.push((*id, code));
             }
+        }
+
+        for (id, title) in renamed {
+            let _ = self.state.set_pane_title(id, &title);
         }
 
         for (id, code) in exited {

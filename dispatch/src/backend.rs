@@ -141,12 +141,14 @@ impl Backend {
 
     /// Moves whatever the process has produced into the emulator.
     ///
-    /// Returns whether anything arrived. A remote pane is fed by the daemon's
-    /// messages instead, so there is nothing to poll.
-    pub fn drain(&mut self) -> bool {
+    /// Returns the bytes as well, because the caller reads the child's title out
+    /// of them: the emulator models the screen, and a title is not on it. A
+    /// remote pane is fed by the daemon's messages instead, so there is nothing
+    /// here to poll.
+    pub fn drain(&mut self) -> Vec<u8> {
         match self {
-            Self::Local(session) => session.drain(),
-            Self::Remote(_) => false,
+            Self::Local(session) => session.drain_output(),
+            Self::Remote(_) => Vec::new(),
         }
     }
 
