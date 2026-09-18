@@ -69,8 +69,11 @@ type Writer = Box<dyn Write + Send>;
 enum After {
     /// Closes the connection, which is what a daemon going away looks like.
     HangUp,
-    /// Keeps it open and keeps listening.
-    Listen,
+    /// Keeps listening, and answers a ping as a daemon would.
+    Answer,
+    /// Keeps the connection open but never says anything again, which is what a
+    /// tunnel that died or a wedged peer looks like.
+    Silence,
 }
 
 /// What a fake server has been told, readable while it is still running.
@@ -102,7 +105,12 @@ impl Heard {
     }
 }
 
-/// Accepts one client, answers its handshake with `answer`, then runs `serve`.
+/// Accepts clients, answers each handshake with `answer`, and runs `serve` for
+/// the first one.
+///
+/// Accepts more than one because a client that has been dropped can still have a
+/// connection attempt in flight, and a server that took exactly one would then
+/// starve the client the test is actually watching.
 ///
 /// Binding happens before the thread starts, so a client connecting immediately
 /// finds the endpoint already there.
@@ -115,23 +123,61 @@ fn serve_one(
     let heard = Heard::new();
     let recording = heard.clone();
 
+    type Once = Arc<Mutex<Option<Box<dyn FnOnce(&mut Writer) + Send>>>>;
+    let serve: Once = Arc::new(Mutex::new(Some(Box::new(serve))));
+
     std::thread::spawn(move || {
-        let connection = listener.accept().expect("a client connects");
-        let (mut reader, writer) = connection.split().expect("splitting succeeds");
-        let mut writer: Writer = Box::new(writer);
+        while let Ok(connection) = listener.accept() {
+            let recording = recording.clone();
+            let answer = answer.clone();
+            let serve = Arc::clone(&serve);
 
-        let hello = Frame::read::<_, ClientMessage>(&mut reader).expect("a hello arrives");
-        recording.push(hello);
+            let handler = std::thread::spawn(move || {
+                let (mut reader, writer) = connection.split().expect("splitting succeeds");
+                let mut writer: Writer = Box::new(writer);
 
-        Frame::write(&mut writer, &answer).expect("writing succeeds");
-        serve(&mut writer);
+                let Ok(hello) = Frame::read::<_, ClientMessage>(&mut reader) else {
+                    return;
+                };
+                recording.push(hello);
 
-        if after == After::HangUp {
-            return;
-        }
+                if Frame::write(&mut writer, &answer).is_err() {
+                    // A connection that went away before being welcomed: a
+                    // client's reconnection attempt crossing with its own drop,
+                    // or the liveness probe another bind makes.
+                    return;
+                }
 
-        while let Ok(message) = Frame::read::<_, ClientMessage>(&mut reader) {
-            recording.push(message);
+                // Only the first client gets the scripted output: a test writes
+                // its messages once, and a straggler must not consume them.
+                let scripted = serve.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(scripted) = scripted {
+                    scripted(&mut writer);
+                }
+
+                if after == After::HangUp {
+                    return;
+                }
+
+                while let Ok(message) = Frame::read::<_, ClientMessage>(&mut reader) {
+                    if let (After::Answer, ClientMessage::Ping { token }) = (after, &message) {
+                        let pong = ServerMessage::Pong { token: *token };
+                        if Frame::write(&mut writer, &pong).is_err() {
+                            break;
+                        }
+                    }
+
+                    recording.push(message);
+                }
+            });
+
+            if after == After::HangUp {
+                // The daemon is gone, endpoint included: a test that starts a
+                // second one needs this listener out of the way, or binding
+                // finds this one still answering.
+                let _ = handler.join();
+                return;
+            }
         }
     });
 
@@ -185,7 +231,7 @@ fn attaching_reports_the_daemon_it_reached() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _endpoint = Endpoint::new("welcome");
 
-    let heard = serve_one(welcome(), |_| {}, After::Listen);
+    let heard = serve_one(welcome(), |_| {}, After::Answer);
 
     let client = Client::attach("test").expect("attaching succeeds");
     assert_eq!(client.device(), "desktop");
@@ -264,7 +310,7 @@ fn messages_arrive_without_blocking_the_caller() {
             )
             .expect("writing succeeds");
         },
-        After::Listen,
+        After::Answer,
     );
 
     let client = Client::attach("test").expect("attaching succeeds");
@@ -272,15 +318,28 @@ fn messages_arrive_without_blocking_the_caller() {
     // Polling an empty queue returns nothing rather than waiting.
     let _ = client.poll();
 
-    let seen = wait_for(&client, "the pane's output and title", |m| m.len() >= 2);
-    assert!(matches!(
-        seen.first(),
-        Some(ServerMessage::PaneOutput { .. })
-    ));
-    assert!(matches!(
-        seen.get(1),
-        Some(ServerMessage::PaneChanged { .. })
-    ));
+    // Keepalive answers are not what this is about, and a slow machine can slip
+    // one in between the two messages that are.
+    let interesting = |m: &[ServerMessage]| -> Vec<ServerMessage> {
+        m.iter()
+            .filter(|m| !matches!(m, ServerMessage::Pong { .. }))
+            .cloned()
+            .collect()
+    };
+
+    let seen = wait_for(&client, "the pane's output and title", |m| {
+        interesting(m).len() >= 2
+    });
+    let seen = interesting(&seen);
+
+    assert!(
+        matches!(seen.first(), Some(ServerMessage::PaneOutput { .. })),
+        "expected the pane's output first, saw {seen:#?}"
+    );
+    assert!(
+        matches!(seen.get(1), Some(ServerMessage::PaneChanged { .. })),
+        "expected the title after it, saw {seen:#?}"
+    );
 }
 
 #[test]
@@ -331,7 +390,7 @@ fn a_daemon_that_comes_back_is_reconnected_to() {
             )
             .expect("writing succeeds");
         },
-        After::Listen,
+        After::Answer,
     );
 
     assert!(
@@ -373,7 +432,7 @@ fn a_handle_taken_before_a_reconnection_still_works_after_one() {
     );
 
     let pane = dispatch_core::PaneId::new();
-    let heard = serve_one(welcome(), |_| {}, After::Listen);
+    let heard = serve_one(welcome(), |_| {}, After::Answer);
 
     assert!(
         wait_until(PATIENCE, || handle.is_connected()),
@@ -389,5 +448,79 @@ fn a_handle_taken_before_a_reconnection_still_works_after_one() {
             .contains(&ClientMessage::ClosePane { pane })),
         "the message reached the new connection, sent {:#?}",
         heard.snapshot()
+    );
+}
+
+#[test]
+fn a_daemon_that_stops_answering_is_treated_as_gone() {
+    // The socket is up as far as this end can tell, and nothing will ever cross
+    // it again. Without asking, the client would wait for output forever.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _endpoint = Endpoint::new("silent");
+
+    let heard = serve_one(welcome(), |_| {}, After::Silence);
+
+    let client = Client::attach_with(
+        "test",
+        Liveness {
+            interval: Duration::from_millis(50),
+            silence: Duration::from_millis(400),
+        },
+    )
+    .expect("attaching succeeds");
+    assert!(client.is_connected());
+
+    assert!(
+        wait_until(PATIENCE, || heard
+            .snapshot()
+            .iter()
+            .any(|m| matches!(m, ClientMessage::Ping { .. }))),
+        "a quiet daemon should be asked whether it is there, sent {:#?}",
+        heard.snapshot()
+    );
+
+    assert!(
+        wait_until(PATIENCE, || !client.is_connected()),
+        "a daemon that never answers should be given up on"
+    );
+}
+
+#[test]
+fn a_daemon_that_answers_is_left_alone() {
+    // The other half of the same rule: silence from the client's side is not
+    // evidence of anything, so a daemon with nothing to say must not be dropped.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _endpoint = Endpoint::new("answering");
+
+    let heard = serve_one(welcome(), |_| {}, After::Answer);
+
+    let client = Client::attach_with(
+        "test",
+        Liveness {
+            interval: Duration::from_millis(50),
+            silence: Duration::from_millis(400),
+        },
+    )
+    .expect("attaching succeeds");
+
+    // Several silence windows, so a client that was going to give up has had
+    // every chance to.
+    std::thread::sleep(Duration::from_millis(1200));
+
+    assert!(
+        client.is_connected(),
+        "an answering daemon should still be attached"
+    );
+    assert_eq!(
+        client.generation(),
+        1,
+        "and should not have been reconnected"
+    );
+    assert!(
+        heard
+            .snapshot()
+            .iter()
+            .any(|m| matches!(m, ClientMessage::Ping { .. })),
+        "the client should have asked at least once"
     );
 }

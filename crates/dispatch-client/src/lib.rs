@@ -18,13 +18,39 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dispatch_os::ipc::{Connection, IpcError};
 use dispatch_proto::{ClientMessage, Frame, ProtocolError, ServerMessage};
 
 /// How long to wait before the first reconnection attempt.
 const FIRST_RETRY: Duration = Duration::from_millis(100);
+
+/// How often to ask a quiet daemon whether it is still there, and how long to
+/// wait for an answer before deciding it is not.
+///
+/// A socket can be up as far as this end is concerned while nothing can cross
+/// it: a forwarded connection whose tunnel died, or a peer wedged mid-write.
+/// Nothing arrives, nothing fails, and without a question being asked the client
+/// would wait for output forever. Asking costs one frame every few seconds.
+#[derive(Debug, Clone, Copy)]
+pub struct Liveness {
+    /// How long to wait, having heard nothing, before asking.
+    pub interval: Duration,
+    /// How long to go unanswered before treating the connection as lost.
+    pub silence: Duration,
+}
+
+impl Default for Liveness {
+    fn default() -> Self {
+        // Four unanswered questions. Long enough that a daemon busy with a
+        // hundred panes is not mistaken for a dead one.
+        Self {
+            interval: Duration::from_secs(5),
+            silence: Duration::from_secs(20),
+        }
+    }
+}
 
 /// How long to wait for a daemon to answer the handshake.
 ///
@@ -88,6 +114,13 @@ struct Wire {
     name: String,
     /// The endpoint first reached, which every reconnection uses.
     endpoint: PathBuf,
+    /// When anything last arrived, for deciding a silent socket is dead.
+    last_heard: Mutex<Instant>,
+    /// When the last question was asked, so one goes out per interval rather
+    /// than on every pass of the supervisor.
+    last_asked: Mutex<Instant>,
+    /// How patient to be with silence.
+    liveness: Liveness,
 }
 
 impl Wire {
@@ -109,6 +142,20 @@ impl Wire {
         }
 
         true
+    }
+
+    /// Records that something arrived.
+    fn heard(&self) {
+        *self.last_heard.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        *self.last_asked.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    /// How long nothing has arrived for.
+    fn quiet_for(&self) -> Duration {
+        self.last_heard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .elapsed()
     }
 
     /// Records that the connection has broken.
@@ -179,6 +226,15 @@ impl Client {
     /// Failing here means no daemon answered now. Once attached, a connection
     /// that breaks is reconnected to rather than reported as an error.
     pub fn attach(name: &str) -> Result<Self, ClientError> {
+        Self::attach_with(name, Liveness::default())
+    }
+
+    /// Connects and shakes hands, with something other than the usual patience
+    /// for silence.
+    ///
+    /// Exists for tests, which cannot wait the tens of seconds a real client
+    /// should wait before declaring a quiet daemon dead.
+    pub fn attach_with(name: &str, liveness: Liveness) -> Result<Self, ClientError> {
         let endpoint = dispatch_os::ipc::endpoint()?;
         let (reader, writer, device) = connect_within(name, &endpoint, HANDSHAKE_TIMEOUT)?;
 
@@ -191,6 +247,9 @@ impl Client {
             device: Mutex::new(device),
             name: name.to_string(),
             endpoint,
+            last_heard: Mutex::new(Instant::now()),
+            last_asked: Mutex::new(Instant::now()),
+            liveness,
         });
 
         let (outbox, outgoing) = channel::<ClientMessage>();
@@ -345,6 +404,7 @@ fn read_from(
         loop {
             match Frame::read::<_, ServerMessage>(&mut reader) {
                 Ok(message) => {
+                    wire.heard();
                     if incoming.send(message).is_err() {
                         return;
                     }
@@ -386,6 +446,7 @@ fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
             }
 
             if wire.connected.load(Ordering::Relaxed) {
+                check_liveness(&wire);
                 std::thread::sleep(FIRST_RETRY);
                 backoff = FIRST_RETRY;
                 continue;
@@ -399,6 +460,7 @@ fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
                     *wire.device.lock().unwrap_or_else(|e| e.into_inner()) = device;
                     *wire.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(writer);
                     wire.generation.fetch_add(1, Ordering::Relaxed);
+                    wire.heard();
                     wire.connected.store(true, Ordering::Relaxed);
                     read_from(reader, &incoming, &wire);
 
@@ -420,6 +482,38 @@ fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
                 }
             }
         }
+    });
+}
+
+/// Asks a quiet daemon whether it is there, and gives up on one that never says.
+fn check_liveness(wire: &Wire) {
+    let quiet = wire.quiet_for();
+
+    if quiet >= wire.liveness.silence {
+        tracing::info!(?quiet, "the daemon stopped answering");
+        wire.lost();
+        return;
+    }
+
+    if quiet < wire.liveness.interval {
+        return;
+    }
+
+    // One question per interval, not one per pass: the supervisor comes round
+    // every hundred milliseconds, and a daemon that is merely busy should not be
+    // buried in pings while it catches up.
+    let mut asked = wire.last_asked.lock().unwrap_or_else(|e| e.into_inner());
+    if asked.elapsed() < wire.liveness.interval {
+        return;
+    }
+    *asked = Instant::now();
+    drop(asked);
+
+    // Written straight to the socket rather than queued: the queue carries the
+    // interface's traffic, and a write that fails here is itself the answer,
+    // because the connection is gone.
+    wire.write(&ClientMessage::Ping {
+        token: u64::try_from(quiet.as_millis()).unwrap_or(u64::MAX),
     });
 }
 
