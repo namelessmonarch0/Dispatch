@@ -11,12 +11,47 @@ use std::time::Duration;
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
+/// Reports the full path of any loadable `conpty.dll`, or why it did not load.
+fn probe_conpty() -> String {
+    use windows_sys::Win32::Foundation::FreeLibrary;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, LoadLibraryW};
+
+    let name: Vec<u16> = "conpty.dll\0".encode_utf16().collect();
+
+    // SAFETY: `name` is a NUL-terminated wide string that outlives the call.
+    let handle = unsafe { LoadLibraryW(name.as_ptr()) };
+    if handle.is_null() {
+        return format!("not loadable ({})", std::io::Error::last_os_error());
+    }
+
+    let mut buf = [0u16; 512];
+    // SAFETY: `handle` is a live module handle and `buf` has the stated length.
+    let len = unsafe { GetModuleFileNameW(handle, buf.as_mut_ptr(), buf.len() as u32) };
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+
+    // SAFETY: `handle` came from LoadLibraryW and is not used afterwards.
+    unsafe { FreeLibrary(handle) };
+
+    format!("loaded from {path:?}")
+}
+
 /// Drives ConPTY directly and reports everything observable, so one CI run
 /// says which stage is failing rather than only that output never arrived.
 #[test]
 fn conpty_diagnostics() {
     let mut report = String::new();
     report.push_str("\n--- ConPTY diagnostics ---\n");
+
+    // Which conpty.dll, if any, the bare search path would have found.
+    report.push_str(&format!(
+        "conpty.dll on PATH before hardening: {}\n",
+        probe_conpty()
+    ));
+    dispatch_os::dll::restrict_search_path();
+    report.push_str(&format!(
+        "conpty.dll on PATH after hardening:  {}\n",
+        probe_conpty()
+    ));
 
     let pty = native_pty_system();
     let pair = match pty.openpty(PtySize {

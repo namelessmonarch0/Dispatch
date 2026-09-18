@@ -86,6 +86,11 @@ impl std::fmt::Debug for PtySession {
 impl PtySession {
     /// Starts `launch` in a new pseudoterminal rooted at `cwd`.
     pub fn spawn(launch: &Launch, cwd: &Path, size: Size) -> Result<Self, PtyError> {
+        // Must happen before the pseudoterminal layer loads anything. On
+        // Windows it decides whether ConPTY comes from the kernel or from
+        // whatever conpty.dll happens to sit on PATH.
+        dispatch_os::dll::restrict_search_path();
+
         let pty_size = PtySize {
             rows: size.rows,
             cols: size.cols,
