@@ -11,7 +11,7 @@ use dispatch_config::HarnessRegistry;
 use dispatch_core::{PaneId, PaneStatus, Project, ProjectId, ProjectSource};
 use dispatch_os::ipc::{Connection, Listener};
 use dispatch_proto::{ClientMessage, Frame, FrameError, PaneUpdate, ProtocolError, ServerMessage};
-use dispatch_pty::{PtySession, RunState, Size};
+use dispatch_pty::{Pty, RunState, Size};
 
 use crate::pane::DaemonPane;
 
@@ -440,7 +440,7 @@ impl Daemon {
 
         let launch = def.launch_for_current_platform();
 
-        let session = match PtySession::spawn(&launch, &root, size) {
+        let session = match Pty::spawn(&launch, &root, size) {
             Ok(session) => session,
             Err(error) => {
                 self.send(
@@ -481,7 +481,7 @@ impl Daemon {
         let mut exited = Vec::new();
 
         for (id, pane) in &mut self.panes {
-            let output = pane.session.drain_output();
+            let output = pane.session.drain();
             if !output.is_empty() {
                 pane.remember(&output);
                 messages.push(ServerMessage::PaneOutput {

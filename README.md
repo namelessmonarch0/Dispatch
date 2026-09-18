@@ -45,7 +45,7 @@ cargo build --workspace --target x86_64-pc-windows-gnu
 | `dispatch-layout` | Tiling algorithm. Pure functions. |
 | `dispatch-config` | Harness definitions, config loading. |
 | `dispatch-os` | All platform-specific code. The only crate with `#[cfg(windows)]`. |
-| `dispatch-pty` | PTY supervision and VT screen state. |
+| `dispatch-pty` | PTY supervision, VT screen state, title scanning. |
 | `dispatch-proto` | The client-daemon wire protocol. |
 | `dispatch-client` | The client half of that protocol. |
 | `dispatch-daemon` | The daemon's loop: it owns the agents. |

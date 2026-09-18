@@ -1,7 +1,7 @@
 //! A pane as the daemon sees it.
 
 use dispatch_core::{PaneId, PaneStatus};
-use dispatch_pty::PtySession;
+use dispatch_pty::Pty;
 
 /// How much of each pane's output the daemon keeps for a client attaching later.
 ///
@@ -14,13 +14,13 @@ pub const HISTORY_BYTES: usize = 256 * 1024;
 /// One agent owned by the daemon.
 ///
 /// The daemon holds no emulator: clients run their own, because they are the
-/// ones drawing. Keeping one here would mean rendering a screen per client per
-/// frame for no gain.
+/// ones drawing. One here would parse every byte a second time and hold a screen
+/// nothing ever reads.
 pub struct DaemonPane {
     /// Stable identifier.
     pub id: PaneId,
     /// The running process.
-    pub session: PtySession,
+    pub session: Pty,
     /// Which harness is running, so a client attaching later can be told.
     pub harness: String,
     /// The project it belongs to.

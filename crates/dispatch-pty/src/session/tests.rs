@@ -268,3 +268,55 @@ fn a_large_burst_of_output_is_not_truncated() {
         lines.last()
     );
 }
+
+#[test]
+fn a_bare_pty_hands_over_bytes() {
+    // What the daemon uses: the child's output, with nothing parsing it.
+    let mut pty = Pty::spawn(&shell("printf hello-from-a-pty"), &cwd(), Size::new(80, 24))
+        .expect("the shell starts");
+
+    let (state, output) = pty.drain_until_exit(Duration::from_secs(10));
+
+    assert_eq!(state, RunState::Exited(0));
+    assert!(
+        String::from_utf8_lossy(&output).contains("hello-from-a-pty"),
+        "expected the child's output, got {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn a_bare_pty_notices_an_exit_while_draining() {
+    let mut pty =
+        Pty::spawn(&shell("exit 5"), &cwd(), Size::new(80, 24)).expect("the shell starts");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let _ = pty.drain();
+        if pty.state() != RunState::Running {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_eq!(pty.state(), RunState::Exited(5));
+}
+
+#[test]
+fn a_session_stops_asking_for_redraws_once_a_pane_has_exited() {
+    // Drain reports change, and an exited pane changes once. Reporting it every
+    // poll would have the interface redrawing forever over a dead pane.
+    let mut session =
+        PtySession::spawn(&shell("exit 0"), &cwd(), Size::new(80, 24)).expect("the shell starts");
+
+    assert_eq!(
+        session.drain_until_exit(Duration::from_secs(10)),
+        RunState::Exited(0)
+    );
+
+    assert!(
+        !session.drain(),
+        "nothing changed, so nothing needs redrawing"
+    );
+    assert!(!session.drain(), "and it stays that way");
+}
