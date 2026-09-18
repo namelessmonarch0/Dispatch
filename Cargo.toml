@@ -58,6 +58,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Test
 insta = "1"
+unicode-width = "0.2"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

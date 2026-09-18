@@ -14,6 +14,7 @@ dispatch-core = { workspace = true }
 dispatch-config = { workspace = true }
 dispatch-layout = { workspace = true }
 dispatch-pty = { workspace = true }
+unicode-width = "0.2"
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 thiserror = { workspace = true }
