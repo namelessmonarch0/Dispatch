@@ -392,3 +392,149 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> GhosttyResult;
 }
+
+/// Opaque key-encoder handle.
+pub type KeyEncoder = *mut c_void;
+
+/// Opaque key-event handle.
+pub type KeyEvent = *mut c_void;
+
+/// `GhosttyKeyAction::GHOSTTY_KEY_ACTION_PRESS`
+pub const KEY_ACTION_PRESS: i32 = 1;
+
+/// `GHOSTTY_KEY_ENCODER_OPT_MACOS_OPTION_AS_ALT`
+pub const KEY_ENCODER_OPT_MACOS_OPTION_AS_ALT: i32 = 6;
+
+/// `GhosttyOptionAsAlt::GHOSTTY_OPTION_AS_ALT_TRUE`
+pub const OPTION_AS_ALT_TRUE: i32 = 1;
+
+/// Modifier bits, from the `GHOSTTY_MODS_*` macros.
+pub mod mods {
+    /// Shift.
+    pub const SHIFT: u16 = 1 << 0;
+    /// Control.
+    pub const CTRL: u16 = 1 << 1;
+    /// Alt / Option.
+    pub const ALT: u16 = 1 << 2;
+    /// Super / Command / Windows.
+    pub const SUPER: u16 = 1 << 3;
+}
+
+/// Physical keys, from `GhosttyKey`.
+///
+/// Only the keys crossterm can report are declared. The values come from the
+/// enum's declaration order in `key/event.h` and must not be renumbered.
+pub mod key {
+    /// Unknown key.
+    pub const UNIDENTIFIED: i32 = 0;
+    /// Backtick.
+    pub const BACKQUOTE: i32 = 1;
+    /// Backslash.
+    pub const BACKSLASH: i32 = 2;
+    /// Left bracket.
+    pub const BRACKET_LEFT: i32 = 3;
+    /// Right bracket.
+    pub const BRACKET_RIGHT: i32 = 4;
+    /// Comma.
+    pub const COMMA: i32 = 5;
+    /// Digit zero; digits one to nine follow consecutively.
+    pub const DIGIT_0: i32 = 6;
+    /// Equals.
+    pub const EQUAL: i32 = 16;
+    /// Letter A; B to Z follow consecutively.
+    pub const A: i32 = 20;
+    /// Minus.
+    pub const MINUS: i32 = 46;
+    /// Period.
+    pub const PERIOD: i32 = 47;
+    /// Apostrophe.
+    pub const QUOTE: i32 = 48;
+    /// Semicolon.
+    pub const SEMICOLON: i32 = 49;
+    /// Forward slash.
+    pub const SLASH: i32 = 50;
+    /// Backspace.
+    pub const BACKSPACE: i32 = 53;
+    /// Return.
+    pub const ENTER: i32 = 58;
+    /// Space.
+    pub const SPACE: i32 = 63;
+    /// Tab.
+    pub const TAB: i32 = 64;
+    /// Delete.
+    pub const DELETE: i32 = 68;
+    /// End.
+    pub const END: i32 = 69;
+    /// Home.
+    pub const HOME: i32 = 71;
+    /// Insert.
+    pub const INSERT: i32 = 72;
+    /// Page down.
+    pub const PAGE_DOWN: i32 = 73;
+    /// Page up.
+    pub const PAGE_UP: i32 = 74;
+    /// Down arrow.
+    pub const ARROW_DOWN: i32 = 75;
+    /// Left arrow.
+    pub const ARROW_LEFT: i32 = 76;
+    /// Right arrow.
+    pub const ARROW_RIGHT: i32 = 77;
+    /// Up arrow.
+    pub const ARROW_UP: i32 = 78;
+    /// Escape.
+    pub const ESCAPE: i32 = 120;
+    /// F1; F2 to F24 follow consecutively.
+    pub const F1: i32 = 121;
+}
+
+unsafe extern "C" {
+    /// `ghostty_key_encoder_new(const GhosttyAllocator*, GhosttyKeyEncoder*)`
+    pub fn ghostty_key_encoder_new(
+        allocator: *const c_void,
+        encoder: *mut KeyEncoder,
+    ) -> GhosttyResult;
+
+    /// `ghostty_key_encoder_free(GhosttyKeyEncoder)`
+    pub fn ghostty_key_encoder_free(encoder: KeyEncoder);
+
+    /// `ghostty_key_encoder_setopt(GhosttyKeyEncoder, GhosttyKeyEncoderOption, const void*)`
+    ///
+    /// `value` points at storage of the type the option documents.
+    pub fn ghostty_key_encoder_setopt(encoder: KeyEncoder, option: i32, value: *const c_void);
+
+    /// `ghostty_key_encoder_setopt_from_terminal(GhosttyKeyEncoder, GhosttyTerminal)`
+    ///
+    /// Copies the terminal's active keyboard modes into the encoder, which is
+    /// what makes the encoding match what the child asked for.
+    pub fn ghostty_key_encoder_setopt_from_terminal(encoder: KeyEncoder, terminal: Terminal);
+
+    /// `ghostty_key_encoder_encode(GhosttyKeyEncoder, GhosttyKeyEvent, char*, size_t, size_t*)`
+    pub fn ghostty_key_encoder_encode(
+        encoder: KeyEncoder,
+        event: KeyEvent,
+        out_buf: *mut u8,
+        out_buf_size: usize,
+        out_len: *mut usize,
+    ) -> GhosttyResult;
+
+    /// `ghostty_key_event_new(const GhosttyAllocator*, GhosttyKeyEvent*)`
+    pub fn ghostty_key_event_new(allocator: *const c_void, event: *mut KeyEvent) -> GhosttyResult;
+
+    /// `ghostty_key_event_free(GhosttyKeyEvent)`
+    pub fn ghostty_key_event_free(event: KeyEvent);
+
+    /// `ghostty_key_event_set_action(GhosttyKeyEvent, GhosttyKeyAction)`
+    pub fn ghostty_key_event_set_action(event: KeyEvent, action: i32);
+
+    /// `ghostty_key_event_set_key(GhosttyKeyEvent, GhosttyKey)`
+    pub fn ghostty_key_event_set_key(event: KeyEvent, key: i32);
+
+    /// `ghostty_key_event_set_mods(GhosttyKeyEvent, GhosttyMods)`
+    pub fn ghostty_key_event_set_mods(event: KeyEvent, mods: u16);
+
+    /// `ghostty_key_event_set_utf8(GhosttyKeyEvent, const char*, size_t)`
+    pub fn ghostty_key_event_set_utf8(event: KeyEvent, utf8: *const u8, len: usize);
+
+    /// `ghostty_key_event_set_unshifted_codepoint(GhosttyKeyEvent, uint32_t)`
+    pub fn ghostty_key_event_set_unshifted_codepoint(event: KeyEvent, codepoint: u32);
+}
