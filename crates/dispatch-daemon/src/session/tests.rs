@@ -64,6 +64,20 @@ fn hello() -> ClientMessage {
     }
 }
 
+/// Everything a pane printed, as text, across the messages seen.
+fn output_of(messages: &[ServerMessage], pane: PaneId) -> String {
+    let bytes: Vec<u8> = messages
+        .iter()
+        .filter_map(|m| match m {
+            ServerMessage::PaneOutput { pane: p, bytes } if *p == pane => Some(bytes.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// Drains whatever a client has been sent.
 fn drain(inbox: &Receiver<ServerMessage>) -> Vec<ServerMessage> {
     let mut messages = Vec::new();
@@ -718,4 +732,167 @@ fn opening_a_path_that_is_not_a_directory_is_reported() {
     );
 
     assert_eq!(daemon.projects().len(), 1, "neither was registered");
+}
+
+#[test]
+fn a_client_attaching_later_is_replayed_what_a_pane_printed() {
+    // Reattaching should show the work, not a blank rectangle.
+    let (mut daemon, project, _dir) = daemon("replay");
+    let first = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    daemon.request_for_test(
+        1,
+        ClientMessage::SpawnPane {
+            project,
+            harness: "shell".into(),
+            size: (80, 24),
+        },
+    );
+
+    let seen = wait_for(&mut daemon, &first, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. }))
+    });
+    let pane = seen
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::PaneSpawned { pane, .. } => Some(*pane),
+            _ => None,
+        })
+        .expect("a pane was spawned");
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane,
+            bytes: b"echo remembered-42\r".to_vec(),
+        },
+    );
+    wait_for(&mut daemon, &first, |messages| {
+        output_of(messages, pane).contains("remembered-42")
+    });
+
+    let late = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+
+    let messages = drain(&late);
+    assert!(
+        output_of(&messages, pane).contains("remembered-42"),
+        "a late client should be replayed the pane's output, got {messages:#?}"
+    );
+}
+
+#[test]
+fn a_pane_remembers_only_its_most_recent_output() {
+    // An agent can print for hours; the daemon cannot keep all of it.
+    let (mut daemon, project, _dir) = daemon("history-cap");
+    let inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    daemon.request_for_test(
+        1,
+        ClientMessage::SpawnPane {
+            project,
+            harness: "shell".into(),
+            size: (80, 24),
+        },
+    );
+    wait_for(&mut daemon, &inbox, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. }))
+    });
+
+    let pane = daemon
+        .panes
+        .values_mut()
+        .next()
+        .expect("the pane is registered");
+
+    // Fed directly: driving a real shell into producing a quarter of a megabyte
+    // would make this a slow test of the shell rather than of the limit.
+    pane.remember(&vec![b'a'; crate::pane::HISTORY_BYTES]);
+    pane.remember(b"the newest bytes");
+
+    let history = &daemon
+        .panes
+        .values()
+        .next()
+        .expect("the pane is registered")
+        .history;
+    assert_eq!(history.len(), crate::pane::HISTORY_BYTES);
+    assert!(
+        history.ends_with(b"the newest bytes"),
+        "the newest output is what a client needs"
+    );
+}
+
+#[test]
+fn a_client_attaching_after_a_pane_exited_is_told_it_exited() {
+    // The change happened before this client was listening, so a subscribe has
+    // to carry it or the pane looks alive forever.
+    let (mut daemon, project, _dir) = daemon("late-exit");
+    let first = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    daemon.request_for_test(
+        1,
+        ClientMessage::SpawnPane {
+            project,
+            harness: "shell".into(),
+            size: (80, 24),
+        },
+    );
+
+    let seen = wait_for(&mut daemon, &first, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. }))
+    });
+    let pane = seen
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::PaneSpawned { pane, .. } => Some(*pane),
+            _ => None,
+        })
+        .expect("a pane was spawned");
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane,
+            bytes: b"exit 3\r".to_vec(),
+        },
+    );
+    wait_for(&mut daemon, &first, |messages| {
+        messages.iter().any(|m| {
+            matches!(
+                m,
+                ServerMessage::PaneChanged {
+                    update: PaneUpdate::Status {
+                        status: PaneStatus::Exited(_)
+                    },
+                    ..
+                }
+            )
+        })
+    });
+
+    let late = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+
+    let messages = drain(&late);
+    assert!(
+        messages.iter().any(|m| matches!(
+            m,
+            ServerMessage::PaneChanged {
+                update: PaneUpdate::Status {
+                    status: PaneStatus::Exited(_)
+                },
+                ..
+            }
+        )),
+        "a late client should be told the pane exited, got {messages:#?}"
+    );
 }

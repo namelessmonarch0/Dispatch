@@ -276,18 +276,41 @@ impl Daemon {
                 // change. Projects come first: a pane names the project it
                 // belongs to, and a client cannot place one it has not heard
                 // of.
-                let existing: Vec<ServerMessage> = self
+                let mut existing: Vec<ServerMessage> = self
                     .projects
                     .values()
                     .map(|project| ServerMessage::ProjectOpened {
                         project: project.clone(),
                     })
-                    .chain(self.panes.values().map(|pane| ServerMessage::PaneSpawned {
+                    .collect();
+
+                for pane in self.panes.values() {
+                    existing.push(ServerMessage::PaneSpawned {
                         pane: pane.id,
                         project: pane.project,
                         harness: pane.harness.clone(),
-                    }))
-                    .collect();
+                    });
+
+                    // What the pane has printed, so a client that reattaches
+                    // sees the work rather than a blank rectangle.
+                    if !pane.history.is_empty() {
+                        existing.push(ServerMessage::PaneOutput {
+                            pane: pane.id,
+                            bytes: pane.history.clone(),
+                        });
+                    }
+
+                    // A pane whose process has already exited says so, since
+                    // the change happened before this client was listening.
+                    if !pane.status.is_live() {
+                        existing.push(ServerMessage::PaneChanged {
+                            pane: pane.id,
+                            update: PaneUpdate::Status {
+                                status: pane.status,
+                            },
+                        });
+                    }
+                }
 
                 for message in existing {
                     self.send(id, message);
@@ -438,6 +461,8 @@ impl Daemon {
                 session,
                 harness: harness.to_string(),
                 project,
+                history: Vec::new(),
+                status: PaneStatus::Starting,
             },
         );
 
@@ -458,13 +483,19 @@ impl Daemon {
         for (id, pane) in &mut self.panes {
             let output = pane.session.drain_output();
             if !output.is_empty() {
+                pane.remember(&output);
                 messages.push(ServerMessage::PaneOutput {
                     pane: *id,
                     bytes: output,
                 });
             }
 
-            if let RunState::Exited(code) = pane.session.state() {
+            // Reported once: a status resent every pass would be a message per
+            // tick per exited pane, forever.
+            if let RunState::Exited(code) = pane.session.state()
+                && pane.status.is_live()
+            {
+                pane.status = PaneStatus::Exited(code);
                 exited.push((*id, code));
             }
         }

@@ -152,6 +152,117 @@ fn wait_for(
     panic!("timed out waiting for {what}; saw {seen:#?}");
 }
 
+/// Connects, says hello, and subscribes, returning the queue and the writer.
+fn attach() -> (Receiver<ServerMessage>, impl std::io::Write) {
+    let (reader, mut writer) = connect().split().expect("splitting succeeds");
+    let inbox = read_in_background(reader);
+
+    Frame::write(
+        &mut writer,
+        &ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "integration test".into(),
+        },
+    )
+    .expect("writing succeeds");
+    let welcome = wait_for(&inbox, "a welcome", |m| !m.is_empty());
+    assert!(
+        matches!(welcome.first(), Some(ServerMessage::Welcome { .. })),
+        "expected a welcome, got {welcome:#?}"
+    );
+
+    Frame::write(&mut writer, &ClientMessage::Subscribe).expect("writing succeeds");
+
+    (inbox, writer)
+}
+
+/// Everything a pane printed, as text, across the messages seen.
+fn output_of(messages: &[ServerMessage], pane: dispatch_core::PaneId) -> String {
+    let bytes: Vec<u8> = messages
+        .iter()
+        .filter_map(|m| match m {
+            ServerMessage::PaneOutput { pane: p, bytes } if *p == pane => Some(bytes.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[test]
+fn a_second_connection_is_replayed_what_a_pane_printed() {
+    // What a reattaching client depends on, at the socket rather than through
+    // the interface: the daemon remembers and repeats.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let endpoint = Endpoint::new("replay");
+
+    let project_dir = endpoint.dir.join("project");
+    std::fs::create_dir_all(&project_dir).expect("temp dir is writable");
+    let _daemon = RunningDaemon::start(&endpoint.dir, &project_dir);
+
+    let (inbox, mut writer) = attach();
+    let announced = wait_for(&inbox, "the project", |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::ProjectOpened { .. }))
+    });
+    let project = announced
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::ProjectOpened { project } => Some(project.id),
+            _ => None,
+        })
+        .expect("checked by wait_for");
+
+    Frame::write(
+        &mut writer,
+        &ClientMessage::SpawnPane {
+            project,
+            harness: "shell".into(),
+            size: (80, 24),
+        },
+    )
+    .expect("writing succeeds");
+    let spawned = wait_for(&inbox, "a pane", |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. }))
+    });
+    let pane = spawned
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::PaneSpawned { pane, .. } => Some(*pane),
+            _ => None,
+        })
+        .expect("checked by wait_for");
+
+    Frame::write(
+        &mut writer,
+        &ClientMessage::WritePane {
+            pane,
+            bytes: b"echo remembered-$((6*7))\n".to_vec(),
+        },
+    )
+    .expect("writing succeeds");
+    wait_for(&inbox, "the pane's output", |m| {
+        output_of(m, pane).contains("remembered-42")
+    });
+
+    // The first connection goes away, as a client exiting would.
+    drop(writer);
+    drop(inbox);
+
+    let (second, _writer) = attach();
+    let replayed = wait_for(&second, "the replayed output", |m| {
+        output_of(m, pane).contains("remembered-42")
+    });
+    assert!(
+        replayed
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. })),
+        "the pane is announced as well as replayed, got {replayed:#?}"
+    );
+}
+
 #[test]
 fn a_client_drives_a_pane_through_the_socket() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());

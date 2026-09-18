@@ -60,6 +60,13 @@ mod tempdir {
 
     impl Drop for TempDir {
         fn drop(&mut self) {
+            // DISPATCH_E2E_KEEP leaves the directory behind, logs included.
+            // These tests drive whole processes, and the logs are usually the
+            // only record of why one of them did the wrong thing.
+            if std::env::var_os("DISPATCH_E2E_KEEP").is_some() {
+                eprintln!("keeping {}", self.0.display());
+                return;
+            }
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
@@ -116,7 +123,10 @@ struct Daemon(std::process::Child);
 impl Daemon {
     fn start(fixture: &Fixture) -> Self {
         // A sibling of the client binary. Cargo only defines CARGO_BIN_EXE_ for
-        // the package under test, so the daemon is found by path.
+        // the package under test, so the daemon is found by path — and it is
+        // whatever the last build left there. Run these against the workspace
+        // (`cargo test --workspace`, as CI does); `cargo test -p dispatch`
+        // alone will happily test a stale daemon.
         let mut path = std::path::PathBuf::from(env!("CARGO_BIN_EXE_dispatch"));
         path.set_file_name(if cfg!(windows) {
             "dispatchd.exe"
@@ -560,6 +570,16 @@ fn agents_survive_the_client_exiting() {
         "the daemon's project should be listed"
     );
     first.spawn_shell();
+    assert!(
+        first.wait_for(|lines| contains(lines, "$")),
+        "the shell should print a prompt"
+    );
+
+    first.send(b"echo survivor-$((6*7))\r");
+    assert!(
+        first.wait_for(|lines| contains(lines, "survivor-42")),
+        "the pane should answer the first client"
+    );
 
     // Quit the client. The pane belongs to the daemon, so nothing is killed.
     first.send(b"\x01q");
@@ -573,6 +593,13 @@ fn agents_survive_the_client_exiting() {
     assert!(
         second.wait_for(|lines| sidebar_panes(lines) == 1),
         "a new client should be told about the pane that is still running"
+    );
+
+    // And it is shown what happened while it was not there, rather than a
+    // blank rectangle.
+    assert!(
+        second.wait_for(|lines| contains(lines, "survivor-42")),
+        "the new client should be replayed what the pane printed"
     );
 
     // And it is the same shell: it answers.
