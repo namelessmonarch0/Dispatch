@@ -93,6 +93,14 @@ impl VtTerminal {
         Ok(Self { handle })
     }
 
+    /// The raw handle, for other modules in this crate that call the library.
+    ///
+    /// Crate-internal on purpose: the handle must not outlive `self`, and
+    /// nothing outside this crate touches raw pointers.
+    pub(crate) fn handle(&self) -> sys::Terminal {
+        self.handle
+    }
+
     /// Feeds bytes from the pseudoterminal into the emulator.
     ///
     /// Takes `&mut self` because libghostty-vt documents `vt_write` as
