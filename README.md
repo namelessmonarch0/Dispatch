@@ -5,7 +5,8 @@ An agent orchestration TUI. One control surface for multiple coding agents
 terminals, and — in later slices — an orchestrator that delegates work to
 spawned subagents under explicit approval.
 
-Status: **early**. Slice 1 (local TUI + PTY multiplexer) is in progress.
+Status: **early**. The TUI multiplexes local agents, and `dispatchd` can own
+them instead so they outlive the interface.
 
 ## Building
 
@@ -55,18 +56,26 @@ cargo build --workspace --target x86_64-pc-windows-gnu
 
 ## Running the daemon
 
-`dispatchd` owns the agents, so they survive a client exiting. It runs in the
-foreground and logs to a file:
+Dispatch works on its own, with the agents as its children. Started that way,
+closing it closes them.
+
+`dispatchd` owns the agents instead, so they survive a client exiting:
 
 ```sh
-cargo run -p dispatchd -- /path/to/project
+cargo run -p dispatchd -- /path/to/project     # one terminal
+cargo run -p dispatch -- --attach              # another, or later, or both
 ```
 
-Projects given on the command line are served immediately; a client can open
-more over the socket. One daemon per configuration directory: a second refuses
-to start rather than splitting the fleet in two. `SIGTERM`, `SIGINT`, or a closed console stops it
-and terminates its panes. `DISPATCH_CONFIG_DIR` gives a separate daemon its own
-endpoint, harnesses, and log.
+Several clients can attach at once and see the same panes. A client attaching to
+a pane that is already running is replayed the last 256 KiB it printed, so
+reattaching shows the work rather than a blank rectangle.
+
+The daemon runs in the foreground and logs to a file. Projects given on its
+command line are served immediately; an attached client opens more over the
+socket. One daemon per configuration directory: a second refuses to start rather
+than splitting the fleet in two. `SIGTERM`, `SIGINT`, or a closed console stops
+it and terminates its panes. `DISPATCH_CONFIG_DIR` gives a separate daemon its
+own endpoint, harnesses, and log.
 
 ## License
 
