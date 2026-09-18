@@ -349,6 +349,4 @@ fn spawn_waiter(mut child: Box<dyn portable_pty::Child + Send + Sync>, tx: Sende
 }
 
 #[cfg(test)]
-mod diagnose;
-#[cfg(test)]
 mod tests;
