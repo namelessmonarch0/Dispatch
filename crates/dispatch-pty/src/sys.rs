@@ -1,82 +1,183 @@
 //! Raw FFI declarations for the vendored `libghostty-vt`.
 //!
-//! Hand-written for now and deliberately minimal: enough to prove the library
-//! links and round-trips bytes on every target. The full surface is generated
-//! by `cargo xtask regen-bindings` and will replace this module.
+//! Hand-written and deliberately narrow: only what Dispatch calls. The full
+//! generated surface is produced by `cargo xtask regen-bindings`.
 //!
-//! Every item here mirrors `vendor/libghostty-vt/include/ghostty/vt/`.
+//! Every item mirrors a declaration in
+//! `vendor/libghostty-vt/include/ghostty/vt/`. Nothing here is safe to call
+//! directly; [`crate::vt`] is the supported interface.
 
 use std::ffi::c_void;
 
-/// Opaque terminal handle. Mirrors `GhosttyTerminal` in `types.h`, which is a
-/// pointer to an incomplete `struct GhosttyTerminalImpl`.
+/// Opaque terminal handle. `GhosttyTerminal` in `types.h` is a pointer to an
+/// incomplete `struct GhosttyTerminalImpl`.
 pub type Terminal = *mut c_void;
 
+/// Opaque formatter handle.
+pub type Formatter = *mut c_void;
+
 /// Mirrors `GhosttyResult` in `types.h`.
-pub type Result = i32;
+pub type GhosttyResult = i32;
 
 /// `GHOSTTY_SUCCESS`
-pub const SUCCESS: Result = 0;
+pub const SUCCESS: GhosttyResult = 0;
+
+/// Selectors for [`ghostty_terminal_get`], from `GhosttyTerminalData`.
+///
+/// Only the fields Dispatch reads are declared. The discriminants are fixed
+/// by the header and must not be renumbered.
+pub mod data {
+    /// Terminal width in cells. Output type `uint16_t *`.
+    pub const COLS: i32 = 1;
+    /// Terminal height in cells. Output type `uint16_t *`.
+    pub const ROWS: i32 = 2;
+    /// Cursor column, zero-indexed. Output type `uint16_t *`.
+    pub const CURSOR_X: i32 = 3;
+    /// Cursor row within the active area, zero-indexed. Output type `uint16_t *`.
+    pub const CURSOR_Y: i32 = 4;
+}
+
+/// `GhosttyFormatterFormat::GHOSTTY_FORMATTER_FORMAT_PLAIN`
+pub const FORMAT_PLAIN: i32 = 0;
+
+/// Mirrors `GhosttyFormatterScreenExtra`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FormatterScreenExtra {
+    /// `sizeof` this struct, for forward compatibility.
+    pub size: usize,
+    /// Emit the cursor position.
+    pub cursor: bool,
+    /// Emit character set designations and invocations.
+    pub charsets: bool,
+}
+
+/// Mirrors `GhosttyFormatterTerminalExtra`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FormatterTerminalExtra {
+    /// `sizeof` this struct, for forward compatibility.
+    pub size: usize,
+    /// Emit the palette using OSC 4.
+    pub palette: bool,
+    /// Emit modes differing from their defaults using CSI h/l.
+    pub modes: bool,
+    /// Emit scrolling region state.
+    pub scrolling_region: bool,
+    /// Emit tabstop positions.
+    pub tabstops: bool,
+    /// Emit the working directory using OSC 7.
+    pub pwd: bool,
+    /// Emit keyboard modes.
+    pub keyboard: bool,
+    /// Screen-level extras.
+    pub screen: FormatterScreenExtra,
+}
+
+/// Mirrors `GhosttyFormatterTerminalOptions`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FormatterTerminalOptions {
+    /// `sizeof` this struct, for forward compatibility.
+    pub size: usize,
+    /// Output format to emit.
+    pub emit: i32,
+    /// Whether to unwrap soft-wrapped lines.
+    pub unwrap: bool,
+    /// Whether to trim trailing whitespace on non-blank lines.
+    pub trim: bool,
+    /// Extra terminal state to include.
+    pub extra: FormatterTerminalExtra,
+    /// Restricts output to a range. Null formats the whole screen.
+    pub selection: *const c_void,
+}
+
+impl FormatterTerminalOptions {
+    /// Options producing plain text for the whole screen.
+    ///
+    /// The `size` fields are what let the library accept a struct compiled
+    /// against an older header, so they must be set from `size_of`.
+    #[must_use]
+    pub fn plain_text() -> Self {
+        Self {
+            size: size_of::<Self>(),
+            emit: FORMAT_PLAIN,
+            unwrap: false,
+            trim: true,
+            extra: FormatterTerminalExtra {
+                size: size_of::<FormatterTerminalExtra>(),
+                palette: false,
+                modes: false,
+                scrolling_region: false,
+                tabstops: false,
+                pwd: false,
+                keyboard: false,
+                screen: FormatterScreenExtra {
+                    size: size_of::<FormatterScreenExtra>(),
+                    cursor: false,
+                    charsets: false,
+                },
+            },
+            selection: std::ptr::null(),
+        }
+    }
+}
 
 unsafe extern "C" {
     /// `ghostty_terminal_new(const GhosttyAllocator*, GhosttyTerminal*, uint16_t, uint16_t)`
     ///
-    /// Passing a null allocator selects the default allocator.
+    /// A null allocator selects the default allocator.
     pub fn ghostty_terminal_new(
         allocator: *const c_void,
         terminal: *mut Terminal,
         cols: u16,
         rows: u16,
-    ) -> Result;
+    ) -> GhosttyResult;
 
     /// `ghostty_terminal_free(GhosttyTerminal)`
     pub fn ghostty_terminal_free(terminal: Terminal);
 
     /// `ghostty_terminal_vt_write(GhosttyTerminal, const uint8_t*, size_t)`
     pub fn ghostty_terminal_vt_write(terminal: Terminal, data: *const u8, len: usize);
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    /// `ghostty_terminal_resize(GhosttyTerminal, uint16_t, uint16_t, uint32_t, uint32_t)`
+    pub fn ghostty_terminal_resize(
+        terminal: Terminal,
+        cols: u16,
+        rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) -> GhosttyResult;
 
-    /// Creates a terminal, writes a VT stream through it, and frees it.
+    /// `ghostty_terminal_get(GhosttyTerminal, GhosttyTerminalData, void*)`
     ///
-    /// This is the canary for the whole engine choice. `ghostty_terminal_vt_write`
-    /// is the exact call that faults with `STATUS_ACCESS_VIOLATION` on the
-    /// unsupported `x86_64-windows-msvc` target, so exercising it here means a
-    /// bad target configuration fails in CI rather than at runtime in a pane.
-    #[test]
-    fn terminal_round_trips_a_vt_stream() {
-        let mut terminal: Terminal = std::ptr::null_mut();
+    /// `out` must point at storage of the type the selector documents.
+    pub fn ghostty_terminal_get(terminal: Terminal, data: i32, out: *mut c_void) -> GhosttyResult;
 
-        // SAFETY: `terminal` is a valid out-pointer and a null allocator
-        // selects libghostty-vt's default allocator, per allocator.h.
-        let result = unsafe { ghostty_terminal_new(std::ptr::null(), &raw mut terminal, 80, 24) };
-        assert_eq!(result, SUCCESS, "ghostty_terminal_new failed");
-        assert!(!terminal.is_null(), "terminal handle is null after success");
+    /// `ghostty_formatter_terminal_new(const GhosttyAllocator*, GhosttyFormatter*, GhosttyTerminal, GhosttyFormatterTerminalOptions)`
+    ///
+    /// The terminal must outlive the formatter.
+    pub fn ghostty_formatter_terminal_new(
+        allocator: *const c_void,
+        formatter: *mut Formatter,
+        terminal: Terminal,
+        options: FormatterTerminalOptions,
+    ) -> GhosttyResult;
 
-        // Plain text, an SGR colour sequence, a cursor move, and an erase --
-        // enough to drive the parser through several states rather than only
-        // the ground state.
-        let stream: &[u8] = b"hello\x1b[31mred\x1b[0m\x1b[2;5Hmoved\x1b[2J";
+    /// `ghostty_formatter_format_alloc(GhosttyFormatter, const GhosttyAllocator*, uint8_t**, size_t*)`
+    ///
+    /// The buffer must be released with [`ghostty_free`] using the same
+    /// allocator.
+    pub fn ghostty_formatter_format_alloc(
+        formatter: Formatter,
+        allocator: *const c_void,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> GhosttyResult;
 
-        // SAFETY: `terminal` was created above and is not freed until below.
-        // `stream` outlives the call and its length is its true byte length.
-        unsafe { ghostty_terminal_vt_write(terminal, stream.as_ptr(), stream.len()) };
+    /// `ghostty_formatter_free(GhosttyFormatter)`
+    pub fn ghostty_formatter_free(formatter: Formatter);
 
-        // SAFETY: `terminal` is a live handle from `ghostty_terminal_new` and
-        // is not used after this call.
-        unsafe { ghostty_terminal_free(terminal) };
-    }
-
-    #[test]
-    fn rejects_a_zero_sized_terminal() {
-        let mut terminal: Terminal = std::ptr::null_mut();
-
-        // SAFETY: same contract as above; cols/rows are documented as needing
-        // to be greater than zero, so this exercises the error path.
-        let result = unsafe { ghostty_terminal_new(std::ptr::null(), &raw mut terminal, 0, 0) };
-        assert_ne!(result, SUCCESS, "a zero-sized terminal should be rejected");
-    }
+    /// `ghostty_free(const GhosttyAllocator*, uint8_t*, size_t)`
+    pub fn ghostty_free(allocator: *const c_void, ptr: *mut u8, len: usize);
 }

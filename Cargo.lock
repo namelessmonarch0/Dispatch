@@ -339,6 +339,7 @@ dependencies = [
 name = "dispatch-pty"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "dispatch-config",
  "dispatch-core",
  "dispatch-os",
