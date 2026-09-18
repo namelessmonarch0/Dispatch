@@ -8,7 +8,10 @@ use anyhow::{Context, Result};
 use dispatch_config::{HarnessRegistry, Launch};
 use dispatch_core::{AppState, HarnessId, PaneId, PaneStatus, Project, ProjectSource};
 use dispatch_layout::{tile, tile_zoomed};
-use dispatch_pty::{KeyEncoder, PtySession, RunState, Screen, ScreenReader, Size};
+use dispatch_pty::{
+    KeyEncoder, MouseEncoder, MouseInput, PtySession, RunState, Screen, ScreenReader, ScrollTo,
+    Size,
+};
 use dispatch_tui::input::{Action, Direction, Event, InputRouter, KeyCode, KeyEventKind};
 use dispatch_tui::{Item, PaneWidget, Picker, Sidebar, sidebar};
 use ratatui::Frame;
@@ -41,6 +44,9 @@ const FRAME: Duration = Duration::from_millis(16);
 struct Pane {
     session: PtySession,
     encoder: KeyEncoder,
+    mouse: MouseEncoder,
+    /// Whether the viewport is scrolled away from the newest output.
+    scrolled_back: bool,
     reader: ScreenReader,
     /// Last screen read, redrawn each frame without re-reading when nothing
     /// changed.
@@ -147,6 +153,8 @@ impl App {
             Pane {
                 session,
                 encoder: KeyEncoder::new().context("failed to create a key encoder")?,
+                mouse: MouseEncoder::new().context("failed to create a mouse encoder")?,
+                scrolled_back: false,
                 reader,
                 screen,
             },
@@ -208,14 +216,14 @@ impl App {
                 let _ = self.state.focus(id);
             }
             Action::FocusDirection(direction) => self.focus_direction(direction),
+            Action::SendMouse(id, input) => self.send_mouse(id, input),
+            Action::Scroll(rows) => self.scroll_focused(rows),
             Action::ToggleZoom => self.state.toggle_zoom(),
             Action::ClosePane => self.close_focused(),
             Action::NewPane => self.open_harness_picker(),
             Action::ProjectPicker => self.open_project_picker(),
             Action::HarnessManager => self.open_harness_manager(),
-            Action::Scrollback => {
-                self.status = "scrollback is not implemented yet".into();
-            }
+            Action::Scrollback => self.scroll_focused(-10),
         }
 
         Ok(())
@@ -347,6 +355,12 @@ impl App {
         let Some(id) = self.state.focused_pane() else {
             return;
         };
+
+        // Typing jumps back to the newest output, as every terminal does:
+        // otherwise the reply to what was just typed appears somewhere the
+        // user is not looking.
+        self.scroll_to_bottom(id);
+
         let Some(pane) = self.panes.get_mut(&id) else {
             return;
         };
@@ -366,6 +380,86 @@ impl App {
             Ok(_) => {}
             Err(error) => tracing::warn!(%error, "failed to encode a key"),
         }
+    }
+
+    /// Forwards a pointer event to a pane, or scrolls it.
+    ///
+    /// A pane that tracks the mouse receives the event. One that does not gets
+    /// nothing, and a wheel event then scrolls its scrollback instead, which
+    /// is what a terminal without mouse tracking does.
+    fn send_mouse(&mut self, id: PaneId, input: MouseInput) {
+        let Some(pane) = self.panes.get_mut(&id) else {
+            return;
+        };
+
+        let size = pane.session.size();
+        let bytes = match pane.mouse.encode(pane.session.terminal(), size, input) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%error, "failed to encode a pointer event");
+                return;
+            }
+        };
+
+        if !bytes.is_empty() {
+            if let Err(error) = pane.session.write(&bytes) {
+                tracing::warn!(%error, "failed to send a pointer event to a pane");
+            }
+            return;
+        }
+
+        // Nothing was encoded, so the pane is not tracking the mouse.
+        use dispatch_pty::MouseButton;
+        let rows = match input.button {
+            MouseButton::WheelUp => -3,
+            MouseButton::WheelDown => 3,
+            _ => return,
+        };
+
+        self.scroll_pane(id, rows);
+    }
+
+    /// Scrolls the focused pane.
+    fn scroll_focused(&mut self, rows: isize) {
+        let Some(id) = self.state.focused_pane() else {
+            return;
+        };
+        self.scroll_pane(id, rows);
+    }
+
+    /// Scrolls one pane and refreshes what it shows.
+    fn scroll_pane(&mut self, id: PaneId, rows: isize) {
+        let Some(pane) = self.panes.get_mut(&id) else {
+            return;
+        };
+
+        pane.session.terminal_mut().scroll(ScrollTo::Delta(rows));
+        pane.scrolled_back = true;
+
+        if let Ok(screen) = pane.reader.read(pane.session.terminal()) {
+            pane.screen = screen;
+        }
+
+        self.status = "scrolled back — press End or type to return".into();
+    }
+
+    /// Returns a pane to the newest output.
+    fn scroll_to_bottom(&mut self, id: PaneId) {
+        let Some(pane) = self.panes.get_mut(&id) else {
+            return;
+        };
+        if !pane.scrolled_back {
+            return;
+        }
+
+        pane.session.terminal_mut().scroll(ScrollTo::Bottom);
+        pane.scrolled_back = false;
+
+        if let Ok(screen) = pane.reader.read(pane.session.terminal()) {
+            pane.screen = screen;
+        }
+
+        self.status.clear();
     }
 
     fn paste(&mut self, text: &str) {

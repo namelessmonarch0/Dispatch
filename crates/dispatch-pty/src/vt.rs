@@ -60,6 +60,17 @@ impl Size {
     }
 }
 
+/// Where to move a pane's viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollTo {
+    /// The oldest output still held.
+    Top,
+    /// The active area, where new output appears.
+    Bottom,
+    /// A signed number of rows. Negative moves towards older output.
+    Delta(isize),
+}
+
 /// The terminal state behind one pane.
 ///
 /// Feed it bytes from a pseudoterminal; read a screen back out.
@@ -154,6 +165,36 @@ impl VtTerminal {
             x: self.get_u16(sys::data::CURSOR_X, "ghostty_terminal_get(CURSOR_X)")?,
             y: self.get_u16(sys::data::CURSOR_Y, "ghostty_terminal_get(CURSOR_Y)")?,
         })
+    }
+
+    /// Moves the viewport over the scrollback.
+    ///
+    /// Scrolling is a property of the viewport, not of the screen contents, so
+    /// output continues to arrive while scrolled back; it simply lands below
+    /// what is being looked at.
+    ///
+    /// Has no effect on the alternate screen, which has no scrollback. A
+    /// full-screen agent is therefore unaffected, which is correct: its own
+    /// interface owns the whole viewport.
+    pub fn scroll(&mut self, to: ScrollTo) {
+        let behavior = match to {
+            ScrollTo::Top => sys::ScrollViewport {
+                tag: sys::scroll::TOP,
+                value: sys::ScrollValue { _padding: [0; 2] },
+            },
+            ScrollTo::Bottom => sys::ScrollViewport {
+                tag: sys::scroll::BOTTOM,
+                value: sys::ScrollValue { _padding: [0; 2] },
+            },
+            ScrollTo::Delta(rows) => sys::ScrollViewport {
+                tag: sys::scroll::DELTA,
+                value: sys::ScrollValue { delta: rows },
+            },
+        };
+
+        // SAFETY: the handle is live and the tag matches the union member set
+        // above, which is the contract the tagged union documents.
+        unsafe { sys::ghostty_terminal_scroll_viewport(self.handle, behavior) };
     }
 
     /// The visible screen as plain text, one line per row.
@@ -360,5 +401,114 @@ mod tests {
         let mut terminal = terminal();
         terminal.feed(&[0xff, 0xfe, b'o', b'k']);
         let _ = terminal.plain_text().expect("formatting still succeeds");
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    /// A terminal with more output than fits, so there is scrollback.
+    fn scrolled() -> VtTerminal {
+        let mut terminal = VtTerminal::new(Size::new(20, 5)).expect("creatable");
+        for i in 1..=20 {
+            terminal.feed(format!("line{i}\r\n").as_bytes());
+        }
+        terminal
+    }
+
+    fn lines(terminal: &VtTerminal) -> Vec<String> {
+        terminal
+            .plain_text()
+            .expect("formatting succeeds")
+            .lines()
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn the_viewport_starts_at_the_newest_output() {
+        let terminal = scrolled();
+        assert!(
+            lines(&terminal).iter().any(|l| l.contains("line20")),
+            "the newest line should be visible"
+        );
+    }
+
+    #[test]
+    fn scrolling_up_reveals_older_output() {
+        let mut terminal = scrolled();
+        terminal.scroll(ScrollTo::Delta(-10));
+
+        let visible = lines(&terminal);
+        assert!(
+            visible.iter().any(|l| l.contains("line1"))
+                || visible.iter().any(|l| l.contains("line5")),
+            "older output should be visible, got {visible:?}"
+        );
+    }
+
+    #[test]
+    fn scrolling_to_the_top_shows_the_oldest_output() {
+        let mut terminal = scrolled();
+        terminal.scroll(ScrollTo::Top);
+
+        assert!(
+            lines(&terminal).iter().any(|l| l.contains("line1")),
+            "the oldest line should be visible"
+        );
+    }
+
+    #[test]
+    fn scrolling_back_to_the_bottom_returns_to_the_newest() {
+        let mut terminal = scrolled();
+        terminal.scroll(ScrollTo::Top);
+        terminal.scroll(ScrollTo::Bottom);
+
+        assert!(
+            lines(&terminal).iter().any(|l| l.contains("line20")),
+            "returning to the bottom should show the newest line"
+        );
+    }
+
+    #[test]
+    fn output_keeps_arriving_while_scrolled_back() {
+        // Scrolling is a property of the viewport, so an agent does not stop
+        // working because someone is reading its history.
+        let mut terminal = scrolled();
+        terminal.scroll(ScrollTo::Top);
+        terminal.feed(b"arrived-later\r\n");
+
+        terminal.scroll(ScrollTo::Bottom);
+        assert!(
+            lines(&terminal).iter().any(|l| l.contains("arrived-later")),
+            "output written while scrolled back should still be there"
+        );
+    }
+
+    #[test]
+    fn scrolling_past_the_ends_clamps_rather_than_panicking() {
+        let mut terminal = scrolled();
+
+        terminal.scroll(ScrollTo::Delta(-10_000));
+        assert!(!lines(&terminal).is_empty(), "scrolled far up");
+
+        terminal.scroll(ScrollTo::Delta(10_000));
+        assert!(
+            lines(&terminal).iter().any(|l| l.contains("line20")),
+            "scrolled far down"
+        );
+    }
+
+    #[test]
+    fn scrolling_a_terminal_with_no_scrollback_is_harmless() {
+        let mut terminal = VtTerminal::new(Size::new(20, 5)).expect("creatable");
+        terminal.feed(b"only");
+
+        terminal.scroll(ScrollTo::Top);
+        terminal.scroll(ScrollTo::Delta(-5));
+
+        assert!(lines(&terminal).iter().any(|l| l.contains("only")));
     }
 }

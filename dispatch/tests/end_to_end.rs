@@ -403,3 +403,33 @@ fn a_picker_takes_the_keyboard_while_it_is_open() {
         "picker navigation must not reach the pane"
     );
 }
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn a_pane_can_be_scrolled_back_and_typing_returns_to_the_newest_output() {
+    // Scrollback is only useful if new output does not yank the view away and
+    // typing brings it back, which is what every terminal does.
+    let mut app = Harness::start(Size::new(100, 30));
+    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+
+    app.spawn_shell();
+
+    // More output than the pane can show.
+    app.send(b"i=1; while [ $i -le 80 ]; do echo row$i; i=$((i+1)); done\r");
+    assert!(
+        app.wait_for(|lines| contains(lines, "row80")),
+        "the newest output should be visible first"
+    );
+
+    app.send(b"\x01[");
+    assert!(
+        app.wait_for(|lines| contains(lines, "scrolled back")),
+        "scrolling back should be announced"
+    );
+
+    app.send(b"echo back-at-the-bottom\r");
+    assert!(
+        app.wait_for(|lines| contains(lines, "back-at-the-bottom")),
+        "typing should return to the newest output"
+    );
+}

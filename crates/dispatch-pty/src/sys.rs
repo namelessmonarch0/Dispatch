@@ -149,6 +149,9 @@ unsafe extern "C" {
         cell_height_px: u32,
     ) -> GhosttyResult;
 
+    /// `ghostty_terminal_scroll_viewport(GhosttyTerminal, GhosttyTerminalScrollViewport)`
+    pub fn ghostty_terminal_scroll_viewport(terminal: Terminal, behavior: ScrollViewport);
+
     /// `ghostty_terminal_get(GhosttyTerminal, GhosttyTerminalData, void*)`
     ///
     /// `out` must point at storage of the type the selector documents.
@@ -393,6 +396,145 @@ unsafe extern "C" {
     ) -> GhosttyResult;
 }
 
+/// Opaque mouse-encoder handle.
+pub type MouseEncoder = *mut c_void;
+
+/// Opaque mouse-event handle.
+pub type MouseEvent = *mut c_void;
+
+/// `GHOSTTY_MOUSE_ENCODER_OPT_SIZE`
+pub const MOUSE_ENCODER_OPT_SIZE: i32 = 2;
+
+/// `GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED`
+pub const MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED: i32 = 3;
+
+/// Mouse button values, from `GhosttyMouseButton`.
+pub mod mouse_button {
+    /// No known button.
+    pub const UNKNOWN: i32 = 0;
+    /// Left.
+    pub const LEFT: i32 = 1;
+    /// Right.
+    pub const RIGHT: i32 = 2;
+    /// Middle.
+    pub const MIDDLE: i32 = 3;
+    /// Wheel up.
+    pub const FOUR: i32 = 4;
+    /// Wheel down.
+    pub const FIVE: i32 = 5;
+    /// Wheel left.
+    pub const SIX: i32 = 6;
+    /// Wheel right.
+    pub const SEVEN: i32 = 7;
+}
+
+/// Mouse actions, from `GhosttyMouseAction`.
+pub mod mouse_action {
+    /// Button pressed.
+    pub const PRESS: i32 = 0;
+    /// Button released.
+    pub const RELEASE: i32 = 1;
+    /// Pointer moved.
+    pub const MOTION: i32 = 2;
+}
+
+/// Mirrors `GhosttyMousePosition`, in surface pixels.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MousePosition {
+    /// Horizontal position.
+    pub x: f32,
+    /// Vertical position.
+    pub y: f32,
+}
+
+/// Mirrors `GhosttyMouseEncoderSize`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MouseEncoderSize {
+    /// `sizeof` this struct, for forward compatibility.
+    pub size: usize,
+    /// Screen width in pixels.
+    pub screen_width: u32,
+    /// Screen height in pixels.
+    pub screen_height: u32,
+    /// Cell width in pixels. Must not be zero.
+    pub cell_width: u32,
+    /// Cell height in pixels. Must not be zero.
+    pub cell_height: u32,
+    /// Top padding.
+    pub padding_top: u32,
+    /// Bottom padding.
+    pub padding_bottom: u32,
+    /// Right padding.
+    pub padding_right: u32,
+    /// Left padding.
+    pub padding_left: u32,
+}
+
+impl MouseEncoderSize {
+    /// A size where one pixel is one cell.
+    ///
+    /// The encoder works in surface pixels because it was written for a
+    /// renderer that draws glyphs. Dispatch has no pixels, so declaring a
+    /// one-by-one cell makes pixel space and cell space the same thing and
+    /// lets cell coordinates be passed through unchanged.
+    #[must_use]
+    pub fn in_cells(cols: u16, rows: u16) -> Self {
+        Self {
+            size: size_of::<Self>(),
+            screen_width: u32::from(cols),
+            screen_height: u32::from(rows),
+            cell_width: 1,
+            cell_height: 1,
+            padding_top: 0,
+            padding_bottom: 0,
+            padding_right: 0,
+            padding_left: 0,
+        }
+    }
+}
+
+/// Tags for `GhosttyTerminalScrollViewport`.
+pub mod scroll {
+    /// Jump to the oldest scrollback.
+    pub const TOP: i32 = 0;
+    /// Return to the active area.
+    pub const BOTTOM: i32 = 1;
+    /// Move by a signed number of rows.
+    pub const DELTA: i32 = 2;
+    /// Jump to an absolute row.
+    pub const ROW: i32 = 3;
+}
+
+/// Mirrors `GhosttyTerminalScrollViewportValue`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union ScrollValue {
+    /// Rows to move by; negative is towards older output.
+    pub delta: isize,
+    /// Absolute row.
+    pub row: usize,
+    /// Forces the union's size and alignment, as the header does.
+    pub _padding: [u64; 2],
+}
+
+impl std::fmt::Debug for ScrollValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ScrollValue")
+    }
+}
+
+/// Mirrors `GhosttyTerminalScrollViewport`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ScrollViewport {
+    /// Which member of `value` is active.
+    pub tag: i32,
+    /// The amount or position.
+    pub value: ScrollValue,
+}
+
 /// Opaque key-encoder handle.
 pub type KeyEncoder = *mut c_void;
 
@@ -537,4 +679,52 @@ unsafe extern "C" {
 
     /// `ghostty_key_event_set_unshifted_codepoint(GhosttyKeyEvent, uint32_t)`
     pub fn ghostty_key_event_set_unshifted_codepoint(event: KeyEvent, codepoint: u32);
+
+    /// `ghostty_mouse_encoder_new(const GhosttyAllocator*, GhosttyMouseEncoder*)`
+    pub fn ghostty_mouse_encoder_new(
+        allocator: *const c_void,
+        encoder: *mut MouseEncoder,
+    ) -> GhosttyResult;
+
+    /// `ghostty_mouse_encoder_free(GhosttyMouseEncoder)`
+    pub fn ghostty_mouse_encoder_free(encoder: MouseEncoder);
+
+    /// `ghostty_mouse_encoder_setopt(GhosttyMouseEncoder, GhosttyMouseEncoderOption, const void*)`
+    pub fn ghostty_mouse_encoder_setopt(encoder: MouseEncoder, option: i32, value: *const c_void);
+
+    /// `ghostty_mouse_encoder_setopt_from_terminal(GhosttyMouseEncoder, GhosttyTerminal)`
+    ///
+    /// Copies the terminal's active mouse tracking modes into the encoder,
+    /// which is what decides whether an event is reported at all.
+    pub fn ghostty_mouse_encoder_setopt_from_terminal(encoder: MouseEncoder, terminal: Terminal);
+
+    /// `ghostty_mouse_encoder_encode(GhosttyMouseEncoder, GhosttyMouseEvent, char*, size_t, size_t*)`
+    pub fn ghostty_mouse_encoder_encode(
+        encoder: MouseEncoder,
+        event: MouseEvent,
+        out_buf: *mut u8,
+        out_buf_size: usize,
+        out_len: *mut usize,
+    ) -> GhosttyResult;
+
+    /// `ghostty_mouse_event_new(const GhosttyAllocator*, GhosttyMouseEvent*)`
+    pub fn ghostty_mouse_event_new(
+        allocator: *const c_void,
+        event: *mut MouseEvent,
+    ) -> GhosttyResult;
+
+    /// `ghostty_mouse_event_free(GhosttyMouseEvent)`
+    pub fn ghostty_mouse_event_free(event: MouseEvent);
+
+    /// `ghostty_mouse_event_set_action(GhosttyMouseEvent, GhosttyMouseAction)`
+    pub fn ghostty_mouse_event_set_action(event: MouseEvent, action: i32);
+
+    /// `ghostty_mouse_event_set_button(GhosttyMouseEvent, GhosttyMouseButton)`
+    pub fn ghostty_mouse_event_set_button(event: MouseEvent, button: i32);
+
+    /// `ghostty_mouse_event_set_mods(GhosttyMouseEvent, GhosttyMods)`
+    pub fn ghostty_mouse_event_set_mods(event: MouseEvent, mods: u16);
+
+    /// `ghostty_mouse_event_set_position(GhosttyMouseEvent, GhosttyMousePosition)`
+    pub fn ghostty_mouse_event_set_position(event: MouseEvent, position: MousePosition);
 }

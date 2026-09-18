@@ -6,12 +6,16 @@
 //! already use.
 
 use dispatch_core::PaneId;
-use dispatch_pty::{Key, Modifiers};
+use dispatch_pty::{Key, Modifiers, MouseAction, MouseButton, MouseInput};
 use ratatui::layout::Rect;
 
 pub use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
+
+// Renamed to keep it distinct from the encoder's own button type, which this
+// module converts into.
+use crossterm::event::MouseButton as MouseButton_;
 
 /// Which way to move focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +44,10 @@ pub enum Action {
     Paste(String),
     /// Focus a pane, from the mouse moving over it.
     FocusPane(PaneId),
+    /// Forward a pointer event to a pane, in coordinates relative to it.
+    SendMouse(PaneId, MouseInput),
+    /// Scroll the focused pane's viewport by a signed number of rows.
+    Scroll(isize),
     /// Move focus in a direction.
     FocusDirection(Direction),
     /// Open the pane picker.
@@ -164,15 +172,47 @@ impl InputRouter {
     }
 
     fn handle_mouse(&mut self, event: &MouseEvent, panes: &[(PaneId, Rect)]) -> Action {
-        match event.kind {
+        let Some((id, rect)) = panes
+            .iter()
+            .find(|(_, rect)| contains(*rect, event.column, event.row))
+        else {
+            // The sidebar and status row are not panes. Moving across them
+            // must not drop focus or send anything anywhere.
+            return Action::None;
+        };
+
+        // Coordinates are relative to the pane, because that is the only frame
+        // of reference the child has.
+        let col = event.column - rect.x;
+        let row = event.row - rect.y;
+        let modifiers = modifiers_of(event.modifiers);
+
+        let (action, button) = match event.kind {
             // Focus follows the pointer, so moving the mouse over a pane is
             // enough to type into it.
-            MouseEventKind::Moved => panes
-                .iter()
-                .find(|(_, rect)| contains(*rect, event.column, event.row))
-                .map_or(Action::None, |(id, _)| Action::FocusPane(*id)),
-            _ => Action::None,
-        }
+            MouseEventKind::Moved => return Action::FocusPane(*id),
+            MouseEventKind::Down(button) => (MouseAction::Press, translate_button(button)),
+            MouseEventKind::Up(button) => (MouseAction::Release, translate_button(button)),
+            MouseEventKind::Drag(button) => (MouseAction::Motion, translate_button(button)),
+            // Scrolling is handled by Dispatch when the pane is not tracking
+            // the mouse, which the caller decides; sending it as a wheel
+            // button lets a pane that does track it receive it instead.
+            MouseEventKind::ScrollUp => (MouseAction::Press, MouseButton::WheelUp),
+            MouseEventKind::ScrollDown => (MouseAction::Press, MouseButton::WheelDown),
+            MouseEventKind::ScrollLeft => (MouseAction::Press, MouseButton::WheelLeft),
+            MouseEventKind::ScrollRight => (MouseAction::Press, MouseButton::WheelRight),
+        };
+
+        Action::SendMouse(
+            *id,
+            MouseInput {
+                action,
+                button,
+                col,
+                row,
+                modifiers,
+            },
+        )
     }
 }
 
@@ -198,6 +238,15 @@ fn command_for(event: &KeyEvent) -> Action {
         // An unbound key after the prefix does nothing rather than reaching
         // the pane, so a mistyped command cannot run something in an agent.
         _ => Action::None,
+    }
+}
+
+/// Converts a crossterm button into the encoder's.
+fn translate_button(button: MouseButton_) -> MouseButton {
+    match button {
+        MouseButton_::Left => MouseButton::Left,
+        MouseButton_::Middle => MouseButton::Middle,
+        MouseButton_::Right => MouseButton::Right,
     }
 }
 

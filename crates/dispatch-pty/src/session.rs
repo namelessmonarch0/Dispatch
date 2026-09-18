@@ -244,6 +244,11 @@ impl PtySession {
         &self.terminal
     }
 
+    /// The pane's screen, mutably, for scrolling its viewport.
+    pub fn terminal_mut(&mut self) -> &mut VtTerminal {
+        &mut self.terminal
+    }
+
     /// Whether the child is still running.
     #[must_use]
     pub fn state(&self) -> RunState {

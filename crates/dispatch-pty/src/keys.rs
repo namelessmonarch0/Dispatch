@@ -128,7 +128,7 @@ impl Modifiers {
         super_: false,
     };
 
-    fn to_ghostty(self) -> u16 {
+    pub(crate) fn to_ghostty(self) -> u16 {
         let mut bits = 0;
         if self.shift {
             bits |= sys::mods::SHIFT;
