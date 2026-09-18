@@ -133,6 +133,9 @@ impl PtySession {
         let reader = pair.master.try_clone_reader().map_err(PtyError::Open)?;
         let writer = pair.master.take_writer().map_err(PtyError::Open)?;
 
+        let mut writer = writer;
+        answer_inherit_cursor_handshake(&mut writer);
+
         let (tx, events) = channel();
         spawn_reader(reader, tx.clone());
         spawn_waiter(child, tx);
@@ -278,6 +281,26 @@ impl Drop for PtySession {
         if matches!(self.state, RunState::Running) {
             self.terminate();
         }
+    }
+}
+
+/// Unblocks ConPTY's inherit-cursor handshake on Windows.
+///
+/// `portable-pty` creates the pseudoconsole with `PSEUDOCONSOLE_INHERIT_CURSOR`,
+/// which makes ConPTY ask the containing terminal where its cursor is and wait
+/// for the answer before it starts pumping. A terminal emulator answers because
+/// it is one; Dispatch embeds the pseudoconsole instead, so without this the
+/// child starts, produces no output, and never exits.
+///
+/// Sends a cursor position report for row 1, column 1. A failure here is not
+/// fatal on its own, so it is logged rather than returned.
+fn answer_inherit_cursor_handshake(writer: &mut Box<dyn Write + Send>) {
+    if !cfg!(windows) {
+        return;
+    }
+
+    if let Err(error) = writer.write_all(b"\x1b[1;1R").and_then(|()| writer.flush()) {
+        tracing::warn!(%error, "failed to answer the ConPTY inherit-cursor handshake");
     }
 }
 

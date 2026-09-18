@@ -82,6 +82,17 @@ fn conpty_diagnostics() {
     };
     report.push_str("try_clone_reader: ok\n");
 
+    // ConPTY is created with PSEUDOCONSOLE_INHERIT_CURSOR and waits for a
+    // cursor position report before it pumps anything.
+    match pair.master.take_writer() {
+        Ok(mut w) => {
+            use std::io::Write;
+            let r = w.write_all(b"\x1b[1;1R").and_then(|()| w.flush());
+            report.push_str(&format!("inherit-cursor answer: {r:?}\n"));
+        }
+        Err(e) => report.push_str(&format!("take_writer failed: {e:?}\n")),
+    }
+
     drop(pair.slave);
     report.push_str("slave dropped\n");
 
