@@ -84,6 +84,14 @@ pub fn daemon_log_file() -> Result<PathBuf, PathError> {
     Ok(project_dirs()?.data_dir().join("dispatchd.log"))
 }
 
+/// Path to the file holding the running daemon's process id.
+///
+/// Written by the daemon while it is listening. The endpoint says whether a
+/// daemon is answering; this says which process to stop.
+pub fn daemon_pid_file() -> Result<PathBuf, PathError> {
+    Ok(config_dir()?.join("dispatchd.pid"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +120,7 @@ mod tests {
             harnesses_dir().expect("harnesses_dir resolves"),
             log_file().expect("log_file resolves"),
             daemon_log_file().expect("daemon_log_file resolves"),
+            daemon_pid_file().expect("daemon_pid_file resolves"),
         ] {
             assert!(path.is_absolute(), "{} is not absolute", path.display());
         }

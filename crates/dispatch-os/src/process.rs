@@ -1,4 +1,5 @@
-//! Killing an agent and everything it spawned.
+//! Starting a process that outlives its parent, and killing one with its
+//! children.
 //!
 //! Agents start subprocesses -- language servers, test runners, build tools.
 //! Killing only the process Dispatch spawned leaves those orphaned and still
@@ -7,9 +8,19 @@
 
 use std::time::Duration;
 
-/// Failure to terminate a process tree.
+/// Failure to start or terminate a process.
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessError {
+    /// The process could not be started.
+    #[error("failed to start {program}: {source}")]
+    Spawn {
+        /// What was being started.
+        program: String,
+        /// Underlying OS error.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The operating system refused the request.
     #[error("failed to terminate process tree for pid {pid}: {source}")]
     Terminate {
@@ -24,6 +35,23 @@ pub enum ProcessError {
 /// How long a tree is given to exit on its own before it is killed outright.
 pub const DEFAULT_GRACE: Duration = Duration::from_millis(250);
 
+/// Starts `program` detached from this process's terminal, and returns its pid.
+///
+/// Detached means two things, both needed by a daemon a client starts on demand:
+/// it keeps running when the client exits, and a Ctrl-C in the terminal the
+/// client was started from does not reach it. Without the second, quitting
+/// Dispatch with Ctrl-C would take the agents with it, which is the thing the
+/// daemon exists to prevent.
+///
+/// Its output goes nowhere: a daemon logs to a file, and anything it printed
+/// would land in the middle of the client's interface.
+pub fn spawn_detached(
+    program: &std::path::Path,
+    args: &[std::ffi::OsString],
+) -> Result<u32, ProcessError> {
+    imp::spawn_detached(program, args)
+}
+
 /// Terminates `pid` and every process in its group or job.
 ///
 /// Asks politely first, waits up to `grace`, then kills what is left. A tree
@@ -36,6 +64,41 @@ pub fn terminate_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
 #[cfg(unix)]
 mod imp {
     use super::{Duration, ProcessError};
+
+    pub(super) fn spawn_detached(
+        program: &std::path::Path,
+        args: &[std::ffi::OsString],
+    ) -> Result<u32, ProcessError> {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new(program);
+        command
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        // SAFETY: setsid is async-signal-safe and is the documented way to
+        // leave the parent's session and process group, which is what stops a
+        // Ctrl-C in the parent's terminal from reaching this child. The closure
+        // allocates nothing and touches no shared state.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        command
+            .spawn()
+            .map(|child| child.id())
+            .map_err(|source| ProcessError::Spawn {
+                program: program.display().to_string(),
+                source,
+            })
+    }
 
     /// How long to wait for a tree to disappear after it has been killed
     /// outright.
@@ -121,6 +184,33 @@ mod imp {
     use super::{Duration, ProcessError};
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+
+    /// Starts the child in its own process group, with no console of its own.
+    ///
+    /// `CREATE_NEW_PROCESS_GROUP` is what keeps a Ctrl-C in the parent's console
+    /// from reaching it, and `DETACHED_PROCESS` stops it inheriting that console
+    /// at all — a daemon has no business writing to the interface's screen.
+    const DETACHED: u32 = 0x0000_0008 | 0x0000_0200;
+
+    pub(super) fn spawn_detached(
+        program: &std::path::Path,
+        args: &[std::ffi::OsString],
+    ) -> Result<u32, ProcessError> {
+        use std::os::windows::process::CommandExt;
+
+        std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(DETACHED)
+            .spawn()
+            .map(|child| child.id())
+            .map_err(|source| ProcessError::Spawn {
+                program: program.display().to_string(),
+                source,
+            })
+    }
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
         WaitForSingleObject,
@@ -178,6 +268,71 @@ mod imp {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// A [`Launch`]-free command that sleeps, spelled per platform.
+    fn sleeper() -> (std::path::PathBuf, Vec<std::ffi::OsString>) {
+        if cfg!(windows) {
+            (
+                std::path::PathBuf::from("cmd.exe"),
+                vec!["/c".into(), "timeout /t 3 /nobreak".into()],
+            )
+        } else {
+            (
+                std::path::PathBuf::from("/bin/sh"),
+                vec!["-c".into(), "sleep 3".into()],
+            )
+        }
+    }
+
+    #[test]
+    fn a_detached_child_starts() {
+        let (program, args) = sleeper();
+        let pid = spawn_detached(&program, &args).expect("the child starts");
+
+        assert!(pid > 0);
+        terminate_tree(pid, DEFAULT_GRACE).expect("the child can be killed");
+    }
+
+    #[test]
+    fn starting_something_that_is_not_there_says_so() {
+        let missing = std::path::PathBuf::from("dispatch-no-such-program");
+        let error = spawn_detached(&missing, &[]).expect_err("there is no such program");
+
+        assert!(
+            matches!(error, ProcessError::Spawn { .. }),
+            "expected a spawn failure, got {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_detached_child_leaves_this_process_group() {
+        // The point of detaching: a Ctrl-C in the terminal that started the
+        // client reaches the client's group, and the daemon must not be in it.
+        let (program, args) = sleeper();
+        let pid = spawn_detached(&program, &args).expect("the child starts");
+
+        let group = std::process::Command::new("ps")
+            .args(["-o", "pgid=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps runs");
+        let group: i32 = String::from_utf8_lossy(&group.stdout)
+            .trim()
+            .parse()
+            .expect("ps reports a process group");
+
+        // SAFETY: getpgrp takes no arguments and only reads this process's own
+        // group.
+        let ours = unsafe { libc::getpgrp() };
+        assert_ne!(group, ours, "the child should lead a group of its own");
+        assert_eq!(
+            group,
+            i32::try_from(pid).expect("a pid fits"),
+            "and it should be its own leader"
+        );
+
+        terminate_tree(pid, DEFAULT_GRACE).expect("the child can be killed");
+    }
 
     use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};

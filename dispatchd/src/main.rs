@@ -72,6 +72,11 @@ fn main() -> Result<()> {
     let listener = Listener::bind().context("failed to start listening")?;
     let endpoint = dispatch_os::ipc::endpoint().context("failed to locate the endpoint")?;
 
+    // Written while listening and removed on the way out. The endpoint says
+    // whether a daemon is answering; this says which process to stop, which is
+    // what an operator — or a client that started one — needs.
+    let pid_file = PidFile::write().context("failed to record the daemon's process id")?;
+
     // The only thing written to a terminal: enough for someone who started it
     // by hand to know it came up, and where to look for the rest.
     tracing::info!(endpoint = %endpoint.display(), device = %args.device, "listening");
@@ -79,8 +84,38 @@ fn main() -> Result<()> {
 
     daemon.serve(listener).context("the daemon stopped")?;
 
+    drop(pid_file);
     tracing::info!("stopped");
     Ok(())
+}
+
+/// The daemon's process id on disk, removed when the daemon stops.
+struct PidFile(PathBuf);
+
+impl PidFile {
+    fn write() -> Result<Self> {
+        let path = dispatch_os::paths::daemon_pid_file()?;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        std::fs::write(&path, std::process::id().to_string())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+
+        Ok(Self(path))
+    }
+}
+
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        // A file left behind would name a process that is gone. Nothing depends
+        // on it being removed, so a failure is logged rather than raised.
+        if let Err(error) = std::fs::remove_file(&self.0) {
+            tracing::warn!(%error, path = %self.0.display(), "failed to remove the pid file");
+        }
+    }
 }
 
 /// Stops the daemon when the operating system asks the process to exit.

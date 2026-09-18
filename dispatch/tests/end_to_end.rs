@@ -117,6 +117,31 @@ impl Fixture {
     }
 }
 
+/// Stops the daemon a client started for `fixture`, by the pid it recorded.
+///
+/// A client-started daemon outlives the client on purpose, so a test that starts
+/// one has to clean it up or leave a process behind on the developer's machine.
+fn stop_recorded_daemon(fixture: &Fixture) {
+    let pid_file = fixture.config.path().join("dispatchd.pid");
+
+    let Ok(contents) = std::fs::read_to_string(&pid_file) else {
+        return;
+    };
+    let Ok(pid) = contents.trim().parse::<u32>() else {
+        return;
+    };
+
+    if cfg!(windows) {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status();
+    } else {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+}
+
 /// A running `dispatchd`, killed when the test ends however it ends.
 struct Daemon(std::process::Child);
 
@@ -198,6 +223,15 @@ impl Harness {
     /// Starts Dispatch attached to a daemon serving `fixture`.
     fn attached(fixture: &Fixture, size: Size) -> Self {
         Self::spawn(fixture, size, &["--attach".to_string()])
+    }
+
+    /// Starts Dispatch attached, refusing to start a daemon itself.
+    fn attached_only(fixture: &Fixture, size: Size) -> Self {
+        Self::spawn(
+            fixture,
+            size,
+            &["--attach".to_string(), "--no-start".to_string()],
+        )
     }
 
     fn spawn(fixture: &Fixture, size: Size, extra: &[String]) -> Self {
@@ -731,5 +765,62 @@ fn an_attached_pane_is_named_by_its_agent_too() {
     assert!(
         dispatch.wait_for(|lines| sidebar_contains(lines, "on-task")),
         "the sidebar should show the title the child set"
+    );
+}
+
+#[test]
+fn attaching_starts_a_daemon_when_none_is_listening() {
+    // The daemon is meant to be an implementation detail: the user asked for
+    // agents that outlive the interface, not for a second process to look after.
+    let fixture = Fixture::new("d5");
+    let mut dispatch = Harness::attached(&fixture, Size::new(100, 30));
+
+    assert!(
+        dispatch.wait_for(|lines| contains(lines, "project")),
+        "a daemon should have been started and its project announced"
+    );
+    dispatch.spawn_shell();
+    assert!(
+        dispatch.wait_for(|lines| contains(lines, "$")),
+        "the pane should be running in the daemon that was started"
+    );
+
+    // It recorded itself, which is how anything else finds it.
+    let pid_file = fixture.config.path().join("dispatchd.pid");
+    assert!(
+        pid_file.is_file(),
+        "the daemon should record its process id at {}",
+        pid_file.display()
+    );
+
+    // And it outlives the client that started it: a second client finds it.
+    drop(dispatch);
+    let mut second = Harness::attached_only(&fixture, Size::new(100, 30));
+    let found = second.wait_for(|lines| sidebar_panes(lines) == 1);
+
+    stop_recorded_daemon(&fixture);
+    assert!(
+        found,
+        "the daemon should still be serving the pane after its client exited"
+    );
+}
+
+#[test]
+fn no_start_refuses_rather_than_starting_a_daemon() {
+    // For someone who runs their own daemon, and for scripts that would rather
+    // fail than fork.
+    let fixture = Fixture::new("d6");
+    let mut dispatch = Harness::attached_only(&fixture, Size::new(100, 30));
+
+    let said_so = dispatch.wait_for(|lines| contains(lines, "no daemon is listening"));
+    stop_recorded_daemon(&fixture);
+
+    assert!(
+        said_so,
+        "it should say what is wrong and how to fix it, rather than starting one"
+    );
+    assert!(
+        !fixture.config.path().join("dispatchd.pid").is_file(),
+        "and no daemon should have been started"
     );
 }

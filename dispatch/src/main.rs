@@ -16,6 +16,12 @@ use dispatch_pty::Size;
 use app::App;
 use terminal::{TerminalGuard, install_panic_hook};
 
+/// What the daemon logs this client as.
+const CLIENT_NAME: &str = "dispatch";
+
+/// How long to wait for a daemon this client started to answer.
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// One control surface for several coding agents.
 #[derive(Debug, Parser)]
 #[command(name = "dispatch", version, about)]
@@ -27,10 +33,15 @@ struct Args {
     #[arg(long)]
     log_file: Option<PathBuf>,
 
-    /// Use the agents owned by a running `dispatchd` instead of starting them
-    /// here, so they survive this process exiting.
+    /// Use the agents owned by `dispatchd` instead of starting them here, so
+    /// they survive this process exiting. Starts a daemon if none is listening.
     #[arg(long)]
     attach: bool,
+
+    /// With `--attach`, fail rather than starting a daemon when none is
+    /// listening.
+    #[arg(long, requires = "attach")]
+    no_start: bool,
 }
 
 fn main() -> Result<()> {
@@ -50,10 +61,25 @@ fn main() -> Result<()> {
         .context("failed to load harness definitions")?;
     tracing::info!(count = harnesses.len(), "harnesses registered");
 
+    // Resolved before anything is attached to or started, so a mistyped path
+    // fails here rather than after a daemon has been spawned for it.
+    let projects = if args.projects.is_empty() {
+        vec![std::env::current_dir().context("failed to read the working directory")?]
+    } else {
+        args.projects.clone()
+    };
+    let roots: Vec<PathBuf> = projects
+        .iter()
+        .map(|project| {
+            project
+                .canonicalize()
+                .with_context(|| format!("no such directory: {}", project.display()))
+        })
+        .collect::<Result<_>>()?;
+
     let mut app = if args.attach {
         // Fails before the terminal is taken over, so the reason is readable.
-        let client = dispatch_client::Client::attach("dispatch")
-            .context("failed to attach to the daemon; start one with `dispatchd <project>`")?;
+        let client = attach(&roots, args.no_start)?;
         tracing::info!(device = client.device(), "attached to a daemon");
         client.subscribe();
         App::attached(harnesses, client)
@@ -61,15 +87,7 @@ fn main() -> Result<()> {
         App::new(harnesses)
     };
 
-    let projects = if args.projects.is_empty() {
-        vec![std::env::current_dir().context("failed to read the working directory")?]
-    } else {
-        args.projects
-    };
-    for project in projects {
-        let root = project
-            .canonicalize()
-            .with_context(|| format!("no such directory: {}", project.display()))?;
+    for root in roots {
         app.add_project(root);
     }
 
@@ -79,6 +97,72 @@ fn main() -> Result<()> {
     let mut guard = TerminalGuard::acquire()?;
 
     run(&mut app, &mut guard)
+}
+
+/// Attaches to a daemon, starting one if nothing is listening.
+///
+/// Starting one is the point of the daemon being an implementation detail: the
+/// user asked for agents that outlive the interface, not for a second process to
+/// look after. `--no-start` is for the case where they do want to look after it
+/// themselves, and for scripts that would rather fail than fork.
+fn attach(roots: &[PathBuf], no_start: bool) -> Result<dispatch_client::Client> {
+    use dispatch_client::{Client, ClientError};
+
+    match Client::attach(CLIENT_NAME) {
+        Ok(client) => return Ok(client),
+        Err(ClientError::NotRunning(endpoint)) if no_start => {
+            anyhow::bail!("no daemon is listening on {endpoint}; start one with `dispatchd`")
+        }
+        Err(ClientError::NotRunning(_)) => {}
+        Err(error) => return Err(error).context("failed to attach to the daemon"),
+    }
+
+    let program = daemon_program()?;
+    let args: Vec<std::ffi::OsString> = roots.iter().map(Into::into).collect();
+    let pid = dispatch_os::process::spawn_detached(&program, &args)
+        .with_context(|| format!("failed to start {}", program.display()))?;
+    tracing::info!(pid, program = %program.display(), "started a daemon");
+
+    // Binding, loading harnesses and opening a socket take a moment, and on a
+    // cold start the daemon binary may still be paging in.
+    let deadline = Instant::now() + DAEMON_START_TIMEOUT;
+    let mut last = None;
+
+    while Instant::now() < deadline {
+        match Client::attach(CLIENT_NAME) {
+            Ok(client) => return Ok(client),
+            Err(error) => last = Some(error),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let log = dispatch_os::paths::daemon_log_file()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "the daemon log".into());
+    let reason = last.map_or_else(|| "it never answered".to_string(), |e| e.to_string());
+
+    anyhow::bail!("started a daemon (pid {pid}) but could not attach: {reason}; see {log}")
+}
+
+/// Where to find the daemon binary.
+///
+/// Beside this one first: a Dispatch run from a build directory or an unpacked
+/// archive should use the daemon it shipped with, not whichever one is on PATH.
+fn daemon_program() -> Result<PathBuf> {
+    let name = if cfg!(windows) {
+        "dispatchd.exe"
+    } else {
+        "dispatchd"
+    };
+
+    if let Ok(exe) = std::env::current_exe() {
+        let sibling = exe.with_file_name(name);
+        if sibling.is_file() {
+            return Ok(sibling);
+        }
+    }
+
+    Ok(PathBuf::from(name))
 }
 
 /// The event loop.
