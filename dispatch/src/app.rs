@@ -9,12 +9,29 @@ use dispatch_config::{HarnessRegistry, Launch};
 use dispatch_core::{AppState, HarnessId, PaneId, PaneStatus, Project, ProjectSource};
 use dispatch_layout::{tile, tile_zoomed};
 use dispatch_pty::{KeyEncoder, PtySession, RunState, Screen, ScreenReader, Size};
-use dispatch_tui::input::{Action, Direction, Event, InputRouter};
-use dispatch_tui::{PaneWidget, Sidebar, sidebar};
+use dispatch_tui::input::{Action, Direction, Event, InputRouter, KeyCode, KeyEventKind};
+use dispatch_tui::{Item, PaneWidget, Picker, Sidebar, sidebar};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Paragraph, Widget};
+
+/// Which overlay is open, decoupled from the picker so a selection can be
+/// read out before the overlay is closed.
+#[derive(Debug, Clone, Copy)]
+enum OverlayKind {
+    Harness,
+    Project,
+    Register,
+}
+
+fn kind_of(overlay: &Overlay) -> OverlayKind {
+    match overlay {
+        Overlay::Harness => OverlayKind::Harness,
+        Overlay::Project => OverlayKind::Project,
+        Overlay::Register => OverlayKind::Register,
+    }
+}
 
 /// Frame budget. A chatty agent can produce output faster than any terminal
 /// can draw it, so redraws are coalesced rather than done per byte.
@@ -30,8 +47,20 @@ struct Pane {
     screen: Screen,
 }
 
+/// What the picker on screen is choosing, which decides what a selection
+/// does.
+enum Overlay {
+    /// A harness to spawn.
+    Harness,
+    /// A project to switch to.
+    Project,
+    /// A harness to register, found on PATH.
+    Register,
+}
+
 /// The application.
 pub struct App {
+    overlay: Option<(Overlay, Picker)>,
     state: AppState,
     panes: HashMap<PaneId, Pane>,
     harnesses: HarnessRegistry,
@@ -46,6 +75,7 @@ impl App {
     /// Creates an application with `harnesses` registered.
     pub fn new(harnesses: HarnessRegistry) -> Self {
         Self {
+            overlay: None,
             state: AppState::new(),
             panes: HashMap::new(),
             harnesses,
@@ -159,6 +189,12 @@ impl App {
 
     /// Acts on one input event.
     pub fn handle(&mut self, event: &Event, area: Size) -> Result<()> {
+        // A picker takes the keyboard while it is open, so arrow keys choose
+        // rather than reaching an agent.
+        if self.overlay.is_some() {
+            return self.handle_overlay(event, area);
+        }
+
         let layout = std::mem::take(&mut self.layout);
         let action = self.router.handle(event, &layout);
         self.layout = layout;
@@ -174,22 +210,137 @@ impl App {
             Action::FocusDirection(direction) => self.focus_direction(direction),
             Action::ToggleZoom => self.state.toggle_zoom(),
             Action::ClosePane => self.close_focused(),
-            Action::NewPane => {
-                // Until the picker exists, spawn the first registered harness
-                // so the loop is usable end to end.
-                let first = self.harnesses.all().next().map(|h| h.id.clone());
-                if let Some(id) = first {
-                    self.spawn_pane(&id, area)?;
-                } else {
-                    self.status = "no harnesses registered".into();
-                }
-            }
-            Action::ProjectPicker | Action::HarnessManager | Action::Scrollback => {
-                self.status = "not implemented yet".into();
+            Action::NewPane => self.open_harness_picker(),
+            Action::ProjectPicker => self.open_project_picker(),
+            Action::HarnessManager => self.open_harness_manager(),
+            Action::Scrollback => {
+                self.status = "scrollback is not implemented yet".into();
             }
         }
 
         Ok(())
+    }
+
+    /// Handles input while a picker is open.
+    fn handle_overlay(&mut self, event: &Event, area: Size) -> Result<()> {
+        let Event::Key(key) = event else {
+            return Ok(());
+        };
+        if key.kind != KeyEventKind::Press {
+            return Ok(());
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.overlay = None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some((_, picker)) = &mut self.overlay {
+                    picker.next();
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some((_, picker)) = &mut self.overlay {
+                    picker.previous();
+                }
+            }
+            KeyCode::Enter => {
+                let chosen = self.overlay.as_ref().and_then(|(kind, picker)| {
+                    picker.selected().map(|i| (kind_of(kind), i.id.clone()))
+                });
+
+                self.overlay = None;
+
+                if let Some((kind, id)) = chosen {
+                    self.choose(kind, &id, area)?;
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    /// Acts on a picker selection.
+    fn choose(&mut self, kind: OverlayKind, id: &str, area: Size) -> Result<()> {
+        match kind {
+            OverlayKind::Harness => self.spawn_pane(id, area)?,
+            OverlayKind::Project => {
+                if let Some(project) = self
+                    .state
+                    .projects()
+                    .iter()
+                    .find(|p| p.id.to_string() == id)
+                    .map(|p| p.id)
+                {
+                    let _ = self.state.select_project(project);
+                }
+            }
+            OverlayKind::Register => {
+                let dir = dispatch_os::paths::harnesses_dir()
+                    .context("failed to locate the harness directory")?;
+                dispatch_config::register_harness(&dir, id)
+                    .with_context(|| format!("failed to register {id}"))?;
+
+                // Reload so the new harness is offered immediately rather
+                // than only after a restart.
+                self.harnesses = HarnessRegistry::load_from_dir(&dir)
+                    .context("failed to reload harness definitions")?;
+                self.status = format!("registered {id}");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn open_harness_picker(&mut self) {
+        let items: Vec<Item> = self
+            .harnesses
+            .all()
+            .map(|h| Item::new(&h.id, &h.display_name).with_detail(&h.launch.command))
+            .collect();
+
+        if items.is_empty() {
+            self.status = "no harnesses registered; press ^a H to add one".into();
+            return;
+        }
+
+        self.overlay = Some((Overlay::Harness, Picker::new("New pane", items)));
+    }
+
+    fn open_project_picker(&mut self) {
+        let items: Vec<Item> = self
+            .state
+            .projects()
+            .iter()
+            .map(|p| Item::new(p.id.to_string(), &p.name).with_detail(p.root.display().to_string()))
+            .collect();
+
+        self.overlay = Some((Overlay::Project, Picker::new("Project", items)));
+    }
+
+    /// Offers harnesses that are installed but not yet registered.
+    fn open_harness_manager(&mut self) {
+        let found = dispatch_config::discover_unregistered(&self.harnesses, &[]);
+
+        if found.is_empty() {
+            self.status = format!(
+                "{} harness(es) registered; nothing else found on PATH",
+                self.harnesses.len()
+            );
+            return;
+        }
+
+        let items: Vec<Item> = found
+            .iter()
+            .map(|id| {
+                let detail = dispatch_config::which(id)
+                    .map_or_else(String::new, |p| p.display().to_string());
+                Item::new(id, id).with_detail(detail)
+            })
+            .collect();
+
+        self.overlay = Some((Overlay::Register, Picker::new("Add harness", items)));
     }
 
     fn send_key(&mut self, key: dispatch_pty::Key, mods: dispatch_pty::Modifiers) {
@@ -309,6 +460,10 @@ impl App {
         self.layout = self.compute_layout(panes_area);
         self.draw_panes(frame);
         self.draw_status(frame, area);
+
+        if let Some((_, picker)) = &self.overlay {
+            frame.render_widget(picker, panes_area);
+        }
     }
 
     /// Where each visible pane goes this frame.

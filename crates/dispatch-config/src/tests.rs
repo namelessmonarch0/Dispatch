@@ -321,3 +321,71 @@ fn a_harness_exposes_its_core_identifier() {
             .expect("valid harness");
     assert_eq!(def.harness_id().as_str(), "demo");
 }
+
+#[test]
+fn a_registered_harness_is_not_offered_again() {
+    let dir = TempDir::new("discover");
+    write_missing_built_ins(dir.path()).expect("writing succeeds");
+    let registry = HarnessRegistry::load_from_dir(dir.path()).expect("loading succeeds");
+
+    let found = discover_unregistered(&registry, &[]);
+
+    assert!(
+        found.is_empty(),
+        "everything shipped is already registered, got {found:?}"
+    );
+}
+
+#[test]
+fn registering_writes_the_built_in_definition() {
+    let dir = TempDir::new("register");
+
+    let path = register_harness(dir.path(), "claude").expect("writing succeeds");
+    assert!(path.ends_with("claude.toml"));
+
+    let def = HarnessRegistry::load_file(&path).expect("the written file parses");
+    assert_eq!(def.display_name, "Claude Code");
+}
+
+#[test]
+fn registering_something_unknown_writes_a_usable_definition() {
+    let dir = TempDir::new("register-unknown");
+
+    let path = register_harness(dir.path(), "somebot").expect("writing succeeds");
+    let def = HarnessRegistry::load_file(&path).expect("the written file parses");
+
+    assert_eq!(def.id, "somebot");
+    assert_eq!(def.launch.command, "somebot");
+    // Windows shims are the common case, so the template covers them.
+    assert_eq!(def.launch_for("windows").command, "cmd.exe");
+}
+
+#[test]
+fn registering_does_not_overwrite_an_existing_definition() {
+    let dir = TempDir::new("register-twice");
+    dir.write(
+        "claude.toml",
+        "id = \"claude\"\ndisplay_name = \"Mine\"\ncommand = \"mine\"\n",
+    );
+
+    register_harness(dir.path(), "claude").expect("writing succeeds");
+
+    let registry = HarnessRegistry::load_from_dir(dir.path()).expect("loading succeeds");
+    assert_eq!(
+        registry.get("claude").expect("registered").display_name,
+        "Mine",
+        "an existing definition must not be discarded"
+    );
+}
+
+#[test]
+fn which_finds_a_program_that_exists() {
+    // Something guaranteed present on every platform this runs on.
+    let name = if cfg!(windows) { "cmd" } else { "sh" };
+    assert!(which(name).is_some(), "{name} should be on PATH");
+}
+
+#[test]
+fn which_does_not_find_a_program_that_does_not_exist() {
+    assert!(which("dispatch-definitely-not-installed").is_none());
+}

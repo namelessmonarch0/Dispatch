@@ -180,3 +180,109 @@ pub fn write_missing_built_ins(dir: &Path) -> Result<Vec<&'static str>, ConfigEr
 
 #[cfg(test)]
 mod tests;
+
+/// Finds harnesses that are installed but not yet registered.
+///
+/// Looks for each candidate on `PATH` and returns those that exist and have no
+/// definition yet, so the harness manager can offer exactly what would work.
+///
+/// Candidates are the built-ins plus anything named in `extra`, so a user can
+/// look for a tool Dispatch does not ship a definition for.
+#[must_use]
+pub fn discover_unregistered(registry: &HarnessRegistry, extra: &[String]) -> Vec<String> {
+    let mut found = Vec::new();
+
+    let candidates = defaults::BUILT_INS
+        .iter()
+        .map(|b| b.id.to_string())
+        .chain(extra.iter().cloned());
+
+    for candidate in candidates {
+        if registry.get(&candidate).is_some() || found.contains(&candidate) {
+            continue;
+        }
+        if which(&candidate).is_some() {
+            found.push(candidate);
+        }
+    }
+
+    found
+}
+
+/// Whether `name` resolves to an executable on `PATH`.
+///
+/// Windows needs the extension list: `claude` there is typically `claude.cmd`,
+/// which a bare name would never find.
+#[must_use]
+pub fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+
+    let extensions: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .map(str::to_lowercase)
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+
+    for dir in std::env::split_paths(&path) {
+        for extension in &extensions {
+            let candidate = dir.join(format!("{name}{extension}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+/// Writes a definition for `id`, using the built-in when one exists.
+///
+/// Returns the path written. Refuses to overwrite, so registering something
+/// already present cannot discard a user's edits.
+pub fn register_harness(dir: &Path, id: &str) -> Result<PathBuf, ConfigError> {
+    std::fs::create_dir_all(dir).map_err(|source| ConfigError::Io {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+
+    let path = dir.join(format!("{id}.toml"));
+    if path.exists() {
+        return Ok(path);
+    }
+
+    let body = defaults::BUILT_INS
+        .iter()
+        .find(|b| b.id == id)
+        .map_or_else(|| generic_harness(id), |b| b.toml.to_string());
+
+    std::fs::write(&path, body).map_err(|source| ConfigError::Io {
+        path: path.clone(),
+        source,
+    })?;
+
+    Ok(path)
+}
+
+/// A definition for a harness Dispatch ships no template for.
+///
+/// Launches the command with no arguments, which is what a terminal agent
+/// does by default, and adds the Windows shim wrapper since that is needed far
+/// more often than not.
+fn generic_harness(id: &str) -> String {
+    format!(
+        "id = {id:?}\n\
+         display_name = {id:?}\n\
+         command = {id:?}\n\
+         args = []\n\
+         \n\
+         # Installed on Windows as a .cmd shim more often than not, which\n\
+         # CreateProcess cannot execute directly.\n\
+         [platform.windows]\n\
+         command = \"cmd.exe\"\n\
+         args = [\"/c\", {id:?}]\n"
+    )
+}

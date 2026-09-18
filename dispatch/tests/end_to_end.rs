@@ -125,6 +125,36 @@ impl Harness {
             .collect()
     }
 
+    /// Opens the harness picker and chooses the test shell.
+    ///
+    /// The picker lists harnesses by display name, and the test shell sorts
+    /// first, so Enter takes it.
+    fn spawn_shell(&mut self) {
+        let before = self.shell_panes();
+
+        self.send(b"\x01n");
+        assert!(
+            self.wait_for(|lines| contains(lines, "New pane")),
+            "the harness picker should open"
+        );
+
+        self.send(b"\r");
+        assert!(
+            self.wait_for(move |lines| {
+                lines.iter().filter(|l| l.contains("Test Shell")).count() > before
+            }),
+            "a pane should be listed after choosing a harness"
+        );
+    }
+
+    /// How many panes are listed.
+    fn shell_panes(&mut self) -> usize {
+        self.lines()
+            .iter()
+            .filter(|l| l.contains("Test Shell"))
+            .count()
+    }
+
     /// Waits until the screen satisfies `predicate`, returning whether it did.
     fn wait_for(&mut self, predicate: impl Fn(&[String]) -> bool) -> bool {
         let deadline = Instant::now() + SETTLE;
@@ -189,11 +219,7 @@ fn a_spawned_pane_runs_a_real_shell_that_echoes() {
     let mut app = Harness::start(Size::new(100, 30));
     assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
 
-    app.send(b"\x01n");
-    assert!(
-        app.wait_for(|lines| contains(lines, "Test Shell")),
-        "the sidebar should name the harness by its display name"
-    );
+    app.spawn_shell();
 
     app.send(b"echo dispatch-end-to-end\r");
     assert!(
@@ -210,8 +236,7 @@ fn a_pane_is_told_the_size_of_the_rectangle_it_was_given() {
     let mut app = Harness::start(Size::new(100, 30));
     assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
 
-    app.send(b"\x01n");
-    assert!(app.wait_for(|lines| contains(lines, "Test Shell")));
+    app.spawn_shell();
 
     app.send(b"stty size\r");
 
@@ -232,14 +257,8 @@ fn a_second_pane_halves_the_width_of_the_first() {
     let mut app = Harness::start(Size::new(100, 30));
     assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
 
-    app.send(b"\x01n");
-    assert!(app.wait_for(|lines| contains(lines, "Test Shell")));
-
-    app.send(b"\x01n");
-    assert!(
-        app.wait_for(|lines| lines.iter().filter(|l| l.contains("Test Shell")).count() >= 2),
-        "a second pane should be listed"
-    );
+    app.spawn_shell();
+    app.spawn_shell();
 
     app.send(b"stty size\r");
 
@@ -257,10 +276,8 @@ fn zoom_gives_a_pane_the_whole_grid_and_gives_it_back() {
     let mut app = Harness::start(Size::new(100, 30));
     assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
 
-    app.send(b"\x01n");
-    assert!(app.wait_for(|lines| contains(lines, "Test Shell")));
-    app.send(b"\x01n");
-    assert!(app.wait_for(|lines| lines.iter().filter(|l| l.contains("Test Shell")).count() >= 2));
+    app.spawn_shell();
+    app.spawn_shell();
 
     let full = 100 - dispatch_tui::sidebar::WIDTH;
 
@@ -302,4 +319,87 @@ fn quitting_restores_the_terminal() {
     }
 
     let _ = std::io::stdout().flush();
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn the_harness_picker_can_be_cancelled() {
+    // Escape must leave nothing behind: a picker that dismissed but still
+    // swallowed keys would look like Dispatch had frozen.
+    let mut app = Harness::start(Size::new(100, 30));
+    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+
+    app.send(b"\x01n");
+    assert!(app.wait_for(|lines| contains(lines, "New pane")));
+
+    app.send(b"\x1b");
+    assert!(
+        app.wait_for(|lines| !contains(lines, "New pane")),
+        "escape should close the picker"
+    );
+
+    // The keyboard is back with Dispatch rather than held by the picker.
+    app.send(b"\x01");
+    assert!(
+        app.wait_for(|lines| contains(lines, "PREFIX")),
+        "keys should reach Dispatch again after cancelling"
+    );
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn the_project_picker_lists_the_open_project() {
+    let mut app = Harness::start(Size::new(100, 30));
+    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+
+    app.send(b"\x01p");
+    assert!(
+        app.wait_for(|lines| contains(lines, "Project")),
+        "the project picker should open"
+    );
+
+    app.send(b"\x1b");
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn the_harness_manager_reports_when_nothing_needs_adding() {
+    // The temporary configuration has every built-in written already, so the
+    // manager has nothing to offer and must say so rather than opening an
+    // empty box.
+    let mut app = Harness::start(Size::new(100, 30));
+    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+
+    app.send(b"\x01H");
+    assert!(
+        app.wait_for(|lines| contains(lines, "registered")),
+        "the manager should report what it found"
+    );
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn a_picker_takes_the_keyboard_while_it_is_open() {
+    // Arrow keys must choose rather than reach the agent underneath.
+    let mut app = Harness::start(Size::new(100, 30));
+    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+
+    app.spawn_shell();
+    app.send(b"\x01n");
+    assert!(app.wait_for(|lines| contains(lines, "New pane")));
+
+    app.send(b"jjj");
+    app.send(b"\x1b");
+    assert!(app.wait_for(|lines| !contains(lines, "New pane")));
+
+    // Those keys went to the picker, so the shell never saw them.
+    app.send(b"echo after-picker\r");
+    assert!(
+        app.wait_for(|lines| contains(lines, "after-picker")),
+        "the pane should still be usable"
+    );
+    assert!(
+        !contains(&app.lines(), "jjj"),
+        "picker navigation must not reach the pane"
+    );
 }
