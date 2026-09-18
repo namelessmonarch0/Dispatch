@@ -63,9 +63,18 @@ impl std::fmt::Debug for Connection {
 }
 
 impl Connection {
-    /// Connects to a running daemon.
+    /// Connects to the daemon for the current configuration.
     pub fn connect() -> Result<Self, IpcError> {
-        imp::connect(&endpoint()?).map(Self)
+        Self::connect_to(&endpoint()?)
+    }
+
+    /// Connects to the daemon listening on `endpoint`.
+    ///
+    /// A client that reconnects uses this with the endpoint it first reached, so
+    /// a configuration change mid-session cannot silently move it to a different
+    /// daemon than the one its panes are on.
+    pub fn connect_to(endpoint: &std::path::Path) -> Result<Self, IpcError> {
+        imp::connect(endpoint).map(Self)
     }
 
     /// Splits into a reader and a writer.

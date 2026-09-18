@@ -1,19 +1,44 @@
 //! The client half of the daemon protocol.
 //!
-//! Keeps the socket off the interface's thread. The reader and the writer each
-//! get one, so a chatty agent cannot stall a redraw and a redraw cannot stall
-//! the socket; what reaches the interface is a queue of messages it drains
-//! whenever it likes.
+//! Keeps the socket off the interface's thread. Reading, writing and
+//! reconnecting each get one of their own, so a chatty agent cannot stall a
+//! redraw and a redraw cannot stall the socket; what reaches the interface is a
+//! queue of messages it drains whenever it likes.
+//!
+//! The connection is supervised rather than owned: a daemon that is restarted,
+//! or a socket that breaks, is reconnected to on its own. That matters because
+//! the agents are on the daemon's side — the work is still running, and a client
+//! that gave up would leave the user with a dead window over live agents.
 //!
 //! Nothing here knows about panes or drawing. It connects, shakes hands, and
 //! moves messages.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use dispatch_os::ipc::{Connection, IpcError};
 use dispatch_proto::{ClientMessage, Frame, ProtocolError, ServerMessage};
+
+/// How long to wait before the first reconnection attempt.
+const FIRST_RETRY: Duration = Duration::from_millis(100);
+
+/// How long to wait for a daemon to answer the handshake.
+///
+/// A peer that accepts a connection and then says nothing would otherwise stop
+/// the client for good: the handshake is read before anything else happens, so
+/// without a limit one unanswering socket ends both attaching and reconnecting.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The longest gap between reconnection attempts.
+///
+/// A daemon being restarted is back within a second or two, and a daemon that
+/// is gone for good should not cost more than a connect attempt every couple of
+/// seconds.
+const MAX_RETRY: Duration = Duration::from_secs(2);
 
 /// Failures attaching to a daemon.
 #[derive(Debug, thiserror::Error)]
@@ -42,44 +67,107 @@ pub enum ClientError {
     Unexpected(String),
 }
 
+/// The socket, and what is known about it.
+///
+/// Shared by the reader, the writer and the supervisor. The writer is behind a
+/// lock and behind an `Option` because reconnecting replaces it: senders keep
+/// the same [`Handle`] across a reconnection rather than being handed a new one.
+struct Wire {
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    connected: AtomicBool,
+    /// Incremented for each connection. A change tells a caller its view is of
+    /// a connection that no longer exists and has to be rebuilt.
+    generation: AtomicU64,
+    /// Whether to resubscribe on reconnecting.
+    subscribed: AtomicBool,
+    /// Set when the client is dropped, so the supervisor stops.
+    closed: AtomicBool,
+    /// What the daemon calls itself.
+    device: Mutex<String>,
+    /// What this client calls itself, for the daemon's log.
+    name: String,
+    /// The endpoint first reached, which every reconnection uses.
+    endpoint: PathBuf,
+}
+
+impl Wire {
+    /// Writes one message, or reports that the connection is gone.
+    fn write(&self, message: &ClientMessage) -> bool {
+        let mut guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+
+        let Some(writer) = guard.as_mut() else {
+            // Disconnected: dropped rather than queued. A keystroke that
+            // arrives at an agent minutes later, out of order with the rest,
+            // is worse than one that never arrives.
+            return false;
+        };
+
+        if Frame::write(writer, message).is_err() {
+            *guard = None;
+            self.connected.store(false, Ordering::Relaxed);
+            return false;
+        }
+
+        true
+    }
+
+    /// Records that the connection has broken.
+    fn lost(&self) {
+        *self.writer.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.connected.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Sends to a daemon.
 ///
 /// Cheap to clone, so whatever owns a pane can keep one rather than reaching
-/// back through the application for every keystroke.
-#[derive(Debug, Clone)]
+/// back through the application for every keystroke. Survives a reconnection:
+/// the handle addresses the connection, not one socket.
+#[derive(Clone)]
 pub struct Handle {
     outbox: Sender<ClientMessage>,
-    connected: Arc<AtomicBool>,
+    wire: Arc<Wire>,
+}
+
+impl std::fmt::Debug for Handle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Handle")
+    }
 }
 
 impl Handle {
-    /// Queues a message. Returns whether the connection is still up.
+    /// Queues a message. Returns whether the connection is up.
     ///
     /// A dropped connection is not an error here: the interface has already
     /// been told, and failing a keystroke it can do nothing about would only
     /// add noise.
     pub fn send(&self, message: ClientMessage) -> bool {
         if self.outbox.send(message).is_err() {
-            self.connected.store(false, Ordering::Relaxed);
+            self.wire.lost();
             return false;
         }
 
         self.is_connected()
     }
 
-    /// Whether the connection is still up.
+    /// Whether the connection is up.
     #[must_use]
     pub fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
+        self.wire.connected.load(Ordering::Relaxed)
     }
 }
 
 /// An attached daemon connection.
-#[derive(Debug)]
 pub struct Client {
     handle: Handle,
     inbox: Receiver<ServerMessage>,
-    device: String,
+    wire: Arc<Wire>,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Client")
+    }
 }
 
 impl Client {
@@ -87,89 +175,68 @@ impl Client {
     ///
     /// `name` is what the daemon logs this client as. Attaching does not ask
     /// for pane events; call [`Client::subscribe`] for those.
+    ///
+    /// Failing here means no daemon answered now. Once attached, a connection
+    /// that breaks is reconnected to rather than reported as an error.
     pub fn attach(name: &str) -> Result<Self, ClientError> {
-        let endpoint = dispatch_os::ipc::endpoint()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "the daemon endpoint".into());
+        let endpoint = dispatch_os::ipc::endpoint()?;
+        let (reader, writer, device) = connect_within(name, &endpoint, HANDSHAKE_TIMEOUT)?;
 
-        let connection = match Connection::connect() {
-            Ok(connection) => connection,
-            Err(IpcError::NotRunning(_)) => return Err(ClientError::NotRunning(endpoint)),
-            Err(error) => return Err(error.into()),
-        };
+        let wire = Arc::new(Wire {
+            writer: Mutex::new(Some(writer)),
+            connected: AtomicBool::new(true),
+            generation: AtomicU64::new(1),
+            subscribed: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            device: Mutex::new(device),
+            name: name.to_string(),
+            endpoint,
+        });
 
-        let (mut reader, mut writer) = connection.split()?;
-
-        Frame::write(
-            &mut writer,
-            &ClientMessage::Hello {
-                version: dispatch_proto::VERSION,
-                client: name.to_string(),
-            },
-        )
-        .map_err(|e| ClientError::Handshake(e.to_string()))?;
-
-        // Read the answer before starting any thread: a refused connection
-        // should fail this call rather than arrive later as a message the
-        // caller has to know to look for.
-        let device = match Frame::read::<_, ServerMessage>(&mut reader) {
-            Ok(ServerMessage::Welcome { device, .. }) => device,
-            Ok(ServerMessage::Error { error }) => return Err(ClientError::Refused(error)),
-            Ok(other) => return Err(ClientError::Unexpected(format!("{other:?}"))),
-            Err(error) => return Err(ClientError::Handshake(error.to_string())),
-        };
-
-        let connected = Arc::new(AtomicBool::new(true));
         let (outbox, outgoing) = channel::<ClientMessage>();
         let (incoming, inbox) = channel::<ServerMessage>();
 
-        let reading = Arc::clone(&connected);
-        std::thread::spawn(move || {
-            loop {
-                match Frame::read::<_, ServerMessage>(&mut reader) {
-                    Ok(message) => {
-                        if incoming.send(message).is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        tracing::info!(%error, "the daemon connection ended");
-                        break;
-                    }
-                }
-            }
-
-            reading.store(false, Ordering::Relaxed);
-        });
-
-        let writing = Arc::clone(&connected);
-        std::thread::spawn(move || {
-            while let Ok(message) = outgoing.recv() {
-                if let Err(error) = Frame::write(&mut writer, &message) {
-                    tracing::info!(%error, "failed to send to the daemon");
-                    break;
-                }
-            }
-
-            writing.store(false, Ordering::Relaxed);
-        });
+        read_from(reader, &incoming, &wire);
+        write_to(outgoing, &wire);
+        supervise(incoming, &wire);
 
         Ok(Self {
-            handle: Handle { outbox, connected },
+            handle: Handle {
+                outbox,
+                wire: Arc::clone(&wire),
+            },
             inbox,
-            device,
+            wire,
         })
     }
 
     /// Asks for pane events, and for what already exists.
+    ///
+    /// Remembered: a reconnection subscribes again, so the panes come back
+    /// without the caller having to notice the socket changed.
     pub fn subscribe(&self) -> bool {
+        self.wire.subscribed.store(true, Ordering::Relaxed);
         self.send(ClientMessage::Subscribe)
     }
 
     /// What the daemon calls itself.
     #[must_use]
-    pub fn device(&self) -> &str {
-        &self.device
+    pub fn device(&self) -> String {
+        self.wire
+            .device
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Which connection this is, counting from one.
+    ///
+    /// A caller that has built state from the daemon's messages compares this
+    /// against what it built: a higher number means a different connection, and
+    /// everything it was told belongs to a socket that no longer exists.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.wire.generation.load(Ordering::Relaxed)
     }
 
     /// A sender for whatever needs to talk to the daemon.
@@ -178,12 +245,12 @@ impl Client {
         self.handle.clone()
     }
 
-    /// Queues a message. Returns whether the connection is still up.
+    /// Queues a message. Returns whether the connection is up.
     pub fn send(&self, message: ClientMessage) -> bool {
         self.handle.send(message)
     }
 
-    /// Whether the connection is still up.
+    /// Whether the connection is up.
     #[must_use]
     pub fn is_connected(&self) -> bool {
         self.handle.is_connected()
@@ -199,6 +266,168 @@ impl Client {
             messages.push(message);
         }
         messages
+    }
+}
+
+/// What one successful connection hands back.
+type Connected = (Box<dyn Read + Send>, Box<dyn Write + Send>, String);
+
+/// Connects and shakes hands, giving up if the peer does not answer in time.
+///
+/// The handshake runs on a thread of its own so a peer that accepts and then
+/// says nothing costs one abandoned thread — which ends when that peer finally
+/// closes — rather than the client's ability to connect at all.
+fn connect_within(
+    name: &str,
+    endpoint: &Path,
+    patience: Duration,
+) -> Result<Connected, ClientError> {
+    let (done, answer) = channel();
+    let name = name.to_string();
+    let endpoint = endpoint.to_path_buf();
+
+    std::thread::spawn(move || {
+        let _ = done.send(connect(&name, &endpoint));
+    });
+
+    match answer.recv_timeout(patience) {
+        Ok(result) => result,
+        Err(_) => Err(ClientError::Handshake(format!(
+            "the daemon did not answer within {patience:?}"
+        ))),
+    }
+}
+
+/// Connects and shakes hands, returning the two halves and the daemon's name.
+fn connect(name: &str, endpoint: &Path) -> Result<Connected, ClientError> {
+    let connection = match Connection::connect_to(endpoint) {
+        Ok(connection) => connection,
+        Err(IpcError::NotRunning(_)) => {
+            return Err(ClientError::NotRunning(endpoint.display().to_string()));
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let (mut reader, mut writer) = connection.split()?;
+
+    Frame::write(
+        &mut writer,
+        &ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: name.to_string(),
+        },
+    )
+    .map_err(|e| ClientError::Handshake(e.to_string()))?;
+
+    // Read the answer before starting any thread: a refused connection should
+    // fail attaching rather than arrive later as a message the caller has to
+    // know to look for.
+    let device = match Frame::read::<_, ServerMessage>(&mut reader) {
+        Ok(ServerMessage::Welcome { device, .. }) => device,
+        Ok(ServerMessage::Error { error }) => return Err(ClientError::Refused(error)),
+        Ok(other) => return Err(ClientError::Unexpected(format!("{other:?}"))),
+        Err(error) => return Err(ClientError::Handshake(error.to_string())),
+    };
+
+    Ok((Box::new(reader), Box::new(writer), device))
+}
+
+/// Moves messages from the socket into the queue, until the socket ends.
+fn read_from(
+    mut reader: impl Read + Send + 'static,
+    incoming: &Sender<ServerMessage>,
+    wire: &Arc<Wire>,
+) {
+    let incoming = incoming.clone();
+    let wire = Arc::clone(wire);
+
+    std::thread::spawn(move || {
+        loop {
+            match Frame::read::<_, ServerMessage>(&mut reader) {
+                Ok(message) => {
+                    if incoming.send(message).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    tracing::info!(%error, "the daemon connection ended");
+                    wire.lost();
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// Moves queued messages out to the socket, for the life of the client.
+///
+/// One thread across every connection: it writes through the wire, which the
+/// supervisor swaps underneath it.
+fn write_to(outgoing: Receiver<ClientMessage>, wire: &Arc<Wire>) {
+    let wire = Arc::clone(wire);
+
+    std::thread::spawn(move || {
+        while let Ok(message) = outgoing.recv() {
+            wire.write(&message);
+        }
+    });
+}
+
+/// Reconnects whenever the connection is down.
+fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
+    let wire = Arc::clone(wire);
+
+    std::thread::spawn(move || {
+        let mut backoff = FIRST_RETRY;
+
+        loop {
+            if wire.closed.load(Ordering::Relaxed) {
+                return;
+            }
+
+            if wire.connected.load(Ordering::Relaxed) {
+                std::thread::sleep(FIRST_RETRY);
+                backoff = FIRST_RETRY;
+                continue;
+            }
+
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(MAX_RETRY);
+
+            match connect_within(&wire.name, &wire.endpoint, HANDSHAKE_TIMEOUT) {
+                Ok((reader, writer, device)) => {
+                    *wire.device.lock().unwrap_or_else(|e| e.into_inner()) = device;
+                    *wire.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(writer);
+                    wire.generation.fetch_add(1, Ordering::Relaxed);
+                    wire.connected.store(true, Ordering::Relaxed);
+                    read_from(reader, &incoming, &wire);
+
+                    // Sent directly rather than through the queue: the queue's
+                    // writer may be mid-message, and a subscribe that arrives
+                    // after the first keystroke would lose the panes.
+                    if wire.subscribed.load(Ordering::Relaxed) {
+                        wire.write(&ClientMessage::Subscribe);
+                    }
+
+                    tracing::info!(
+                        generation = wire.generation.load(Ordering::Relaxed),
+                        "reconnected to the daemon"
+                    );
+                    backoff = FIRST_RETRY;
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "the daemon is not answering yet");
+                }
+            }
+        }
+    });
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        // Otherwise the supervisor would keep reconnecting to a daemon nobody
+        // is listening to, for as long as the process lives.
+        self.wire.closed.store(true, Ordering::Relaxed);
     }
 }
 

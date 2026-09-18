@@ -151,6 +151,34 @@ impl Daemon {
     }
 }
 
+impl Daemon {
+    /// Stops the daemon the way an operator would, so it takes its panes with
+    /// it rather than orphaning them.
+    fn stop(mut self) {
+        #[cfg(unix)]
+        let asked = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(self.0.id().to_string())
+            .status()
+            .is_ok_and(|s| s.success());
+        #[cfg(not(unix))]
+        let asked = false;
+
+        if asked {
+            let deadline = Instant::now() + SETTLE;
+            while Instant::now() < deadline {
+                if matches!(self.0.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -608,4 +636,39 @@ fn agents_survive_the_client_exiting() {
         second.wait_for(|lines| contains(lines, "reattached-42")),
         "the surviving pane should still answer"
     );
+}
+
+#[test]
+fn a_client_waits_for_a_daemon_that_is_restarted() {
+    // A daemon being restarted should cost the view, not the session: the
+    // client reattaches on its own and asks for its projects again.
+    let fixture = Fixture::new("d3");
+    let daemon = Daemon::start(&fixture);
+    let mut dispatch = Harness::attached(&fixture, Size::new(100, 30));
+
+    assert!(
+        dispatch.wait_for(|lines| contains(lines, "project")),
+        "the daemon's project should be listed"
+    );
+    dispatch.spawn_shell();
+
+    daemon.stop();
+    assert!(
+        dispatch.wait_for(|lines| contains(lines, "waiting for the daemon")),
+        "the client should say the daemon is gone rather than look alive"
+    );
+
+    let _restarted = Daemon::start(&fixture);
+    assert!(
+        dispatch.wait_for(|lines| contains(lines, "reattached")),
+        "the client should reattach on its own"
+    );
+
+    // The panes went with the old daemon; the project comes back, and the
+    // interface still works.
+    assert!(
+        dispatch.wait_for(|lines| sidebar_panes(lines) == 0 && contains(lines, "project")),
+        "the view should be rebuilt from what the new daemon says"
+    );
+    dispatch.spawn_shell();
 }

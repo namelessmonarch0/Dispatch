@@ -70,6 +70,10 @@ Several clients can attach at once and see the same panes. A client attaching to
 a pane that is already running is replayed the last 256 KiB it printed, so
 reattaching shows the work rather than a blank rectangle.
 
+An attached client reconnects on its own: restart the daemon, or lose the socket,
+and it waits, says so, and rebuilds its view from what the daemon reports when it
+answers again.
+
 The daemon runs in the foreground and logs to a file. Projects given on its
 command line are served immediately; an attached client opens more over the
 socket. One daemon per configuration directory: a second refuses to start rather

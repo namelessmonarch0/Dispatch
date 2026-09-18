@@ -84,6 +84,11 @@ enum Mode {
 /// The application.
 pub struct App {
     mode: Mode,
+    /// Which daemon connection the state on screen was built from. Zero when
+    /// the agents are this process's own.
+    generation: u64,
+    /// The project roots this client asked for, so a reconnection can ask again.
+    opened: Vec<PathBuf>,
     overlay: Option<(Overlay, Picker)>,
     state: AppState,
     panes: HashMap<PaneId, Pane>,
@@ -107,8 +112,15 @@ impl App {
     }
 
     fn with_mode(harnesses: HarnessRegistry, mode: Mode) -> Self {
+        let generation = match &mode {
+            Mode::Standalone => 0,
+            Mode::Attached(client) => client.generation(),
+        };
+
         Self {
             mode,
+            generation,
+            opened: Vec::new(),
             overlay: None,
             state: AppState::new(),
             panes: HashMap::new(),
@@ -127,7 +139,13 @@ impl App {
     /// fleet have to use the same id for the same checkout.
     pub fn add_project(&mut self, root: PathBuf) {
         if let Mode::Attached(client) = &self.mode {
-            client.send(ClientMessage::OpenProject { root });
+            client.send(ClientMessage::OpenProject { root: root.clone() });
+            // Remembered so a reconnection asks again: a daemon that was
+            // restarted is serving whatever its own command line said, which
+            // need not include what this client was opened with.
+            if !self.opened.contains(&root) {
+                self.opened.push(root);
+            }
             return;
         }
 
@@ -142,7 +160,7 @@ impl App {
 
     /// What the daemon calls itself, when attached to one.
     #[must_use]
-    pub fn device(&self) -> Option<&str> {
+    pub fn device(&self) -> Option<String> {
         match &self.mode {
             Mode::Standalone => None,
             Mode::Attached(client) => Some(client.device()),
@@ -238,22 +256,62 @@ impl App {
             return false;
         };
 
-        let messages = client.poll();
+        let generation = client.generation();
         let connected = client.is_connected();
+        let device = client.device();
+        let messages = client.poll();
         let mut changed = false;
+
+        if generation != self.generation {
+            // Everything on screen was described by a connection that is gone.
+            // The new one announces its projects and panes on subscribing, so
+            // the view is rebuilt from what it says rather than kept and
+            // patched.
+            self.generation = generation;
+            self.forget_the_fleet();
+            self.reopen_projects();
+            self.status = format!("reattached to {device}");
+            changed = true;
+        }
 
         for message in messages {
             changed |= self.apply(message);
         }
 
         // Said once, and only once: a status line rewritten every frame would
-        // bury whatever the user was reading.
-        if !connected && !self.status.starts_with("the daemon") {
-            self.status = "the daemon connection ended — the agents are still running".into();
+        // bury whatever the user was reading. The agents are the daemon's, so
+        // this is a lost view rather than lost work.
+        if !connected && !self.status.starts_with("waiting") {
+            self.status = "waiting for the daemon — the agents are still running".into();
             changed = true;
         }
 
         changed
+    }
+
+    /// Asks the daemon for the projects this client was opened with.
+    fn reopen_projects(&mut self) {
+        let Mode::Attached(client) = &self.mode else {
+            return;
+        };
+
+        for root in &self.opened {
+            client.send(ClientMessage::OpenProject { root: root.clone() });
+        }
+    }
+
+    /// Forgets what a daemon told us over a connection that has ended.
+    ///
+    /// A pane the old connection described may not exist any more: a daemon that
+    /// was restarted names its panes afresh. Anything still running is described
+    /// again by the new connection.
+    fn forget_the_fleet(&mut self) {
+        self.panes.clear();
+        self.state = AppState::new();
+        self.layout.clear();
+        // A picker offering projects that have just been forgotten would act on
+        // an id nothing answers to.
+        self.overlay = None;
     }
 
     /// Applies one message from the daemon. Returns whether to redraw.
