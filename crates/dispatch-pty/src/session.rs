@@ -181,6 +181,29 @@ impl PtySession {
         changed
     }
 
+    /// Feeds pending output into the emulator and returns the raw bytes.
+    ///
+    /// The daemon forwards these to its clients, which run their own
+    /// emulators. The bytes are still fed here as well, so the daemon can hand
+    /// a client that attaches later the screen as it currently stands rather
+    /// than replaying the whole session.
+    pub fn drain_output(&mut self) -> Vec<u8> {
+        let mut output = Vec::new();
+
+        loop {
+            match self.events.try_recv() {
+                Ok(PtyEvent::Output(bytes)) => {
+                    self.terminal.feed(&bytes);
+                    output.extend_from_slice(&bytes);
+                }
+                Ok(PtyEvent::Exited(code)) => self.state = RunState::Exited(code),
+                Err(TryRecvError::Disconnected | TryRecvError::Empty) => break,
+            }
+        }
+
+        output
+    }
+
     /// Feeds output for up to `timeout`, returning once the child exits.
     ///
     /// Intended for tests and for short-lived commands; the application loop

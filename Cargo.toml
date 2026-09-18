@@ -4,6 +4,7 @@ members = [
     "crates/dispatch-core",
     "crates/dispatch-layout",
     "crates/dispatch-config",
+    "crates/dispatch-daemon",
     "crates/dispatch-os",
     "crates/dispatch-proto",
     "crates/dispatch-pty",
@@ -24,6 +25,7 @@ repository = "https://github.com/namelessmonarch/dispatch"
 dispatch-core = { path = "crates/dispatch-core" }
 dispatch-layout = { path = "crates/dispatch-layout" }
 dispatch-config = { path = "crates/dispatch-config" }
+dispatch-daemon = { path = "crates/dispatch-daemon" }
 dispatch-os = { path = "crates/dispatch-os" }
 dispatch-proto = { path = "crates/dispatch-proto" }
 dispatch-pty = { path = "crates/dispatch-pty" }
