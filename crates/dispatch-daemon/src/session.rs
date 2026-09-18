@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
@@ -34,6 +36,27 @@ pub enum DaemonError {
 /// Identifies one attached client.
 type ClientId = u64;
 
+/// Asks a running daemon to stop.
+///
+/// Taken before [`Daemon::serve`] is called, because that consumes the daemon.
+/// A signal handler runs on another thread, so this is the flag it sets rather
+/// than a method on the daemon itself.
+#[derive(Debug, Clone)]
+pub struct Shutdown(Arc<AtomicBool>);
+
+impl Shutdown {
+    /// Asks the daemon to stop after its current pass.
+    pub fn request(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a stop has been asked for.
+    #[must_use]
+    pub fn is_requested(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// Something the loop reacts to.
 enum Event {
     /// A client attached.
@@ -61,6 +84,7 @@ pub struct Daemon {
     events: Receiver<Event>,
     sender: Sender<Event>,
     device: String,
+    stop: Arc<AtomicBool>,
 }
 
 impl Daemon {
@@ -77,7 +101,16 @@ impl Daemon {
             events,
             sender,
             device: device.into(),
+            stop: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Returns the handle that stops this daemon.
+    ///
+    /// Must be taken before [`Daemon::serve`], which consumes the daemon.
+    #[must_use]
+    pub fn shutdown_handle(&self) -> Shutdown {
+        Shutdown(Arc::clone(&self.stop))
     }
 
     /// Registers a project the daemon will spawn panes in.
@@ -120,8 +153,12 @@ impl Daemon {
     }
 
     /// The loop. Public so tests can drive it without a listener.
+    ///
+    /// Returns once [`Shutdown::request`] has been called, after killing the
+    /// panes: they are the daemon's children, and an orphan agent no client can
+    /// ever reattach to is worse than a stopped one.
     pub fn run(&mut self) {
-        loop {
+        while !self.stop.load(Ordering::Relaxed) {
             match self.events.recv_timeout(TICK) {
                 Ok(event) => self.handle(event),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -131,6 +168,16 @@ impl Daemon {
             }
 
             self.pump_panes();
+        }
+
+        self.close_all_panes();
+    }
+
+    /// Terminates every pane, so nothing outlives the daemon.
+    fn close_all_panes(&mut self) {
+        for (id, mut pane) in self.panes.drain() {
+            tracing::info!(pane = %id, "terminating a pane on shutdown");
+            pane.session.terminate();
         }
     }
 

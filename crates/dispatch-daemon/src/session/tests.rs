@@ -537,3 +537,58 @@ fn an_exited_pane_is_reported_and_kept() {
 
     assert_eq!(daemon.pane_count(), 1, "an exited pane stays until closed");
 }
+
+#[test]
+fn a_shutdown_handle_reports_the_request() {
+    let (daemon, _, _dir) = daemon("handle");
+    let handle = daemon.shutdown_handle();
+
+    assert!(!handle.is_requested(), "a fresh daemon is not stopping");
+    handle.request();
+    assert!(handle.is_requested());
+}
+
+#[test]
+fn a_requested_shutdown_stops_the_loop_and_kills_the_panes() {
+    let (mut daemon, project, dir) = daemon("shutdown");
+    let inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let _ = drain(&inbox);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::SpawnPane {
+            project,
+            harness: "shell".into(),
+            size: (80, 24),
+        },
+    );
+    wait_for(&mut daemon, &inbox, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. }))
+    });
+    assert_eq!(daemon.pane_count(), 1);
+
+    // The loop runs on another thread so a missing shutdown check fails the
+    // test rather than hanging it.
+    let shutdown = daemon.shutdown_handle();
+    let (done, finished) = channel();
+    let worker = std::thread::spawn(move || {
+        daemon.run();
+        let _ = done.send(daemon.pane_count());
+        drop(dir);
+    });
+
+    shutdown.request();
+
+    let remaining = finished
+        .recv_timeout(Duration::from_secs(10))
+        .expect("run returns once a shutdown is requested");
+    assert_eq!(
+        remaining, 0,
+        "panes are the daemon's children and must not outlive it"
+    );
+
+    worker.join().expect("the loop thread does not panic");
+}

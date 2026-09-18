@@ -45,9 +45,26 @@ cargo build --workspace --target x86_64-pc-windows-gnu
 | `dispatch-config` | Harness definitions, config loading. |
 | `dispatch-os` | All platform-specific code. The only crate with `#[cfg(windows)]`. |
 | `dispatch-pty` | PTY supervision and VT screen state. |
+| `dispatch-proto` | The client-daemon wire protocol. |
+| `dispatch-daemon` | The daemon's loop: it owns the agents. |
 | `dispatch-tui` | Rendering, input routing, keymap. |
-| `dispatch` | The binary. |
+| `dispatch` | The client binary. |
+| `dispatchd` | The daemon binary. |
 | `xtask` | Build tooling — regenerates FFI bindings on version bumps. |
+
+## Running the daemon
+
+`dispatchd` owns the agents, so they survive a client exiting. It runs in the
+foreground and logs to a file:
+
+```sh
+cargo run -p dispatchd -- /path/to/project
+```
+
+One daemon per configuration directory: a second refuses to start rather than
+splitting the fleet in two. `SIGTERM`, `SIGINT`, or a closed console stops it
+and terminates its panes. `DISPATCH_CONFIG_DIR` gives a separate daemon its own
+endpoint, harnesses, and log.
 
 ## License
 

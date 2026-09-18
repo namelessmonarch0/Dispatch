@@ -11,4 +11,4 @@
 mod pane;
 mod session;
 
-pub use session::{Daemon, DaemonError};
+pub use session::{Daemon, DaemonError, Shutdown};

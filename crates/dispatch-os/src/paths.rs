@@ -68,6 +68,22 @@ pub fn log_file() -> Result<PathBuf, PathError> {
     Ok(project_dirs()?.data_dir().join("dispatch.log"))
 }
 
+/// Path to the daemon's log file.
+///
+/// Separate from [`log_file`] because the client and the daemon are two
+/// processes: appending both to one file interleaves their lines, and the point
+/// of reading a daemon log is usually to find out what it did while no client
+/// was watching.
+pub fn daemon_log_file() -> Result<PathBuf, PathError> {
+    if let Some(path) = std::env::var_os(CONFIG_DIR_ENV)
+        && !path.is_empty()
+    {
+        return Ok(PathBuf::from(path).join("dispatchd.log"));
+    }
+
+    Ok(project_dirs()?.data_dir().join("dispatchd.log"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,6 +111,7 @@ mod tests {
             config_file().expect("config_file resolves"),
             harnesses_dir().expect("harnesses_dir resolves"),
             log_file().expect("log_file resolves"),
+            daemon_log_file().expect("daemon_log_file resolves"),
         ] {
             assert!(path.is_absolute(), "{} is not absolute", path.display());
         }
@@ -105,6 +122,14 @@ mod tests {
         // XDG_CONFIG_HOME would not do: macOS and Windows ignore it, so a
         // redirected configuration has to have its own variable.
         assert_eq!(CONFIG_DIR_ENV, "DISPATCH_CONFIG_DIR");
+    }
+
+    #[test]
+    fn the_client_and_the_daemon_log_to_different_files() {
+        // Two processes appending to one file interleave their lines.
+        let client = log_file().expect("log_file resolves");
+        let daemon = daemon_log_file().expect("daemon_log_file resolves");
+        assert_ne!(client, daemon);
     }
 
     #[test]
