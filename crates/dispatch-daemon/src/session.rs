@@ -8,7 +8,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use dispatch_config::HarnessRegistry;
-use dispatch_core::{PaneId, PaneStatus, ProjectId};
+use dispatch_core::{PaneId, PaneStatus, Project, ProjectId, ProjectSource};
 use dispatch_os::ipc::{Connection, Listener};
 use dispatch_proto::{ClientMessage, Frame, FrameError, PaneUpdate, ProtocolError, ServerMessage};
 use dispatch_pty::{PtySession, RunState, Size};
@@ -80,7 +80,7 @@ pub struct Daemon {
     panes: HashMap<PaneId, DaemonPane>,
     clients: HashMap<ClientId, Client>,
     harnesses: HarnessRegistry,
-    projects: HashMap<ProjectId, PathBuf>,
+    projects: HashMap<ProjectId, Project>,
     events: Receiver<Event>,
     sender: Sender<Event>,
     device: String,
@@ -114,8 +114,36 @@ impl Daemon {
     }
 
     /// Registers a project the daemon will spawn panes in.
-    pub fn add_project(&mut self, id: ProjectId, root: PathBuf) {
-        self.projects.insert(id, root);
+    ///
+    /// Reopening a root already registered returns the id it already has, so a
+    /// client that opens the same directory twice does not end up with two
+    /// entries for one checkout.
+    ///
+    /// `root` is expected to be absolute and to exist; the daemon resolves it
+    /// for a client in [`ClientMessage::OpenProject`].
+    pub fn open_project(&mut self, root: PathBuf) -> ProjectId {
+        if let Some(existing) = self.projects.values().find(|p| p.root == root) {
+            return existing.id;
+        }
+
+        // The daemon is on the machine the directory is on, so it is the only
+        // side that can tell a repository from a plain directory.
+        let source = if root.join(".git").exists() {
+            ProjectSource::GitRepo { remote: None }
+        } else {
+            ProjectSource::LocalDir
+        };
+
+        let project = Project::new(root, source);
+        let id = project.id;
+        self.projects.insert(id, project);
+        id
+    }
+
+    /// The projects registered, in no particular order.
+    #[must_use]
+    pub fn projects(&self) -> Vec<Project> {
+        self.projects.values().cloned().collect()
     }
 
     /// How many panes are running.
@@ -245,21 +273,28 @@ impl Daemon {
 
                 // Describe what already exists, so a client attaching to a
                 // running daemon sees the panes rather than waiting for one to
-                // change.
+                // change. Projects come first: a pane names the project it
+                // belongs to, and a client cannot place one it has not heard
+                // of.
                 let existing: Vec<ServerMessage> = self
-                    .panes
+                    .projects
                     .values()
-                    .map(|pane| ServerMessage::PaneSpawned {
+                    .map(|project| ServerMessage::ProjectOpened {
+                        project: project.clone(),
+                    })
+                    .chain(self.panes.values().map(|pane| ServerMessage::PaneSpawned {
                         pane: pane.id,
                         project: pane.project,
                         harness: pane.harness.clone(),
-                    })
+                    }))
                     .collect();
 
                 for message in existing {
                     self.send(id, message);
                 }
             }
+
+            ClientMessage::OpenProject { root } => self.open_project_for(id, root),
 
             ClientMessage::SpawnPane {
                 project,
@@ -317,8 +352,50 @@ impl Daemon {
         }
     }
 
+    /// Resolves a client's path and registers it, telling everyone.
+    fn open_project_for(&mut self, client: ClientId, root: PathBuf) {
+        // Resolved here rather than on the client: the client may be on another
+        // machine, and a relative or symlinked path has to mean the same thing
+        // to every client looking at this project.
+        let resolved = match root.canonicalize() {
+            Ok(resolved) if resolved.is_dir() => resolved,
+            Ok(resolved) => {
+                self.send(
+                    client,
+                    ServerMessage::Error {
+                        error: ProtocolError::Other(format!(
+                            "not a directory: {}",
+                            resolved.display()
+                        )),
+                    },
+                );
+                return;
+            }
+            Err(error) => {
+                self.send(
+                    client,
+                    ServerMessage::Error {
+                        error: ProtocolError::Other(format!(
+                            "cannot open {}: {error}",
+                            root.display()
+                        )),
+                    },
+                );
+                return;
+            }
+        };
+
+        let id = self.open_project(resolved);
+        let project = self.projects[&id].clone();
+        tracing::info!(project = %id, root = %project.root.display(), "project opened");
+
+        // Every client hears about it: they are looking at the same fleet, and
+        // a project one of them opened is one they can all spawn into.
+        self.broadcast(ServerMessage::ProjectOpened { project });
+    }
+
     fn spawn_pane(&mut self, client: ClientId, project: ProjectId, harness: &str, size: Size) {
-        let Some(root) = self.projects.get(&project).cloned() else {
+        let Some(root) = self.projects.get(&project).map(|p| p.root.clone()) else {
             self.send(
                 client,
                 ServerMessage::Error {

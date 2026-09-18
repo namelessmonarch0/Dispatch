@@ -10,7 +10,6 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 use dispatch_config::HarnessRegistry;
-use dispatch_core::ProjectId;
 use dispatch_daemon::{Daemon, Shutdown};
 use dispatch_os::ipc::Listener;
 
@@ -60,9 +59,8 @@ fn main() -> Result<()> {
         let root = project
             .canonicalize()
             .with_context(|| format!("no such directory: {}", project.display()))?;
-        let id = ProjectId::new();
+        let id = daemon.open_project(root.clone());
         tracing::info!(project = %id, root = %root.display(), "serving a project");
-        daemon.add_project(id, root);
     }
 
     // Taken before serving, which consumes the daemon.

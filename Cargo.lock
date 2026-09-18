@@ -405,6 +405,7 @@ dependencies = [
  "dispatch-core",
  "dispatch-daemon",
  "dispatch-os",
+ "dispatch-proto",
  "tokio",
  "tracing",
  "tracing-subscriber",

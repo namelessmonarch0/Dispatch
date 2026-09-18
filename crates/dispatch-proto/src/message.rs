@@ -5,7 +5,9 @@
 //! what make a version mismatch survivable: a newer peer's extra fields are
 //! skipped, and a missing one falls back rather than failing the decode.
 
-use dispatch_core::{PaneId, PaneStatus, ProjectId};
+use std::path::PathBuf;
+
+use dispatch_core::{PaneId, PaneStatus, Project, ProjectId};
 use serde::{Deserialize, Serialize};
 
 /// A protocol version.
@@ -78,6 +80,16 @@ pub enum ClientMessage {
 
     /// Asks for the current state of everything.
     Subscribe,
+
+    /// Registers a directory the daemon may spawn panes in.
+    ///
+    /// The daemon resolves and inspects the path, because it is the machine the
+    /// directory is on: a client attached over the network cannot stat it, and
+    /// even a local one should not be trusted to have got it right.
+    OpenProject {
+        /// Where the project lives, as the client knows it.
+        root: PathBuf,
+    },
 
     /// Starts a pane.
     SpawnPane {
@@ -160,6 +172,16 @@ pub enum ServerMessage {
         pane: PaneId,
         /// What changed.
         update: PaneUpdate,
+    },
+
+    /// A project is available to spawn panes in.
+    ///
+    /// Sent for each project on [`ClientMessage::Subscribe`], and again
+    /// whenever one is opened, because a pane can only be started against an
+    /// id the client has been told.
+    ProjectOpened {
+        /// The project, as the daemon resolved it.
+        project: Project,
     },
 
     /// A pane was started.

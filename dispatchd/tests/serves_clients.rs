@@ -1,0 +1,255 @@
+//! End-to-end: a real client, a real socket, a real `dispatchd`.
+//!
+//! The daemon's decisions are tested in `dispatch-daemon` and the transport in
+//! `dispatch-os`. What neither covers is the binary: that it comes up, binds,
+//! and carries a pane from a spawn request to the bytes the child printed. This
+//! runs the built `dispatchd` and talks to it over the socket.
+
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, channel};
+use std::time::{Duration, Instant};
+
+use dispatch_os::ipc::Connection;
+use dispatch_proto::{ClientMessage, Frame, ServerMessage};
+
+/// How long to wait for the daemon to do anything before failing.
+const PATIENCE: Duration = Duration::from_secs(20);
+
+/// Points this process and the daemon at a configuration directory of the
+/// test's own, so neither touches the developer's harnesses or socket.
+///
+/// The variable is process-wide, so tests that use it run one at a time.
+struct Endpoint {
+    dir: PathBuf,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl Endpoint {
+    fn new(label: &str) -> Self {
+        // Under the system temp directory rather than a deeper path: a Unix
+        // socket address is limited to about a hundred bytes.
+        let dir = std::env::temp_dir().join(format!("dispatchd-it-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("harnesses")).expect("temp dir is writable");
+
+        // A harness of the test's own, so what a pane runs is a plain shell
+        // rather than whichever agents happen to be installed.
+        let shell = if cfg!(windows) {
+            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n"
+        } else {
+            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"sh\"\n"
+        };
+        std::fs::write(dir.join("harnesses").join("shell.toml"), shell)
+            .expect("temp dir is writable");
+
+        let previous = std::env::var_os(dispatch_os::paths::CONFIG_DIR_ENV);
+
+        // SAFETY: the tests that move this variable are serialised by the
+        // mutex below, and nothing else in this binary reads it concurrently.
+        unsafe { std::env::set_var(dispatch_os::paths::CONFIG_DIR_ENV, &dir) };
+
+        Self { dir, previous }
+    }
+}
+
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        // SAFETY: as above.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(dispatch_os::paths::CONFIG_DIR_ENV, value),
+                None => std::env::remove_var(dispatch_os::paths::CONFIG_DIR_ENV),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Serialises the tests that move the process-wide endpoint.
+static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A running daemon, killed when the test ends however it ends.
+struct RunningDaemon(Child);
+
+impl RunningDaemon {
+    fn start(config_dir: &Path, project: &Path) -> Self {
+        let child = Command::new(env!("CARGO_BIN_EXE_dispatchd"))
+            .arg(project)
+            .env(dispatch_os::paths::CONFIG_DIR_ENV, config_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the built dispatchd runs");
+
+        Self(child)
+    }
+}
+
+impl Drop for RunningDaemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Connects, retrying until the daemon has bound the endpoint.
+fn connect() -> Connection {
+    let deadline = Instant::now() + PATIENCE;
+
+    loop {
+        match Connection::connect() {
+            Ok(connection) => return connection,
+            Err(error) if Instant::now() >= deadline => {
+                panic!("the daemon never started listening: {error}")
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+/// Reads frames on a thread, so a message that never arrives fails the test
+/// instead of blocking it forever.
+fn read_in_background(mut reader: impl Read + Send + 'static) -> Receiver<ServerMessage> {
+    let (sender, receiver) = channel();
+
+    std::thread::spawn(move || {
+        while let Ok(message) = Frame::read::<_, ServerMessage>(&mut reader) {
+            if sender.send(message).is_err() {
+                break;
+            }
+        }
+    });
+
+    receiver
+}
+
+/// Collects messages until `predicate` holds, or fails.
+fn wait_for(
+    inbox: &Receiver<ServerMessage>,
+    what: &str,
+    predicate: impl Fn(&[ServerMessage]) -> bool,
+) -> Vec<ServerMessage> {
+    let deadline = Instant::now() + PATIENCE;
+    let mut seen = Vec::new();
+
+    while Instant::now() < deadline {
+        if predicate(&seen) {
+            return seen;
+        }
+
+        match inbox.recv_timeout(Duration::from_millis(200)) {
+            Ok(message) => seen.push(message),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    if predicate(&seen) {
+        return seen;
+    }
+    panic!("timed out waiting for {what}; saw {seen:#?}");
+}
+
+#[test]
+fn a_client_drives_a_pane_through_the_socket() {
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let endpoint = Endpoint::new("pane");
+
+    let project_dir = endpoint.dir.join("project");
+    std::fs::create_dir_all(&project_dir).expect("temp dir is writable");
+    let _daemon = RunningDaemon::start(&endpoint.dir, &project_dir);
+
+    let (reader, mut writer) = connect().split().expect("splitting succeeds");
+    let inbox = read_in_background(reader);
+
+    Frame::write(
+        &mut writer,
+        &ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "integration test".into(),
+        },
+    )
+    .expect("writing succeeds");
+
+    let welcome = wait_for(&inbox, "a welcome", |m| !m.is_empty());
+    assert!(
+        matches!(welcome.first(), Some(ServerMessage::Welcome { .. })),
+        "expected a welcome, got {welcome:#?}"
+    );
+
+    // The project named on the daemon's command line is announced, which is how
+    // a client learns an id it can spawn against.
+    Frame::write(&mut writer, &ClientMessage::Subscribe).expect("writing succeeds");
+    let announced = wait_for(&inbox, "the project", |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::ProjectOpened { .. }))
+    });
+    let project = announced
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::ProjectOpened { project } => Some(project.clone()),
+            _ => None,
+        })
+        .expect("checked by wait_for");
+    assert_eq!(
+        project.root,
+        project_dir
+            .canonicalize()
+            .expect("the project dir resolves")
+    );
+
+    Frame::write(
+        &mut writer,
+        &ClientMessage::SpawnPane {
+            project: project.id,
+            harness: "shell".into(),
+            size: (80, 24),
+        },
+    )
+    .expect("writing succeeds");
+
+    let spawned = wait_for(&inbox, "a pane", |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. }))
+    });
+    let pane = spawned
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::PaneSpawned { pane, .. } => Some(*pane),
+            _ => None,
+        })
+        .expect("checked by wait_for");
+
+    // The arithmetic is the point: the shell has to have run the line for the
+    // answer to appear, so this proves the whole path rather than an echo of
+    // what was typed.
+    Frame::write(
+        &mut writer,
+        &ClientMessage::WritePane {
+            pane,
+            bytes: b"echo alive-$((6*7))\n".to_vec(),
+        },
+    )
+    .expect("writing succeeds");
+
+    wait_for(&inbox, "the pane's output", |messages| {
+        let output: Vec<u8> = messages
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::PaneOutput { pane: p, bytes } if *p == pane => Some(bytes.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+
+        String::from_utf8_lossy(&output).contains("alive-42")
+    });
+
+    Frame::write(&mut writer, &ClientMessage::ClosePane { pane }).expect("writing succeeds");
+    wait_for(&inbox, "the pane to close", |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneClosed { .. }))
+    });
+}

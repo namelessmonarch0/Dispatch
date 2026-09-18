@@ -61,8 +61,9 @@ foreground and logs to a file:
 cargo run -p dispatchd -- /path/to/project
 ```
 
-One daemon per configuration directory: a second refuses to start rather than
-splitting the fleet in two. `SIGTERM`, `SIGINT`, or a closed console stops it
+Projects given on the command line are served immediately; a client can open
+more over the socket. One daemon per configuration directory: a second refuses
+to start rather than splitting the fleet in two. `SIGTERM`, `SIGINT`, or a closed console stops it
 and terminates its panes. `DISPATCH_CONFIG_DIR` gives a separate daemon its own
 endpoint, harnesses, and log.
 

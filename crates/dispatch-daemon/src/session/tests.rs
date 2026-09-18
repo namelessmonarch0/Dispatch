@@ -51,8 +51,8 @@ fn daemon(label: &str) -> (Daemon, ProjectId, TempDir) {
     let registry = harnesses(&dir.0.join("harnesses"));
 
     let mut daemon = Daemon::new(registry, "test-device");
-    let project = ProjectId::new();
-    daemon.add_project(project, dir.0.clone());
+    let root = dir.0.canonicalize().expect("the temp dir resolves");
+    let project = daemon.open_project(root);
 
     (daemon, project, dir)
 }
@@ -591,4 +591,131 @@ fn a_requested_shutdown_stops_the_loop_and_kills_the_panes() {
     );
 
     worker.join().expect("the loop thread does not panic");
+}
+
+#[test]
+fn reopening_a_root_keeps_one_project() {
+    // Two sidebar entries for one checkout would be a bug the user has to
+    // untangle by hand.
+    let (mut daemon, project, dir) = daemon("reopen");
+    let root = dir.0.canonicalize().expect("the temp dir resolves");
+
+    assert_eq!(daemon.open_project(root), project);
+    assert_eq!(daemon.projects().len(), 1);
+}
+
+#[test]
+fn a_subscriber_is_told_the_projects_before_the_panes() {
+    // A pane names the project it belongs to, so a client that heard about the
+    // pane first would have nowhere to put it.
+    let (mut daemon, project, _dir) = daemon("projects-first");
+    let inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let _ = drain(&inbox);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::SpawnPane {
+            project,
+            harness: "shell".into(),
+            size: (80, 24),
+        },
+    );
+    wait_for(&mut daemon, &inbox, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. }))
+    });
+
+    // A second client attaching now sees the whole picture.
+    let later = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+
+    let seen = drain(&later);
+    let projects = seen
+        .iter()
+        .position(|m| matches!(m, ServerMessage::ProjectOpened { .. }))
+        .expect("the project is announced");
+    let panes = seen
+        .iter()
+        .position(|m| matches!(m, ServerMessage::PaneSpawned { .. }))
+        .expect("the pane is announced");
+    assert!(projects < panes, "projects come first, saw {seen:#?}");
+
+    let Some(ServerMessage::ProjectOpened { project: opened }) = seen.get(projects) else {
+        unreachable!("checked above");
+    };
+    assert_eq!(opened.id, project);
+}
+
+#[test]
+fn opening_a_project_tells_every_subscriber() {
+    let (mut daemon, _, dir) = daemon("open");
+    let inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let _ = drain(&inbox);
+
+    let nested = dir.0.join("nested");
+    std::fs::create_dir_all(&nested).expect("temp dir is writable");
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::OpenProject {
+            root: nested.clone(),
+        },
+    );
+
+    let seen = drain(&inbox);
+    let Some(ServerMessage::ProjectOpened { project }) = seen.first() else {
+        panic!("expected a project, got {seen:#?}");
+    };
+    assert_eq!(project.name, "nested");
+    assert_eq!(
+        project.root,
+        nested.canonicalize().expect("the nested dir resolves"),
+        "the daemon resolves the path it was given"
+    );
+    assert_eq!(daemon.projects().len(), 2);
+}
+
+#[test]
+fn opening_a_path_that_is_not_a_directory_is_reported() {
+    let (mut daemon, _, dir) = daemon("open-bad");
+    let inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    let _ = drain(&inbox);
+
+    let file = dir.0.join("not-a-directory");
+    std::fs::write(&file, b"contents").expect("temp dir is writable");
+
+    daemon.request_for_test(1, ClientMessage::OpenProject { root: file });
+    assert!(
+        matches!(
+            drain(&inbox).first(),
+            Some(ServerMessage::Error {
+                error: ProtocolError::Other(_)
+            })
+        ),
+        "a file is not a project"
+    );
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::OpenProject {
+            root: dir.0.join("missing"),
+        },
+    );
+    assert!(
+        matches!(
+            drain(&inbox).first(),
+            Some(ServerMessage::Error {
+                error: ProtocolError::Other(_)
+            })
+        ),
+        "a path that does not exist is not a project"
+    );
+
+    assert_eq!(daemon.projects().len(), 1, "neither was registered");
 }

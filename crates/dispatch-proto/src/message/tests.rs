@@ -28,6 +28,9 @@ fn every_client_message_round_trips() {
             client: "test".into(),
         },
         ClientMessage::Subscribe,
+        ClientMessage::OpenProject {
+            root: PathBuf::from("/home/someone/code/dispatch"),
+        },
         ClientMessage::SpawnPane {
             project: ProjectId::new(),
             harness: "claude".into(),
@@ -77,6 +80,14 @@ fn every_server_message_round_trips() {
             update: PaneUpdate::Title {
                 title: "building".into(),
             },
+        },
+        ServerMessage::ProjectOpened {
+            project: dispatch_core::Project::new(
+                "/home/someone/code/dispatch",
+                dispatch_core::ProjectSource::GitRepo {
+                    remote: Some("git@github.com:someone/dispatch.git".into()),
+                },
+            ),
         },
         ServerMessage::PaneSpawned {
             pane: PaneId::new(),

@@ -11,7 +11,6 @@ workspace = true
 
 [dependencies]
 dispatch-config = { workspace = true }
-dispatch-core = { workspace = true }
 dispatch-daemon = { workspace = true }
 dispatch-os = { workspace = true }
 anyhow = { workspace = true }
@@ -19,3 +18,8 @@ clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+dispatch-core = { workspace = true }
+dispatch-os = { workspace = true }
+dispatch-proto = { workspace = true }
