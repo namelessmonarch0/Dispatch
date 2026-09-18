@@ -1,0 +1,19 @@
+[package]
+name = "dispatch-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+dispatch-os = { workspace = true }
+dispatch-proto = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+dispatch-core = { workspace = true }

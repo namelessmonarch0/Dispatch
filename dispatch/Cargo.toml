@@ -10,10 +10,12 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+dispatch-client = { workspace = true }
 dispatch-core = { workspace = true }
 dispatch-config = { workspace = true }
 dispatch-layout = { workspace = true }
 dispatch-os = { workspace = true }
+dispatch-proto = { workspace = true }
 dispatch-pty = { workspace = true }
 dispatch-tui = { workspace = true }
 crossterm = { workspace = true }

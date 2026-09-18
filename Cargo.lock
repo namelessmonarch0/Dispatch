@@ -290,15 +290,28 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
+ "dispatch-client",
  "dispatch-config",
  "dispatch-core",
  "dispatch-layout",
  "dispatch-os",
+ "dispatch-proto",
  "dispatch-pty",
  "dispatch-tui",
  "ratatui",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "dispatch-client"
+version = "0.1.0"
+dependencies = [
+ "dispatch-core",
+ "dispatch-os",
+ "dispatch-proto",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]

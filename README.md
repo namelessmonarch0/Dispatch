@@ -46,6 +46,7 @@ cargo build --workspace --target x86_64-pc-windows-gnu
 | `dispatch-os` | All platform-specific code. The only crate with `#[cfg(windows)]`. |
 | `dispatch-pty` | PTY supervision and VT screen state. |
 | `dispatch-proto` | The client-daemon wire protocol. |
+| `dispatch-client` | The client half of that protocol. |
 | `dispatch-daemon` | The daemon's loop: it owns the agents. |
 | `dispatch-tui` | Rendering, input routing, keymap. |
 | `dispatch` | The client binary. |

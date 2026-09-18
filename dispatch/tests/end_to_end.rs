@@ -28,7 +28,9 @@ args = []
 struct Harness {
     session: PtySession,
     reader: ScreenReader,
-    _config: tempdir::TempDir,
+    /// Kept alive for as long as the Dispatch under test, when the test did not
+    /// bring its own.
+    _config: Option<tempdir::TempDir>,
 }
 
 /// Minimal scoped temporary directory, to avoid a dependency for one use.
@@ -63,10 +65,20 @@ mod tempdir {
     }
 }
 
-impl Harness {
-    /// Starts Dispatch against a temporary project directory.
-    fn start(size: Size) -> Self {
-        let config = tempdir::TempDir::new("config").expect("temp dir is writable");
+/// A configuration directory and a project, shared by whatever runs against it.
+///
+/// Separate from the Harness so a daemon and the clients attaching to it can be
+/// pointed at the same one, and so it can outlive a client.
+struct Fixture {
+    config: tempdir::TempDir,
+    project: std::path::PathBuf,
+}
+
+impl Fixture {
+    /// The label is short because a Unix socket address is limited to about a
+    /// hundred bytes, and the daemon's endpoint lives in here.
+    fn new(label: &str) -> Self {
+        let config = tempdir::TempDir::new(label).expect("temp dir is writable");
         let project = config.path().join("project");
         std::fs::create_dir_all(&project).expect("temp dir is writable");
 
@@ -80,29 +92,93 @@ impl Harness {
         std::fs::write(harnesses.join("aaashell.toml"), SHELL_HARNESS.trim())
             .expect("temp dir is writable");
 
-        // The config directory is passed through the child's own environment
-        // rather than this process's. These tests run in parallel, and
-        // setting a process-wide variable would have each one racing the
-        // others' setup.
+        Self { config, project }
+    }
+
+    /// The environment that points a child at this configuration.
+    ///
+    /// Passed through the child's own environment rather than this process's:
+    /// these tests run in parallel, and a process-wide variable would have each
+    /// one racing the others' setup.
+    fn env(&self) -> std::collections::BTreeMap<String, String> {
         let mut env = std::collections::BTreeMap::new();
         env.insert(
             dispatch_os::paths::CONFIG_DIR_ENV.to_string(),
-            config.path().display().to_string(),
+            self.config.path().display().to_string(),
         );
+        env
+    }
+}
+
+/// A running `dispatchd`, killed when the test ends however it ends.
+struct Daemon(std::process::Child);
+
+impl Daemon {
+    fn start(fixture: &Fixture) -> Self {
+        // A sibling of the client binary. Cargo only defines CARGO_BIN_EXE_ for
+        // the package under test, so the daemon is found by path.
+        let mut path = std::path::PathBuf::from(env!("CARGO_BIN_EXE_dispatch"));
+        path.set_file_name(if cfg!(windows) {
+            "dispatchd.exe"
+        } else {
+            "dispatchd"
+        });
+        assert!(
+            path.exists(),
+            "{} is missing; build the workspace first",
+            path.display()
+        );
+
+        let child = std::process::Command::new(&path)
+            .arg(&fixture.project)
+            .envs(fixture.env())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the dispatchd binary can be started");
+
+        Self(child)
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Harness {
+    /// Starts Dispatch against a temporary project directory, owning its agents.
+    fn start(size: Size) -> Self {
+        let fixture = Fixture::new("config");
+        let mut harness = Self::spawn(&fixture, size, &[]);
+        harness._config = Some(fixture.config);
+        harness
+    }
+
+    /// Starts Dispatch attached to a daemon serving `fixture`.
+    fn attached(fixture: &Fixture, size: Size) -> Self {
+        Self::spawn(fixture, size, &["--attach".to_string()])
+    }
+
+    fn spawn(fixture: &Fixture, size: Size, extra: &[String]) -> Self {
+        let mut args = vec![fixture.project.display().to_string()];
+        args.extend_from_slice(extra);
 
         let launch = Launch {
             command: env!("CARGO_BIN_EXE_dispatch").to_string(),
-            args: vec![project.display().to_string()],
-            env,
+            args,
+            env: fixture.env(),
         };
 
-        let session = PtySession::spawn(&launch, config.path(), size)
+        let session = PtySession::spawn(&launch, fixture.config.path(), size)
             .expect("the dispatch binary can be started");
 
         Self {
             session,
             reader: ScreenReader::new().expect("a reader can be created"),
-            _config: config,
+            _config: None,
         }
     }
 
@@ -140,19 +216,14 @@ impl Harness {
 
         self.send(b"\r");
         assert!(
-            self.wait_for(move |lines| {
-                lines.iter().filter(|l| l.contains("Test Shell")).count() > before
-            }),
+            self.wait_for(move |lines| sidebar_panes(lines) > before),
             "a pane should be listed after choosing a harness"
         );
     }
 
-    /// How many panes are listed.
+    /// How many panes the sidebar lists.
     fn shell_panes(&mut self) -> usize {
-        self.lines()
-            .iter()
-            .filter(|l| l.contains("Test Shell"))
-            .count()
+        sidebar_panes(&self.lines())
     }
 
     /// Waits until the screen satisfies `predicate`, returning whether it did.
@@ -179,6 +250,17 @@ impl Drop for Harness {
     fn drop(&mut self) {
         self.session.terminate();
     }
+}
+
+/// How many panes the sidebar lists.
+///
+/// The last row is the status line, which names a harness too: attached, it says
+/// which one is starting, and a pane that is merely starting has no screen to
+/// type at yet. Counting it would have a test type into nothing.
+fn sidebar_panes(lines: &[String]) -> usize {
+    let sidebar = lines.split_last().map_or(lines, |(_status, rest)| rest);
+
+    sidebar.iter().filter(|l| l.contains("Test Shell")).count()
 }
 
 fn contains(lines: &[String], needle: &str) -> bool {
@@ -431,5 +513,72 @@ fn a_pane_can_be_scrolled_back_and_typing_returns_to_the_newest_output() {
     assert!(
         app.wait_for(|lines| contains(lines, "back-at-the-bottom")),
         "typing should return to the newest output"
+    );
+}
+
+#[test]
+fn attached_dispatch_runs_its_panes_in_the_daemon() {
+    // The project is not passed to the client's own state: it arrives because
+    // the daemon announced it, which is the only way an attached client can
+    // learn an id it may spawn against.
+    let fixture = Fixture::new("d1");
+    let _daemon = Daemon::start(&fixture);
+    let mut dispatch = Harness::attached(&fixture, Size::new(100, 30));
+
+    assert!(
+        dispatch.wait_for(|lines| contains(lines, "project")),
+        "the daemon's project should be listed"
+    );
+
+    dispatch.spawn_shell();
+
+    // Wait for the prompt before typing. A shell discards whatever is already
+    // pending when it sets up the terminal, so type-ahead into a shell that has
+    // not started yet is lost — here and in any other terminal.
+    assert!(
+        dispatch.wait_for(|lines| contains(lines, "$")),
+        "the shell should print a prompt"
+    );
+
+    dispatch.send(b"echo attached-$((6*7))\r");
+    assert!(
+        dispatch.wait_for(|lines| contains(lines, "attached-42")),
+        "the pane's output should come back through the daemon"
+    );
+}
+
+#[test]
+fn agents_survive_the_client_exiting() {
+    // The whole point of the daemon: close the laptop, reattach, and the work
+    // is still there.
+    let fixture = Fixture::new("d2");
+    let _daemon = Daemon::start(&fixture);
+
+    let mut first = Harness::attached(&fixture, Size::new(100, 30));
+    assert!(
+        first.wait_for(|lines| contains(lines, "project")),
+        "the daemon's project should be listed"
+    );
+    first.spawn_shell();
+
+    // Quit the client. The pane belongs to the daemon, so nothing is killed.
+    first.send(b"\x01q");
+    assert!(
+        first.wait_for(|lines| sidebar_panes(lines) == 0),
+        "the client should quit"
+    );
+    drop(first);
+
+    let mut second = Harness::attached(&fixture, Size::new(100, 30));
+    assert!(
+        second.wait_for(|lines| sidebar_panes(lines) == 1),
+        "a new client should be told about the pane that is still running"
+    );
+
+    // And it is the same shell: it answers.
+    second.send(b"echo reattached-$((6*7))\r");
+    assert!(
+        second.wait_for(|lines| contains(lines, "reattached-42")),
+        "the surviving pane should still answer"
     );
 }

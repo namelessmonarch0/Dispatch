@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/dispatch-client",
     "crates/dispatch-core",
     "crates/dispatch-layout",
     "crates/dispatch-config",
@@ -23,6 +24,7 @@ repository = "https://github.com/namelessmonarch/dispatch"
 
 [workspace.dependencies]
 # Internal
+dispatch-client = { path = "crates/dispatch-client" }
 dispatch-core = { path = "crates/dispatch-core" }
 dispatch-layout = { path = "crates/dispatch-layout" }
 dispatch-config = { path = "crates/dispatch-config" }

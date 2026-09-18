@@ -41,8 +41,18 @@ impl AppState {
     }
 
     /// Registers a project, selecting it if it is the first.
+    ///
+    /// A project already known by that id is updated in place rather than
+    /// added again. The daemon announces its projects on every subscribe, and
+    /// two rows for one checkout would give its panes two places to be drawn.
     pub fn add_project(&mut self, project: Project) -> ProjectId {
         let id = project.id;
+
+        if let Some(existing) = self.projects.iter_mut().find(|p| p.id == id) {
+            *existing = project;
+            return id;
+        }
+
         self.projects.push(project);
         if self.selected_project.is_none() {
             self.selected_project = Some(id);
@@ -108,12 +118,25 @@ impl AppState {
         project: ProjectId,
         harness: HarnessId,
     ) -> Result<PaneId, StateError> {
+        self.adopt_pane(Pane::new(project, harness))
+    }
+
+    /// Adds a pane that already exists, keeping its identity.
+    ///
+    /// The daemon names the panes it owns, so a client attaching to one takes
+    /// the ids it is given rather than minting its own: two clients looking at
+    /// the same fleet have to agree on what each pane is called.
+    pub fn adopt_pane(&mut self, pane: Pane) -> Result<PaneId, StateError> {
+        let project = pane.project;
         if !self.projects.iter().any(|p| p.id == project) {
             return Err(StateError::NoSuchProject(project));
         }
 
-        let pane = Pane::new(project, harness);
         let id = pane.id;
+        if self.panes.iter().any(|p| p.id == id) {
+            return Ok(id);
+        }
+
         self.panes.push(pane);
 
         if self.selected_project == Some(project) {
@@ -215,6 +238,59 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_project_announced_twice_is_one_project() {
+        // The daemon announces its projects on every subscribe; two rows for
+        // one checkout would give its panes two places to be drawn.
+        let mut state = AppState::new();
+        let project = Project::new("/tmp/one", ProjectSource::LocalDir);
+        let id = project.id;
+
+        assert_eq!(state.add_project(project.clone()), id);
+        assert_eq!(state.add_project(project.with_name("renamed")), id);
+
+        assert_eq!(state.projects().len(), 1);
+        assert_eq!(state.projects()[0].name, "renamed");
+    }
+
+    #[test]
+    fn a_pane_from_the_daemon_keeps_its_id() {
+        // Two clients on the same fleet have to call each pane the same thing.
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+
+        let mut pane = Pane::new(project, HarnessId::new("claude"));
+        pane.id = PaneId::new();
+        let id = pane.id;
+
+        assert_eq!(state.adopt_pane(pane).expect("the project exists"), id);
+        assert_eq!(state.pane(id).map(|p| p.id), Some(id));
+    }
+
+    #[test]
+    fn adopting_a_pane_twice_is_not_a_second_pane() {
+        // The daemon announces its panes on every subscribe, and a client that
+        // resubscribes must not double them.
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let pane = Pane::new(project, HarnessId::new("claude"));
+
+        let id = state.adopt_pane(pane.clone()).expect("the project exists");
+        assert_eq!(state.adopt_pane(pane).expect("the project exists"), id);
+        assert_eq!(state.visible_panes().len(), 1);
+    }
+
+    #[test]
+    fn a_pane_for_an_unknown_project_is_refused() {
+        let mut state = AppState::new();
+        let pane = Pane::new(ProjectId::new(), HarnessId::new("claude"));
+
+        assert!(matches!(
+            state.adopt_pane(pane),
+            Err(StateError::NoSuchProject(_))
+        ));
+    }
 
     use crate::project::ProjectSource;
 

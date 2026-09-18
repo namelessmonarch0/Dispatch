@@ -1,6 +1,7 @@
 //! Dispatch: an agent orchestration TUI.
 
 mod app;
+mod backend;
 mod terminal;
 
 use std::path::PathBuf;
@@ -25,6 +26,11 @@ struct Args {
     /// Write diagnostics to this file instead of the default location.
     #[arg(long)]
     log_file: Option<PathBuf>,
+
+    /// Use the agents owned by a running `dispatchd` instead of starting them
+    /// here, so they survive this process exiting.
+    #[arg(long)]
+    attach: bool,
 }
 
 fn main() -> Result<()> {
@@ -44,7 +50,16 @@ fn main() -> Result<()> {
         .context("failed to load harness definitions")?;
     tracing::info!(count = harnesses.len(), "harnesses registered");
 
-    let mut app = App::new(harnesses);
+    let mut app = if args.attach {
+        // Fails before the terminal is taken over, so the reason is readable.
+        let client = dispatch_client::Client::attach("dispatch")
+            .context("failed to attach to the daemon; start one with `dispatchd <project>`")?;
+        tracing::info!(device = client.device(), "attached to a daemon");
+        client.subscribe();
+        App::attached(harnesses, client)
+    } else {
+        App::new(harnesses)
+    };
 
     let projects = if args.projects.is_empty() {
         vec![std::env::current_dir().context("failed to read the working directory")?]
@@ -105,6 +120,11 @@ fn run(app: &mut App, guard: &mut TerminalGuard) -> Result<()> {
         }
 
         if app.poll_panes() {
+            needs_draw = true;
+        }
+
+        // A daemon's panes arrive as messages rather than from a pseudoterminal.
+        if app.poll_daemon() {
             needs_draw = true;
         }
     }

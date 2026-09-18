@@ -5,13 +5,19 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use dispatch_client::Client;
 use dispatch_config::{HarnessRegistry, Launch};
-use dispatch_core::{AppState, HarnessId, PaneId, PaneStatus, Project, ProjectSource};
+use dispatch_core::{
+    AppState, HarnessId, Pane as CorePane, PaneId, PaneStatus, Project, ProjectId, ProjectSource,
+};
 use dispatch_layout::{tile, tile_zoomed};
+use dispatch_proto::{ClientMessage, PaneUpdate, ServerMessage};
 use dispatch_pty::{
     KeyEncoder, MouseEncoder, MouseInput, PtySession, RunState, Screen, ScreenReader, ScrollTo,
     Size,
 };
+
+use crate::backend::{Backend, RemotePane};
 use dispatch_tui::input::{Action, Direction, Event, InputRouter, KeyCode, KeyEventKind};
 use dispatch_tui::{Item, PaneWidget, Picker, Sidebar, sidebar};
 use ratatui::Frame;
@@ -42,7 +48,7 @@ const FRAME: Duration = Duration::from_millis(16);
 
 /// Everything one pane owns.
 struct Pane {
-    session: PtySession,
+    backend: Backend,
     encoder: KeyEncoder,
     mouse: MouseEncoder,
     /// Whether the viewport is scrolled away from the newest output.
@@ -64,8 +70,20 @@ enum Overlay {
     Register,
 }
 
+/// Where this Dispatch's agents run.
+///
+/// Attached is what lets the work outlive the interface; standalone is what
+/// makes Dispatch usable with nothing else running, so both are kept.
+enum Mode {
+    /// The agents are this process's children.
+    Standalone,
+    /// The agents belong to a daemon.
+    Attached(Client),
+}
+
 /// The application.
 pub struct App {
+    mode: Mode,
     overlay: Option<(Overlay, Picker)>,
     state: AppState,
     panes: HashMap<PaneId, Pane>,
@@ -78,9 +96,19 @@ pub struct App {
 }
 
 impl App {
-    /// Creates an application with `harnesses` registered.
+    /// Creates an application that owns its own agents.
     pub fn new(harnesses: HarnessRegistry) -> Self {
+        Self::with_mode(harnesses, Mode::Standalone)
+    }
+
+    /// Creates an application whose agents belong to `client`'s daemon.
+    pub fn attached(harnesses: HarnessRegistry, client: Client) -> Self {
+        Self::with_mode(harnesses, Mode::Attached(client))
+    }
+
+    fn with_mode(harnesses: HarnessRegistry, mode: Mode) -> Self {
         Self {
+            mode,
             overlay: None,
             state: AppState::new(),
             panes: HashMap::new(),
@@ -93,7 +121,16 @@ impl App {
     }
 
     /// Registers a project.
+    ///
+    /// Attached, the daemon is asked to open it and the project appears when it
+    /// answers: it is the daemon that names projects, and both clients on a
+    /// fleet have to use the same id for the same checkout.
     pub fn add_project(&mut self, root: PathBuf) {
+        if let Mode::Attached(client) = &self.mode {
+            client.send(ClientMessage::OpenProject { root });
+            return;
+        }
+
         let source = if root.join(".git").exists() {
             ProjectSource::GitRepo { remote: None }
         } else {
@@ -103,6 +140,15 @@ impl App {
         self.state.add_project(Project::new(root, source));
     }
 
+    /// What the daemon calls itself, when attached to one.
+    #[must_use]
+    pub fn device(&self) -> Option<&str> {
+        match &self.mode {
+            Mode::Standalone => None,
+            Mode::Attached(client) => Some(client.device()),
+        }
+    }
+
     /// Whether the loop should stop.
     #[must_use]
     pub fn should_quit(&self) -> bool {
@@ -110,6 +156,9 @@ impl App {
     }
 
     /// Starts a pane running `harness` in the selected project.
+    ///
+    /// Attached, this asks and returns: the pane appears when the daemon says it
+    /// has started one, which is also how the other clients hear about it.
     pub fn spawn_pane(&mut self, harness: &str, area: Size) -> Result<()> {
         let Some(project_id) = self.state.selected_project() else {
             self.status = "no project selected".into();
@@ -120,6 +169,16 @@ impl App {
             self.status = format!("unknown harness {harness:?}");
             return Ok(());
         };
+
+        if let Mode::Attached(client) = &self.mode {
+            client.send(ClientMessage::SpawnPane {
+                project: project_id,
+                harness: harness.to_string(),
+                size: (area.cols, area.rows),
+            });
+            self.status = format!("starting {}…", def.display_name);
+            return Ok(());
+        }
 
         let launch: Launch = def.launch_for_current_platform().clone();
         let cwd = self
@@ -133,25 +192,32 @@ impl App {
         let session = PtySession::spawn(&launch, &cwd, area)
             .with_context(|| format!("failed to start {}", def.display_name))?;
 
-        let mut reader = ScreenReader::new().context("failed to create a screen reader")?;
-        let screen = reader
-            .read(session.terminal())
-            .context("failed to read the new pane")?;
-
         let id = self
             .state
             .spawn_pane(project_id, HarnessId::new(harness))
             .context("the selected project is registered")?;
 
-        // The sidebar should read "Claude Code", not "claude". The harness id
-        // is a filename; the display name is what the user chose to call it.
-        // A title sequence from the child replaces this later.
-        let _ = self.state.set_pane_title(id, &def.display_name);
+        let display_name = def.display_name.clone();
+        self.adopt(id, Backend::Local(session), &display_name)
+    }
+
+    /// Takes on a pane that now exists, wherever its process is.
+    ///
+    /// The sidebar should read "Claude Code", not "claude". The harness id is a
+    /// filename; the display name is what the user chose to call it. A title
+    /// sequence from the child replaces this later.
+    fn adopt(&mut self, id: PaneId, backend: Backend, display_name: &str) -> Result<()> {
+        let mut reader = ScreenReader::new().context("failed to create a screen reader")?;
+        let screen = reader
+            .read(backend.terminal())
+            .context("failed to read the new pane")?;
+
+        let _ = self.state.set_pane_title(id, display_name);
 
         self.panes.insert(
             id,
             Pane {
-                session,
+                backend,
                 encoder: KeyEncoder::new().context("failed to create a key encoder")?,
                 mouse: MouseEncoder::new().context("failed to create a mouse encoder")?,
                 scrolled_back: false,
@@ -163,6 +229,137 @@ impl App {
         Ok(())
     }
 
+    /// Acts on whatever the daemon has said since the last call.
+    ///
+    /// Returns whether anything needs redrawing. Standalone, there is nothing
+    /// to hear and this does nothing.
+    pub fn poll_daemon(&mut self) -> bool {
+        let Mode::Attached(client) = &self.mode else {
+            return false;
+        };
+
+        let messages = client.poll();
+        let connected = client.is_connected();
+        let mut changed = false;
+
+        for message in messages {
+            changed |= self.apply(message);
+        }
+
+        // Said once, and only once: a status line rewritten every frame would
+        // bury whatever the user was reading.
+        if !connected && !self.status.starts_with("the daemon") {
+            self.status = "the daemon connection ended — the agents are still running".into();
+            changed = true;
+        }
+
+        changed
+    }
+
+    /// Applies one message from the daemon. Returns whether to redraw.
+    fn apply(&mut self, message: ServerMessage) -> bool {
+        match message {
+            ServerMessage::ProjectOpened { project } => {
+                self.state.add_project(project);
+                true
+            }
+
+            ServerMessage::PaneSpawned {
+                pane,
+                project,
+                harness,
+            } => self.adopt_remote(pane, project, &harness),
+
+            ServerMessage::PaneOutput { pane, bytes } => {
+                let Some(target) = self.panes.get_mut(&pane) else {
+                    return false;
+                };
+
+                if let Backend::Remote(remote) = &mut target.backend {
+                    remote.feed(&bytes);
+                }
+                if let Ok(screen) = target.reader.read(target.backend.terminal()) {
+                    target.screen = screen;
+                }
+
+                true
+            }
+
+            ServerMessage::PaneChanged { pane, update } => match update {
+                PaneUpdate::Status { status } => {
+                    if let PaneStatus::Exited(code) = status
+                        && let Some(target) = self.panes.get_mut(&pane)
+                        && let Backend::Remote(remote) = &mut target.backend
+                    {
+                        remote.set_state(RunState::Exited(code));
+                    }
+
+                    self.state.set_pane_status(pane, status).is_ok()
+                }
+                PaneUpdate::Title { title } => self.state.set_pane_title(pane, &title).is_ok(),
+            },
+
+            ServerMessage::PaneClosed { pane } => {
+                // Already gone if this client closed it; a pane another client
+                // closed is removed here.
+                self.panes.remove(&pane);
+                self.state.close_pane(pane).is_ok()
+            }
+
+            ServerMessage::Error { error } => {
+                self.status = error.to_string();
+                true
+            }
+
+            // The handshake is done by the client, and nothing here pings.
+            ServerMessage::Welcome { .. } | ServerMessage::Pong { .. } => false,
+        }
+    }
+
+    /// Takes on a pane the daemon has started.
+    fn adopt_remote(&mut self, id: PaneId, project: ProjectId, harness: &str) -> bool {
+        if self.panes.contains_key(&id) {
+            return false;
+        }
+
+        let Mode::Attached(client) = &self.mode else {
+            return false;
+        };
+        let daemon = client.handle();
+
+        let mut pane = CorePane::new(project, HarnessId::new(harness));
+        pane.id = id;
+        if self.state.adopt_pane(pane).is_err() {
+            // A pane in a project this client has not been told about: the
+            // announcement is on its way, and the pane arrives with the next
+            // subscribe rather than being drawn with nowhere to belong.
+            tracing::warn!(pane = %id, project = %project, "a pane for an unknown project");
+            return false;
+        }
+
+        // Sized to nothing much: the next frame's layout resizes it to the
+        // rectangle it actually gets.
+        let backend = match RemotePane::new(id, daemon, Size::new(80, 24)) {
+            Ok(remote) => Backend::Remote(remote),
+            Err(error) => {
+                tracing::warn!(%error, "failed to prepare a pane");
+                return false;
+            }
+        };
+
+        let display_name = self
+            .harnesses
+            .get(harness)
+            .map_or_else(|| harness.to_string(), |def| def.display_name.clone());
+
+        if let Err(error) = self.adopt(id, backend, &display_name) {
+            tracing::warn!(%error, "failed to adopt a pane");
+            return false;
+        }
+
+        true
+    }
+
     /// Feeds pending output into every pane and refreshes what changed.
     ///
     /// Returns whether anything needs redrawing.
@@ -171,17 +368,17 @@ impl App {
         let mut exited = Vec::new();
 
         for (id, pane) in &mut self.panes {
-            if !pane.session.drain() {
+            if !pane.backend.drain() {
                 continue;
             }
 
             changed = true;
 
-            if let Ok(screen) = pane.reader.read(pane.session.terminal()) {
+            if let Ok(screen) = pane.reader.read(pane.backend.terminal()) {
                 pane.screen = screen;
             }
 
-            if let RunState::Exited(code) = pane.session.state() {
+            if let RunState::Exited(code) = pane.backend.state() {
                 exited.push((*id, code));
             }
         }
@@ -367,13 +564,13 @@ impl App {
 
         // Typing into a pane whose process has exited would go nowhere, and
         // the write would fail every keystroke.
-        if !matches!(pane.session.state(), RunState::Running) {
+        if !matches!(pane.backend.state(), RunState::Running) {
             return;
         }
 
-        match pane.encoder.encode(pane.session.terminal(), key, mods) {
+        match pane.encoder.encode(pane.backend.terminal(), key, mods) {
             Ok(bytes) if !bytes.is_empty() => {
-                if let Err(error) = pane.session.write(&bytes) {
+                if let Err(error) = pane.backend.write(&bytes) {
                     tracing::warn!(%error, "failed to write to a pane");
                 }
             }
@@ -392,8 +589,8 @@ impl App {
             return;
         };
 
-        let size = pane.session.size();
-        let bytes = match pane.mouse.encode(pane.session.terminal(), size, input) {
+        let size = pane.backend.size();
+        let bytes = match pane.mouse.encode(pane.backend.terminal(), size, input) {
             Ok(bytes) => bytes,
             Err(error) => {
                 tracing::warn!(%error, "failed to encode a pointer event");
@@ -402,7 +599,7 @@ impl App {
         };
 
         if !bytes.is_empty() {
-            if let Err(error) = pane.session.write(&bytes) {
+            if let Err(error) = pane.backend.write(&bytes) {
                 tracing::warn!(%error, "failed to send a pointer event to a pane");
             }
             return;
@@ -433,10 +630,10 @@ impl App {
             return;
         };
 
-        pane.session.terminal_mut().scroll(ScrollTo::Delta(rows));
+        pane.backend.terminal_mut().scroll(ScrollTo::Delta(rows));
         pane.scrolled_back = true;
 
-        if let Ok(screen) = pane.reader.read(pane.session.terminal()) {
+        if let Ok(screen) = pane.reader.read(pane.backend.terminal()) {
             pane.screen = screen;
         }
 
@@ -452,10 +649,10 @@ impl App {
             return;
         }
 
-        pane.session.terminal_mut().scroll(ScrollTo::Bottom);
+        pane.backend.terminal_mut().scroll(ScrollTo::Bottom);
         pane.scrolled_back = false;
 
-        if let Ok(screen) = pane.reader.read(pane.session.terminal()) {
+        if let Ok(screen) = pane.reader.read(pane.backend.terminal()) {
             pane.screen = screen;
         }
 
@@ -477,7 +674,7 @@ impl App {
         bytes.extend_from_slice(text.as_bytes());
         bytes.extend_from_slice(b"\x1b[201~");
 
-        if let Err(error) = pane.session.write(&bytes) {
+        if let Err(error) = pane.backend.write(&bytes) {
             tracing::warn!(%error, "failed to paste into a pane");
         }
     }
@@ -527,7 +724,7 @@ impl App {
         };
 
         if let Some(mut pane) = self.panes.remove(&id) {
-            pane.session.terminate();
+            pane.backend.terminate();
         }
 
         let _ = self.state.close_pane(id);
@@ -617,7 +814,12 @@ impl App {
             self.status.clone()
         } else {
             let panes = self.state.visible_panes().len();
-            format!("{panes} pane(s)  ^a n new  ^a x close  ^a z zoom  ^a q quit")
+            // Attached is worth saying: it is the difference between closing
+            // Dispatch and killing the agents.
+            let where_ = self
+                .device()
+                .map_or_else(String::new, |device| format!("  {device}"));
+            format!("{panes} pane(s){where_}  ^a n new  ^a x close  ^a z zoom  ^a q quit")
         };
 
         let style = if self.router.is_armed() {
@@ -647,16 +849,16 @@ impl App {
             };
 
             let size = Size::new(rect.width, rect.height);
-            if size == pane.session.size() {
+            if size == pane.backend.size() {
                 continue;
             }
 
-            if let Err(error) = pane.session.resize(size) {
+            if let Err(error) = pane.backend.resize(size) {
                 tracing::warn!(%error, "failed to resize a pane");
                 continue;
             }
 
-            if let Ok(screen) = pane.reader.read(pane.session.terminal()) {
+            if let Ok(screen) = pane.reader.read(pane.backend.terminal()) {
                 pane.screen = screen;
             }
         }
