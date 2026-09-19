@@ -723,6 +723,13 @@ impl App {
             _ => {}
         }
 
+        // A request that arrived while a picker had the keyboard was queued
+        // rather than shown; once the picker is gone, this is the same free
+        // keyboard `DelegatePending` would have found.
+        if self.overlay.is_none() {
+            self.open_next_approval();
+        }
+
         Ok(())
     }
 
@@ -1269,6 +1276,7 @@ impl App {
 mod tests {
     use super::*;
     use dispatch_core::{Project, ProjectSource};
+    use dispatch_tui::input::{KeyEvent, KeyModifiers};
 
     #[test]
     fn a_delegated_pane_is_not_tiled_until_the_user_opens_it() {
@@ -1352,6 +1360,34 @@ mod tests {
         assert!(
             !app.expanded.contains(&child_id),
             "a closed pane has nothing left to be expanded into"
+        );
+    }
+
+    #[test]
+    fn a_delegation_queued_behind_a_picker_appears_once_the_picker_closes() {
+        // `DelegatePending` only opens the approval prompt when the keyboard is
+        // free; a request that arrives mid-pick is queued silently rather than
+        // yanking the keyboard out from under whatever the user was doing.
+        // Once that picker is gone, nothing else will surface the request
+        // except this.
+        let mut app = App::new(HarnessRegistry::default());
+        app.overlay = Some(Overlay::Harness(Picker::new("New pane", Vec::new())));
+        app.pending.push_back(PendingRequest {
+            request: RequestId::new(),
+            parent: PaneId::new(),
+            project: ProjectId::new(),
+            harness: "claude".into(),
+            task: "write the tests".into(),
+            depth: 0,
+        });
+
+        let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_overlay(&esc, Size::new(80, 24))
+            .expect("handling an escape never fails");
+
+        assert!(
+            matches!(app.overlay, Some(Overlay::Approval { .. })),
+            "the queued request should be shown now that the picker is gone"
         );
     }
 }
