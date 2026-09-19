@@ -96,17 +96,42 @@ impl AppState {
     }
 
     /// Panes currently on screen, in tiling order.
+    ///
+    /// Excludes tombstones: a closed pane has no process behind it, so there
+    /// is nothing for the grid to draw.
     #[must_use]
     pub fn visible_panes(&self) -> Vec<&Pane> {
-        self.selected_project
-            .map(|p| self.panes_for(p))
-            .unwrap_or_default()
+        self.panes
+            .iter()
+            .filter(|p| !p.closed && Some(p.project) == self.selected_project)
+            .collect()
     }
 
     /// Looks up one pane.
     #[must_use]
     pub fn pane(&self, id: PaneId) -> Option<&Pane> {
         self.panes.iter().find(|p| p.id == id)
+    }
+
+    /// The panes delegated by `parent`, in spawn order.
+    #[must_use]
+    pub fn children_of(&self, parent: PaneId) -> Vec<&Pane> {
+        self.panes
+            .iter()
+            .filter(|p| p.parent == Some(parent))
+            .collect()
+    }
+
+    /// How many of `parent`'s children are still running.
+    ///
+    /// What the delegation cap counts: work in progress, not work that has
+    /// been done.
+    #[must_use]
+    pub fn live_children(&self, parent: PaneId) -> usize {
+        self.children_of(parent)
+            .iter()
+            .filter(|p| p.status.is_live())
+            .count()
     }
 
     /// Adds a pane to `project` and focuses it.
@@ -149,13 +174,85 @@ impl AppState {
     }
 
     /// Removes a pane, repairing focus and zoom.
+    ///
+    /// A pane with live durable children is marked closed and kept instead: a
+    /// blanket-approved subagent outlives its caller, and has to stay reachable
+    /// through something. Children that were one-off, or that have already
+    /// finished, go with their parent — their transcripts were reachable
+    /// through the pane being closed, and rows for finished work under a pane
+    /// that no longer exists are debris.
     pub fn close_pane(&mut self, id: PaneId) -> Result<(), StateError> {
-        let index = self
+        if !self.panes.iter().any(|p| p.id == id) {
+            return Err(StateError::NoSuchPane(id));
+        }
+
+        let survivors: Vec<PaneId> = self
+            .children_of(id)
+            .iter()
+            .filter(|p| p.durable && p.status.is_live())
+            .map(|p| p.id)
+            .collect();
+
+        let doomed: Vec<PaneId> = self
+            .children_of(id)
+            .iter()
+            .filter(|p| !survivors.contains(&p.id))
+            .map(|p| p.id)
+            .collect();
+
+        for child in doomed {
+            self.remove_pane(child);
+        }
+
+        if survivors.is_empty() {
+            // Read before the child is removed: once it is gone, its parent
+            // link goes with it.
+            let tombstone = self.parent_tombstone(id);
+            self.remove_pane(id);
+
+            // A tombstone exists only for its children. Closing the last one
+            // takes the row with it.
+            if let Some(parent) = tombstone {
+                self.remove_pane(parent);
+            }
+        } else if let Some(pane) = self.panes.iter_mut().find(|p| p.id == id) {
+            pane.closed = true;
+            if self.focused_pane == Some(id) {
+                self.focused_pane = None;
+            }
+            if self.zoomed_pane == Some(id) {
+                self.zoomed_pane = None;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The closed parent of `child`, when that parent is only still present to
+    /// hold children and this was its last live one.
+    fn parent_tombstone(&self, child: PaneId) -> Option<PaneId> {
+        let parent = self
             .panes
             .iter()
-            .position(|p| p.id == id)
-            .ok_or(StateError::NoSuchPane(id))?;
+            .find(|p| p.id == child)
+            .and_then(|p| p.parent)?;
 
+        let pane = self.panes.iter().find(|p| p.id == parent)?;
+        if !pane.closed {
+            return None;
+        }
+
+        (self.live_children(parent) <= 1).then_some(parent)
+    }
+
+    /// Removes one pane and repairs focus and zoom around it.
+    ///
+    /// A tombstone is never a repair target: it has no process behind it, so
+    /// focus or zoom landing on one would point at nothing the grid draws.
+    fn remove_pane(&mut self, id: PaneId) {
+        let Some(index) = self.panes.iter().position(|p| p.id == id) else {
+            return;
+        };
         let closed = self.panes.remove(index);
 
         if self.zoomed_pane == Some(id) {
@@ -165,13 +262,15 @@ impl AppState {
         if self.focused_pane == Some(id) {
             // Prefer the pane that slid into this one's position, so repeated
             // closes walk along the grid instead of jumping to the start.
-            let siblings = self.panes_for(closed.project);
+            let siblings: Vec<&Pane> = self
+                .panes
+                .iter()
+                .filter(|p| p.project == closed.project && !p.closed)
+                .collect();
             self.focused_pane = siblings
                 .get(index.min(siblings.len().saturating_sub(1)))
                 .map(|p| p.id);
         }
-
-        Ok(())
     }
 
     /// The focused pane, which receives keystrokes.
@@ -608,5 +707,103 @@ mod tests {
 
         assert_eq!(state.visible_panes().len(), 1);
         assert_eq!(state.focused_pane(), Some(pane));
+    }
+
+    /// A project with a parent pane and one child, returning both ids.
+    fn parent_and_child(durable: bool) -> (AppState, PaneId, PaneId) {
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+
+        let parent = state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+
+        let mut child = Pane::new(project, HarnessId::new("claude"));
+        child.parent = Some(parent);
+        child.durable = durable;
+        let child_id = child.id;
+        state.adopt_pane(child).expect("the project exists");
+
+        (state, parent, child_id)
+    }
+
+    #[test]
+    fn a_child_is_listed_under_its_parent() {
+        let (state, parent, child) = parent_and_child(false);
+
+        let children: Vec<PaneId> = state.children_of(parent).iter().map(|p| p.id).collect();
+        assert_eq!(children, vec![child]);
+        assert_eq!(state.live_children(parent), 1);
+        assert!(
+            state.children_of(child).is_empty(),
+            "a child has no children of its own"
+        );
+    }
+
+    #[test]
+    fn an_exited_child_is_not_a_live_child() {
+        // The cap counts what is running, not what has run.
+        let (mut state, parent, child) = parent_and_child(false);
+        state
+            .set_pane_status(child, PaneStatus::Exited(0))
+            .expect("the pane exists");
+
+        assert_eq!(state.live_children(parent), 0);
+        assert_eq!(state.children_of(parent).len(), 1, "the row stays");
+    }
+
+    #[test]
+    fn closing_a_parent_takes_its_one_off_children_with_it() {
+        // A one-off subagent exists to answer a caller that has just gone.
+        let (mut state, parent, child) = parent_and_child(false);
+
+        state.close_pane(parent).expect("the pane exists");
+
+        assert!(state.pane(parent).is_none(), "the parent is gone");
+        assert!(state.pane(child).is_none(), "and so is its child");
+    }
+
+    #[test]
+    fn closing_a_parent_leaves_a_tombstone_over_a_durable_child() {
+        // Blanket-approved work keeps running, and has to stay reachable.
+        let (mut state, parent, child) = parent_and_child(true);
+
+        state.close_pane(parent).expect("the pane exists");
+
+        let row = state.pane(parent).expect("the parent row stays");
+        assert!(row.closed, "marked closed rather than removed");
+        assert!(state.pane(child).is_some(), "the child keeps running");
+        assert!(
+            !state.visible_panes().iter().any(|p| p.id == parent),
+            "a tombstone is a row, not a pane to draw"
+        );
+    }
+
+    #[test]
+    fn a_tombstone_goes_when_its_last_child_does() {
+        let (mut state, parent, child) = parent_and_child(true);
+        state.close_pane(parent).expect("the pane exists");
+
+        state.close_pane(child).expect("the pane exists");
+
+        assert!(
+            state.pane(parent).is_none(),
+            "nothing is left to hold the row open"
+        );
+    }
+
+    #[test]
+    fn closing_a_parent_drops_children_that_have_already_finished() {
+        // Their transcripts were reachable through the pane just closed; rows
+        // for finished work under a pane that is gone are debris.
+        let (mut state, parent, child) = parent_and_child(true);
+        state
+            .set_pane_status(child, PaneStatus::Exited(0))
+            .expect("the pane exists");
+
+        state.close_pane(parent).expect("the pane exists");
+
+        assert!(state.pane(parent).is_none());
+        assert!(state.pane(child).is_none());
     }
 }

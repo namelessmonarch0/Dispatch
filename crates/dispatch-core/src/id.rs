@@ -39,6 +39,14 @@ macro_rules! id_type {
                 write!(f, "{}", self.0)
             }
         }
+
+        impl std::str::FromStr for $name {
+            type Err = uuid::Error;
+
+            fn from_str(text: &str) -> Result<Self, Self::Err> {
+                Ok(Self(text.parse()?))
+            }
+        }
     };
 }
 
@@ -60,6 +68,14 @@ id_type! {
     PaneId
 }
 
+id_type! {
+    /// Identifies one delegation request.
+    ///
+    /// Separate from [`PaneId`] because a request has a life before a pane
+    /// does: it can be refused or denied and never become one.
+    RequestId
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +92,20 @@ mod tests {
         let id = PaneId::new();
         assert_eq!(id.as_uuid(), id.as_uuid());
         assert_eq!(id.to_string(), id.as_uuid().to_string());
+    }
+
+    #[test]
+    fn an_id_survives_being_written_out_and_read_back() {
+        // A pane's id reaches a subagent through the environment, as text.
+        let id = PaneId::new();
+        let parsed: PaneId = id.to_string().parse().expect("its own output parses");
+
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn text_that_is_not_an_id_is_refused() {
+        assert!("not-a-uuid".parse::<PaneId>().is_err());
+        assert!("".parse::<PaneId>().is_err());
     }
 }
