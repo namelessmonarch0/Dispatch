@@ -1,11 +1,13 @@
 //! Loading Dispatch's configuration and harness definitions.
 
+pub mod config;
 pub mod defaults;
 pub mod harness;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub use config::{Config, DelegationLimits, LoadedConfig};
 pub use harness::{HarnessDef, Launch, SettingDef, SettingKind, TaskArgs, TaskLaunch};
 
 /// Failures while loading configuration.
