@@ -62,6 +62,8 @@ pub enum Action {
     HarnessManager,
     /// Enter scrollback mode.
     Scrollback,
+    /// Reopen the approval prompt for whatever delegation requests are queued.
+    Approvals,
     /// Quit.
     Quit,
 }
@@ -233,6 +235,9 @@ fn command_for(event: &KeyEvent) -> Action {
         KeyCode::Char('l') => Action::FocusDirection(Direction::Right),
         KeyCode::Char('p') => Action::ProjectPicker,
         KeyCode::Char('H') => Action::HarnessManager,
+        // `p` is already the project picker, so approvals go on `a` instead —
+        // mnemonic with the `a` that approves one once the prompt is open.
+        KeyCode::Char('a') => Action::Approvals,
         KeyCode::Char('[') => Action::Scrollback,
         KeyCode::Char('q') => Action::Quit,
         // An unbound key after the prefix does nothing rather than reaching

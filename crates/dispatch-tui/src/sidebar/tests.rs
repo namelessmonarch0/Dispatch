@@ -320,3 +320,59 @@ fn a_tombstone_says_it_is_closed_and_still_shows_its_children() {
         "its surviving child is still reachable: {lines:#?}"
     );
 }
+
+#[test]
+fn a_click_on_a_pane_row_finds_that_pane() {
+    let (mut state, alpha, _) = state();
+    let pane = spawn(&mut state, alpha, "claude");
+
+    let area = Rect::new(0, 0, WIDTH, 10);
+    assert_eq!(hit_test(&state, area, area.x, 1), Some(pane));
+}
+
+#[test]
+fn a_click_on_a_child_row_finds_the_child_rather_than_its_parent() {
+    let (mut state, alpha, _) = state();
+    let parent = spawn(&mut state, alpha, "claude");
+    let mut child = Pane::new(alpha, HarnessId::new("claude"));
+    child.parent = Some(parent);
+    let child = state.adopt_pane(child).expect("the project exists");
+
+    let area = Rect::new(0, 0, WIDTH, 10);
+
+    assert_eq!(hit_test(&state, area, area.x, 1), Some(parent));
+    assert_eq!(hit_test(&state, area, area.x, 2), Some(child));
+}
+
+#[test]
+fn a_click_on_a_project_heading_finds_nothing() {
+    // The heading names a project, not a pane, so there is nothing there to
+    // focus.
+    let (mut state, alpha, _) = state();
+    spawn(&mut state, alpha, "claude");
+
+    let area = Rect::new(0, 0, WIDTH, 10);
+    assert_eq!(hit_test(&state, area, area.x, 0), None);
+}
+
+#[test]
+fn a_click_on_a_closed_panes_tombstone_finds_nothing() {
+    // Its row is still drawn, for its surviving children's sake, but there is
+    // no live pane behind it to bring into the grid.
+    let (mut state, alpha, _) = state();
+    let pane = spawn(&mut state, alpha, "claude");
+    state.close_pane(pane).expect("the pane exists");
+
+    let area = Rect::new(0, 0, WIDTH, 10);
+    assert_eq!(hit_test(&state, area, area.x, 1), None);
+}
+
+#[test]
+fn a_click_outside_the_sidebars_area_finds_nothing() {
+    let (mut state, alpha, _) = state();
+    spawn(&mut state, alpha, "claude");
+
+    let area = Rect::new(0, 0, WIDTH, 10);
+    assert_eq!(hit_test(&state, area, WIDTH + 5, 1), None);
+    assert_eq!(hit_test(&state, area, area.x, 20), None);
+}

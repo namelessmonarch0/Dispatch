@@ -136,6 +136,57 @@ impl Widget for Sidebar<'_> {
     }
 }
 
+/// Which pane, if any, sits at `(x, y)` in a sidebar drawn at `area`.
+///
+/// The sidebar has no keyboard focus of its own, so a pointer is the only way
+/// to pick one row out of the list; this is what lets a click reach a pane the
+/// tiled grid does not currently show. Walks the same rows in the same order
+/// as [`Sidebar::render`] — a project, then its top-level panes, each
+/// followed by its children — so a click lands on the row the eye sees there.
+/// A closed pane's tombstone row still occupies its line but answers `None`:
+/// there is nothing left to focus.
+#[must_use]
+pub fn hit_test(state: &AppState, area: Rect, x: u16, y: u16) -> Option<PaneId> {
+    if x < area.x || x >= area.x + area.width || y < area.y || y >= area.y + area.height {
+        return None;
+    }
+
+    let mut row = area.y;
+
+    for project in state.projects() {
+        if row >= area.y + area.height {
+            return None;
+        }
+        // The project heading itself names nothing to focus.
+        row += 1;
+
+        for pane in state.panes_for(project.id) {
+            if pane.parent.is_some() {
+                continue;
+            }
+            if row >= area.y + area.height {
+                return None;
+            }
+            if row == y {
+                return (!pane.closed).then_some(pane.id);
+            }
+            row += 1;
+
+            for child in state.children_of(pane.id) {
+                if row >= area.y + area.height {
+                    return None;
+                }
+                if row == y {
+                    return (!child.closed).then_some(child.id);
+                }
+                row += 1;
+            }
+        }
+    }
+
+    None
+}
+
 impl Sidebar<'_> {
     /// Draws one project row and returns the next line.
     fn render_project(

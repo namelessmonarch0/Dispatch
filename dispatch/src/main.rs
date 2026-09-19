@@ -1,6 +1,7 @@
 //! Dispatch: an agent orchestration TUI.
 
 mod app;
+mod approval;
 mod backend;
 mod delegate;
 mod terminal;

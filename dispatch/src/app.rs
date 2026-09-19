@@ -1,6 +1,6 @@
 //! The running application: state, panes, and the event loop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -9,6 +9,7 @@ use dispatch_client::Client;
 use dispatch_config::{HarnessRegistry, Launch};
 use dispatch_core::{
     AppState, HarnessId, Pane as CorePane, PaneId, PaneStatus, Project, ProjectId, ProjectSource,
+    RequestId,
 };
 use dispatch_layout::{tile, tile_zoomed};
 use dispatch_proto::{ClientMessage, PaneUpdate, ServerMessage};
@@ -17,16 +18,21 @@ use dispatch_pty::{
     Size, TitleScanner,
 };
 
+use crate::approval::Approval;
 use crate::backend::{Backend, RemotePane};
-use dispatch_tui::input::{Action, Direction, Event, InputRouter, KeyCode, KeyEventKind};
+use dispatch_tui::input::{
+    Action, Direction, Event, InputRouter, KeyCode, KeyEventKind, MouseEventKind,
+};
 use dispatch_tui::{Item, PaneWidget, Picker, Sidebar, sidebar};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Clear, Paragraph, Widget};
 
-/// Which overlay is open, decoupled from the picker so a selection can be
-/// read out before the overlay is closed.
+/// Which picker is open, decoupled from the picker itself so a selection can
+/// be read out before the overlay is closed. `Overlay::Approval` has no
+/// picker of its own and so no `OverlayKind` — a decision there is acted on
+/// directly rather than looked up by kind.
 #[derive(Debug, Clone, Copy)]
 enum OverlayKind {
     Harness,
@@ -34,17 +40,44 @@ enum OverlayKind {
     Register,
 }
 
-fn kind_of(overlay: &Overlay) -> OverlayKind {
-    match overlay {
-        Overlay::Harness => OverlayKind::Harness,
-        Overlay::Project => OverlayKind::Project,
-        Overlay::Register => OverlayKind::Register,
-    }
+/// One delegation request waiting on a decision.
+///
+/// Held only as the daemon announced it: Dispatch keeps no ledger of its own,
+/// so a reattach or a resolution from elsewhere is always taken as the truth.
+struct PendingRequest {
+    /// Which request, for the `DelegateDecision` that eventually answers it.
+    request: RequestId,
+    /// The pane asking.
+    parent: PaneId,
+    /// Its project, for display.
+    project: ProjectId,
+    /// Which harness would run.
+    harness: String,
+    /// What it would be asked to do, verbatim.
+    task: String,
+    /// How deep the asking pane already is.
+    depth: u8,
 }
 
 /// Frame budget. A chatty agent can produce output faster than any terminal
 /// can draw it, so redraws are coalesced rather than done per byte.
 const FRAME: Duration = Duration::from_millis(16);
+
+/// Centres a box for the approval prompt inside `area`.
+///
+/// Wide enough for a few sentences of task text without cropping the corners
+/// off a small terminal.
+fn centred_approval(area: Rect) -> Rect {
+    let width = area.width.saturating_sub(4).clamp(20, 76).min(area.width);
+    let height = area.height.saturating_sub(2).clamp(8, 20).min(area.height);
+
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+}
 
 /// Everything one pane owns.
 struct Pane {
@@ -61,15 +94,53 @@ struct Pane {
     titles: TitleScanner,
 }
 
-/// What the picker on screen is choosing, which decides what a selection
-/// does.
+/// What has the keyboard, so a keystroke meant for an agent — or an approval
+/// meant for one request — can never land on the wrong thing.
 enum Overlay {
     /// A harness to spawn.
-    Harness,
+    Harness(Picker),
     /// A project to switch to.
-    Project,
+    Project(Picker),
     /// A harness to register, found on PATH.
-    Register,
+    Register(Picker),
+    /// A delegation request, shown from the front of `App::pending`.
+    Approval {
+        /// First line of the task text on screen, for a long one.
+        scroll: u16,
+    },
+}
+
+impl Overlay {
+    /// The picker inside, for the variants that have one.
+    fn picker(&self) -> Option<&Picker> {
+        match self {
+            Overlay::Harness(picker) | Overlay::Project(picker) | Overlay::Register(picker) => {
+                Some(picker)
+            }
+            Overlay::Approval { .. } => None,
+        }
+    }
+
+    /// The picker inside, mutably, for the variants that have one.
+    fn picker_mut(&mut self) -> Option<&mut Picker> {
+        match self {
+            Overlay::Harness(picker) | Overlay::Project(picker) | Overlay::Register(picker) => {
+                Some(picker)
+            }
+            Overlay::Approval { .. } => None,
+        }
+    }
+
+    /// What kind of choice a picker overlay is making, for the variants that
+    /// are one.
+    fn kind(&self) -> Option<OverlayKind> {
+        match self {
+            Overlay::Harness(_) => Some(OverlayKind::Harness),
+            Overlay::Project(_) => Some(OverlayKind::Project),
+            Overlay::Register(_) => Some(OverlayKind::Register),
+            Overlay::Approval { .. } => None,
+        }
+    }
 }
 
 /// Where this Dispatch's agents run.
@@ -91,19 +162,27 @@ pub struct App {
     generation: u64,
     /// The project roots this client asked for, so a reconnection can ask again.
     opened: Vec<PathBuf>,
-    overlay: Option<(Overlay, Picker)>,
+    overlay: Option<Overlay>,
     state: AppState,
     panes: HashMap<PaneId, Pane>,
     harnesses: HarnessRegistry,
     router: InputRouter,
     /// Where each pane was drawn last frame, for resolving the pointer.
     layout: Vec<(PaneId, Rect)>,
+    /// Where the sidebar was drawn last frame.
+    ///
+    /// The sidebar has no keyboard focus of its own, so a click is the only
+    /// way to pick one of its rows out of the list — this is what a click is
+    /// matched against.
+    sidebar_area: Rect,
     /// Subagents the user has opened, so they join the tiled grid.
     ///
     /// Which rows are open is a per-client choice, not a property of the
     /// pane itself — two clients on one fleet can disagree about it, so this
     /// never goes to the daemon.
     expanded: HashSet<PaneId>,
+    /// Delegation requests waiting on a decision, oldest first.
+    pending: VecDeque<PendingRequest>,
     status: String,
     quit: bool,
 }
@@ -135,7 +214,9 @@ impl App {
             harnesses,
             router: InputRouter::new(),
             layout: Vec::new(),
+            sidebar_area: Rect::default(),
             expanded: HashSet::new(),
+            pending: VecDeque::new(),
             status: String::new(),
             quit: false,
         }
@@ -320,8 +401,11 @@ impl App {
         self.state = AppState::new();
         self.layout.clear();
         // A picker offering projects that have just been forgotten would act on
-        // an id nothing answers to.
+        // an id nothing answers to, and a request from a pane that no longer
+        // exists would be answered into a void. The new connection's `Subscribe`
+        // catch-up replays whatever is still actually outstanding.
         self.overlay = None;
+        self.pending.clear();
     }
 
     /// Applies one message from the daemon. Returns whether to redraw.
@@ -381,6 +465,9 @@ impl App {
                 // Already gone if this client closed it; a pane another client
                 // closed is removed here.
                 self.panes.remove(&pane);
+                // A pane that is gone cannot be opened into the grid, so it has
+                // no business staying in `expanded` either.
+                self.expanded.remove(&pane);
                 self.state.close_pane(pane).is_ok()
             }
 
@@ -389,13 +476,56 @@ impl App {
                 true
             }
 
+            ServerMessage::DelegatePending {
+                request,
+                parent,
+                project,
+                harness,
+                task,
+                depth,
+            } => {
+                self.pending.push_back(PendingRequest {
+                    request,
+                    parent,
+                    project,
+                    harness,
+                    task,
+                    depth,
+                });
+
+                // A keystroke meant for an agent must never land on an
+                // approval, which cuts both ways: this only takes the
+                // keyboard when nothing else already has it.
+                if self.overlay.is_none() {
+                    self.overlay = Some(Overlay::Approval { scroll: 0 });
+                }
+
+                true
+            }
+
+            ServerMessage::DelegateResolved { request, .. } => {
+                // Answered here, elsewhere, or by the daemon's own deadline —
+                // any of the three means this client's queue no longer has a
+                // reason to hold it. A decision this client made itself is
+                // already gone from `pending` (see `decide`), so this mostly
+                // withdraws a prompt someone else, or nobody, has just settled.
+                let front_was = self.pending.front().map(|waiting| waiting.request);
+                self.pending.retain(|waiting| waiting.request != request);
+
+                if matches!(self.overlay, Some(Overlay::Approval { .. }))
+                    && front_was != self.pending.front().map(|waiting| waiting.request)
+                {
+                    self.open_next_approval();
+                }
+
+                true
+            }
+
             // The handshake is done by the client, and nothing here pings.
-            // Delegation messages are for delegate callers, not interface clients.
-            // Unknown messages from newer peers are ignored.
+            // `DelegateFinished` is for the delegate caller, not interface
+            // clients. Unknown messages from newer peers are ignored.
             ServerMessage::Welcome { .. }
             | ServerMessage::Pong { .. }
-            | ServerMessage::DelegatePending { .. }
-            | ServerMessage::DelegateResolved { .. }
             | ServerMessage::DelegateFinished { .. }
             | ServerMessage::Unknown => false,
         }
@@ -488,10 +618,22 @@ impl App {
 
     /// Acts on one input event.
     pub fn handle(&mut self, event: &Event, area: Size) -> Result<()> {
-        // A picker takes the keyboard while it is open, so arrow keys choose
-        // rather than reaching an agent.
+        // An overlay takes the keyboard while it is open, so arrow keys choose
+        // and approval keys decide rather than either reaching an agent.
         if self.overlay.is_some() {
             return self.handle_overlay(event, area);
+        }
+
+        // The sidebar is not otherwise part of input routing — `layout` below
+        // covers only the tiled grid — so a click on one of its rows is
+        // resolved here rather than through the router.
+        if let Event::Mouse(mouse) = event
+            && matches!(mouse.kind, MouseEventKind::Down(_))
+            && let Some(id) =
+                sidebar::hit_test(&self.state, self.sidebar_area, mouse.column, mouse.row)
+        {
+            self.focus_pane(id);
+            return Ok(());
         }
 
         let layout = std::mem::take(&mut self.layout);
@@ -503,9 +645,7 @@ impl App {
             Action::Quit => self.quit = true,
             Action::SendKey(key, mods) => self.send_key(key, mods),
             Action::Paste(text) => self.paste(&text),
-            Action::FocusPane(id) => {
-                let _ = self.state.focus(id);
-            }
+            Action::FocusPane(id) => self.focus_pane(id),
             Action::FocusDirection(direction) => self.focus_direction(direction),
             Action::SendMouse(id, input) => self.send_mouse(id, input),
             Action::Scroll(rows) => self.scroll_focused(rows),
@@ -515,12 +655,31 @@ impl App {
             Action::ProjectPicker => self.open_project_picker(),
             Action::HarnessManager => self.open_harness_manager(),
             Action::Scrollback => self.scroll_focused(-10),
+            Action::Approvals => self.open_next_approval(),
         }
 
         Ok(())
     }
 
-    /// Handles input while a picker is open.
+    /// Focuses a pane and, if it is a subagent, brings it into the tiled grid.
+    ///
+    /// Every way of focusing a pane — the mouse moving over a tiled one, a
+    /// sidebar click, `h`/`j`/`k`/`l` — goes through this, so it is the one
+    /// place a child needs to be added to `expanded` rather than several.
+    fn focus_pane(&mut self, id: PaneId) {
+        if self.state.focus(id).is_err() {
+            return;
+        }
+        if self
+            .state
+            .pane(id)
+            .is_some_and(|pane| pane.parent.is_some())
+        {
+            self.expanded.insert(id);
+        }
+    }
+
+    /// Handles input while an overlay has the keyboard.
     fn handle_overlay(&mut self, event: &Event, area: Size) -> Result<()> {
         let Event::Key(key) = event else {
             return Ok(());
@@ -529,23 +688,30 @@ impl App {
             return Ok(());
         }
 
+        if matches!(self.overlay, Some(Overlay::Approval { .. })) {
+            self.handle_approval_key(key.code);
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.overlay = None;
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if let Some((_, picker)) = &mut self.overlay {
+                if let Some(picker) = self.overlay.as_mut().and_then(Overlay::picker_mut) {
                     picker.next();
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if let Some((_, picker)) = &mut self.overlay {
+                if let Some(picker) = self.overlay.as_mut().and_then(Overlay::picker_mut) {
                     picker.previous();
                 }
             }
             KeyCode::Enter => {
-                let chosen = self.overlay.as_ref().and_then(|(kind, picker)| {
-                    picker.selected().map(|i| (kind_of(kind), i.id.clone()))
+                let chosen = self.overlay.as_ref().and_then(|overlay| {
+                    let kind = overlay.kind()?;
+                    let item = overlay.picker()?.selected()?;
+                    Some((kind, item.id.clone()))
                 });
 
                 self.overlay = None;
@@ -558,6 +724,77 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Handles a key while the approval prompt has the keyboard.
+    ///
+    /// `Esc` defers rather than denies — a mistaken deny throws away work the
+    /// agent has already reasoned about — so it is the only key here that
+    /// leaves the request in `pending` rather than answering it.
+    fn handle_approval_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.overlay = None;
+                if !self.pending.is_empty() {
+                    self.status = format!("{} delegation(s) waiting — ^a a", self.pending.len());
+                }
+            }
+            KeyCode::Char('a') => self.decide(true, false),
+            KeyCode::Char('d') => self.decide(false, false),
+            KeyCode::Char('A') => self.decide(true, true),
+            KeyCode::Up => self.scroll_approval(false),
+            KeyCode::Down => self.scroll_approval(true),
+            _ => {}
+        }
+    }
+
+    /// Answers the request at the front of the queue, and moves on to the
+    /// next one if there is one waiting.
+    fn decide(&mut self, approve: bool, blanket: bool) {
+        let Some(waiting) = self.pending.pop_front() else {
+            self.overlay = None;
+            return;
+        };
+
+        if let Mode::Attached(client) = &self.mode {
+            client.send(ClientMessage::DelegateDecision {
+                request: waiting.request,
+                approve,
+                blanket,
+            });
+        }
+
+        self.open_next_approval();
+    }
+
+    /// Scrolls the task text of the request currently shown.
+    fn scroll_approval(&mut self, down: bool) {
+        let Some(Overlay::Approval { scroll }) = &mut self.overlay else {
+            return;
+        };
+
+        if down {
+            let max = self.pending.front().map_or(0, |waiting| {
+                u16::try_from(waiting.task.lines().count()).unwrap_or(u16::MAX)
+            });
+            *scroll = scroll.saturating_add(1).min(max);
+        } else {
+            *scroll = scroll.saturating_sub(1);
+        }
+    }
+
+    /// Opens the approval prompt for whatever is at the front of the queue,
+    /// or closes it when there is nothing left to ask about.
+    ///
+    /// This is `Action::Approvals`, reached with the queue as it stands
+    /// whenever nothing new has arrived; it is also how the prompt advances
+    /// to the next request after one is answered.
+    fn open_next_approval(&mut self) {
+        self.overlay = if self.pending.is_empty() {
+            None
+        } else {
+            Some(Overlay::Approval { scroll: 0 })
+        };
     }
 
     /// Acts on a picker selection.
@@ -604,7 +841,7 @@ impl App {
             return;
         }
 
-        self.overlay = Some((Overlay::Harness, Picker::new("New pane", items)));
+        self.overlay = Some(Overlay::Harness(Picker::new("New pane", items)));
     }
 
     fn open_project_picker(&mut self) {
@@ -615,7 +852,7 @@ impl App {
             .map(|p| Item::new(p.id.to_string(), &p.name).with_detail(p.root.display().to_string()))
             .collect();
 
-        self.overlay = Some((Overlay::Project, Picker::new("Project", items)));
+        self.overlay = Some(Overlay::Project(Picker::new("Project", items)));
     }
 
     /// Offers harnesses that are installed but not yet registered.
@@ -639,7 +876,7 @@ impl App {
             })
             .collect();
 
-        self.overlay = Some((Overlay::Register, Picker::new("Add harness", items)));
+        self.overlay = Some(Overlay::Register(Picker::new("Add harness", items)));
     }
 
     fn send_key(&mut self, key: dispatch_pty::Key, mods: dispatch_pty::Modifiers) {
@@ -822,6 +1059,9 @@ impl App {
         }
 
         let _ = self.state.close_pane(id);
+        // A closed pane cannot be brought into the grid, so it has nothing
+        // left to be expanded into.
+        self.expanded.remove(&id);
     }
 
     /// Draws one frame.
@@ -841,14 +1081,60 @@ impl App {
         );
 
         frame.render_widget(Sidebar::new(&self.state), sidebar_area);
+        self.sidebar_area = sidebar_area;
 
         self.layout = self.compute_layout(panes_area);
         self.draw_panes(frame);
         self.draw_status(frame, area);
 
-        if let Some((_, picker)) = &self.overlay {
+        self.draw_overlay(frame, panes_area);
+    }
+
+    /// Draws whichever overlay is open, if any.
+    fn draw_overlay(&self, frame: &mut Frame<'_>, panes_area: Rect) {
+        let Some(overlay) = &self.overlay else {
+            return;
+        };
+
+        if let Some(picker) = overlay.picker() {
             frame.render_widget(picker, panes_area);
+            return;
         }
+
+        let Overlay::Approval { scroll } = overlay else {
+            return;
+        };
+        // The queue can only be empty here for one frame, between the last
+        // request being answered and `open_next_approval` closing the
+        // overlay; nothing to draw is not a bug worth a fallback screen for.
+        let Some(request) = self.pending.front() else {
+            return;
+        };
+
+        let asking = self
+            .state
+            .pane(request.parent)
+            .map_or("a pane", |pane| pane.title.as_str());
+        let project = self
+            .state
+            .projects()
+            .iter()
+            .find(|project| project.id == request.project)
+            .map_or("an unknown project", |project| project.name.as_str());
+
+        let widget = Approval {
+            asking,
+            harness: &request.harness,
+            project,
+            depth: request.depth,
+            task: &request.task,
+            waiting: self.pending.len().saturating_sub(1),
+            scroll: *scroll,
+        };
+
+        let rect = centred_approval(panes_area);
+        Clear.render(rect, frame.buffer_mut());
+        frame.render_widget(widget, rect);
     }
 
     /// The panes to tile this frame.
@@ -1013,6 +1299,59 @@ mod tests {
             app.tileable(),
             vec![parent, child_id],
             "opening the child brings it into the grid"
+        );
+    }
+
+    #[test]
+    fn focusing_a_child_pane_is_how_it_gets_opened() {
+        // The sidebar has no keyboard focus of its own, so a click on one of
+        // its rows and a hover over an already-tiled child both end up here —
+        // this is the one place `expanded` needs to gain an entry.
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let parent = app
+            .state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+
+        let mut child = CorePane::new(project, HarnessId::new("claude"));
+        child.parent = Some(parent);
+        let child_id = app.state.adopt_pane(child).expect("the project exists");
+
+        app.focus_pane(child_id);
+
+        assert!(app.expanded.contains(&child_id));
+        assert_eq!(app.state.focused_pane(), Some(child_id));
+    }
+
+    #[test]
+    fn closing_a_pane_forgets_that_it_was_opened() {
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let parent = app
+            .state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+
+        let mut child = CorePane::new(project, HarnessId::new("claude"));
+        child.parent = Some(parent);
+        let child_id = app.state.adopt_pane(child).expect("the project exists");
+
+        app.focus_pane(child_id);
+        assert!(
+            app.expanded.contains(&child_id),
+            "set up: the child is open"
+        );
+
+        app.close_focused();
+
+        assert!(
+            !app.expanded.contains(&child_id),
+            "a closed pane has nothing left to be expanded into"
         );
     }
 }

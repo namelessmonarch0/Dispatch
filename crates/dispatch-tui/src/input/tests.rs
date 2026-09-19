@@ -103,6 +103,7 @@ fn every_command_is_bound() {
         ('z', Action::ToggleZoom),
         ('p', Action::ProjectPicker),
         ('H', Action::HarnessManager),
+        ('a', Action::Approvals),
         ('[', Action::Scrollback),
         ('q', Action::Quit),
         ('h', Action::FocusDirection(Direction::Left)),
