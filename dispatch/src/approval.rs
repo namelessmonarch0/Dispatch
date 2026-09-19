@@ -79,51 +79,48 @@ impl<'a> Approval<'a> {
         lines
     }
 
-    /// How many rows this prompt needs once wrapped to `width` columns.
+    /// Renders the task and its surrounding chrome — everything but the
+    /// border — at this prompt's own `scroll`.
     ///
-    /// A task delivered as a single long line still wraps once rendered —
-    /// `Paragraph::scroll` counts *wrapped* rows, not the logical lines
-    /// `str::lines` sees — so a caller clamping how far this can scroll needs
-    /// this, not `task.lines().count()`. Found by actually rendering the same
-    /// lines [`Widget::render`] draws, rather than reimplementing ratatui's
-    /// word-wrap by hand: the two can never drift apart, and this needs no
-    /// unstable API.
+    /// Split out of [`Widget::render`] so [`Self::has_more_to_show`] can ask
+    /// what one offset paints without nesting a second border inside the
+    /// first.
+    fn render_content(&self, area: Rect, buf: &mut Buffer) {
+        Paragraph::new(self.lines())
+            .wrap(Wrap { trim: false })
+            .scroll((self.scroll, 0))
+            .render(area, buf);
+    }
+
+    /// Whether this prompt, scrolled to its own `scroll`, still has fresh
+    /// content to show at the bottom of a `width`×`height` box.
+    ///
+    /// How far the prompt can scroll is answered by asking this rather than
+    /// by predicting a row count: a word-wrap can waste up to a whole row's
+    /// width of columns when the next word will not fit, so any bound
+    /// computed from the text is only ever an estimate, and an estimate that
+    /// undercounts cuts off exactly the tail this prompt exists to show.
+    ///
+    /// Checked against the last two rows, not the whole box: once `scroll`
+    /// has gone past the true end, `Paragraph::scroll` paints nothing there
+    /// at all, but checking only the very last row would risk mistaking one
+    /// of this prompt's own blank separator lines for that — there is
+    /// always at least one, and this layout never stacks two in a row, so
+    /// two rows absorbs it safely without needing to know how many rows the
+    /// content actually has.
     #[must_use]
-    pub fn total_rows(&self, width: u16) -> u16 {
-        if width == 0 {
-            return 0;
+    pub fn has_more_to_show(&self, width: u16, height: u16) -> bool {
+        if width == 0 || height == 0 {
+            return false;
         }
 
-        let lines = self.lines();
-
-        // A hard break — the worst case, forced when a line has no word
-        // boundary to wrap at — needs exactly `line.width()` characters
-        // packed `width` to a row: `line.width().div_ceil(width)`. A word-wrap
-        // that instead breaks at whitespace can only need that many rows or
-        // one more per line, for whatever a word boundary leaves unused at
-        // the end of a row. Summed in `usize` rather than `u16` so a line
-        // past 65,535 columns is divided before it is ever truncated, not
-        // truncated first and divided short.
-        let bound: usize = lines
-            .iter()
-            .map(|line| line.width().div_ceil(usize::from(width)).saturating_add(1))
-            .fold(0usize, usize::saturating_add)
-            .max(1);
-        let bound = u16::try_from(bound).unwrap_or(u16::MAX);
-
-        let area = Rect::new(0, 0, width, bound);
+        let area = Rect::new(0, 0, width, height);
         let mut buf = Buffer::empty(area);
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(area, &mut buf);
+        self.render_content(area, &mut buf);
 
-        // The greatest row that still has anything painted on it.
-        (0..bound)
-            .rev()
-            .find(|&y| {
-                (0..width).any(|x| buf.cell((x, y)).is_some_and(|cell| cell.symbol() != " "))
-            })
-            .map_or(0, |y| y + 1)
+        let checked = height.min(2);
+        ((height - checked)..height)
+            .any(|y| (0..width).any(|x| buf.cell((x, y)).is_some_and(|cell| cell.symbol() != " ")))
     }
 }
 
@@ -135,64 +132,6 @@ impl Widget for Approval<'_> {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let scroll = self.scroll;
-        Paragraph::new(self.lines())
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0))
-            .render(inner, buf);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn approval<'a>(task: &'a str, waiting: usize) -> Approval<'a> {
-        Approval {
-            asking: "Claude Code",
-            harness: "claude",
-            project: "dispatch",
-            depth: 0,
-            task,
-            waiting,
-            scroll: 0,
-        }
-    }
-
-    #[test]
-    fn a_hard_break_needs_exactly_one_row_per_width_worth_of_characters() {
-        // A single "word" with no whitespace at all cannot wrap at a word
-        // boundary, so ratatui hard-breaks it every `width` columns — the
-        // worst case `total_rows`'s bound is built around. 4000 columns at a
-        // width of 68 needs ceil(4000 / 68) = 59 rows for the task alone.
-        let task = "x".repeat(4000);
-        let widget = approval(&task, 0);
-
-        let task_rows = 4000usize.div_ceil(68);
-        // harness/project/depth (1) + blank (1) + task + blank (1) + legend (1).
-        let expected = u16::try_from(task_rows + 4).expect("fits comfortably in a u16");
-
-        assert_eq!(widget.total_rows(68), expected);
-    }
-
-    #[test]
-    fn a_queued_second_request_adds_exactly_one_row() {
-        // The only way the queue's length changes what is rendered: an extra
-        // "N more waiting" line, once there is one.
-        let solo = approval("a short task", 0);
-        let with_one_more = approval("a short task", 1);
-
-        assert_eq!(with_one_more.total_rows(40), solo.total_rows(40) + 1);
-    }
-
-    #[test]
-    fn an_empty_task_still_measures_the_chrome_around_it() {
-        // `str::lines` yields nothing for an empty string, so the task
-        // contributes no rows of its own here — only the chrome does:
-        // harness/project/depth (1) + blank (1) + blank (1) + legend (1). A
-        // wide enough box that neither of those two text lines wraps on its
-        // own — this is about the chrome's line *count*, not its wrapping.
-        let widget = approval("", 0);
-        assert_eq!(widget.total_rows(100), 4);
+        self.render_content(inner, buf);
     }
 }
