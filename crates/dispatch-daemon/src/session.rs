@@ -414,6 +414,9 @@ impl Daemon {
 
             ClientMessage::ClosePane { pane } => {
                 if let Some(mut target) = self.panes.remove(&pane) {
+                    // The pane is being killed, not allowed to finish; its
+                    // caller, if it has one, is answered here or not at all.
+                    self.answer_for_a_closed_subagent(&mut target);
                     target.session.terminate();
                     // A pane that is gone can be asked for nothing more, so its
                     // blanket approval goes with it.
@@ -835,12 +838,42 @@ impl Daemon {
         });
     }
 
-    /// Resolves a request: answers its caller, and tells every interface
+    /// Resolves a request: answers its caller, and tells every other interface
     /// client so a prompt already on screen does not linger past its answer.
+    ///
+    /// The caller is excluded from the broadcast half: it already has its
+    /// answer from the direct send, and a caller that is also a subscribed
+    /// interface client — an agent delegating from a pane someone is watching —
+    /// would otherwise be told twice.
     fn resolve(&mut self, request: RequestId, caller: ClientId, outcome: DelegateOutcome) {
         let message = ServerMessage::DelegateResolved { request, outcome };
         self.send(caller, message.clone());
-        self.broadcast(message);
+        self.broadcast_except(Some(caller), message);
+    }
+
+    /// Answers the caller of a subagent whose pane is being closed under it.
+    ///
+    /// The pane leaves the map right after this, so `pump_panes` will never see
+    /// its exit, and the request left `pending` when it was approved: without
+    /// this the caller waits for a result that nothing will ever send. The exit
+    /// is reported as -1 because the subagent did not choose it — the work was
+    /// cut short, and a fabricated success or failure code would both be lies.
+    fn answer_for_a_closed_subagent(&mut self, pane: &mut DaemonPane) {
+        let (Some(request), Some(caller)) = (pane.request.take(), pane.caller.take()) else {
+            return;
+        };
+
+        let start = pane.history.len().saturating_sub(TAIL_BYTES);
+        let tail = pane.history[start..].to_vec();
+
+        self.send(
+            caller,
+            ServerMessage::DelegateFinished {
+                request,
+                exit: -1,
+                tail,
+            },
+        );
     }
 
     /// Refuses the requests a closing pane was waiting on.
@@ -943,6 +976,10 @@ impl Daemon {
         for id in ids {
             if let Some(mut pane) = self.panes.remove(&id) {
                 tracing::info!(pane = %id, "a subagent's reason to run is gone");
+                // A cascaded child can itself be a running subagent with its own
+                // caller waiting on it, and it is being killed here exactly as a
+                // directly closed pane is: the same answer is owed.
+                self.answer_for_a_closed_subagent(&mut pane);
                 pane.session.terminate();
                 self.blanket.remove(&id);
                 self.broadcast(ServerMessage::PaneClosed { pane: id });
@@ -1067,13 +1104,23 @@ impl Daemon {
 
     /// Sends to every subscribed client.
     fn broadcast(&mut self, message: ServerMessage) {
+        self.broadcast_except(None, message);
+    }
+
+    /// Sends to every subscribed interface client except `exclude`, when given.
+    ///
+    /// `resolve` uses the exclusion: it already sends the caller its answer
+    /// directly, and a caller that is also a subscribed interface client (an
+    /// agent delegating from its own pane, watched by the same client) would
+    /// otherwise be told twice.
+    fn broadcast_except(&mut self, exclude: Option<ClientId>, message: ServerMessage) {
         let mut gone = Vec::new();
 
         for (id, client) in &self.clients {
             // A delegate caller wants the fate of its own request; the fleet's
             // output and every other pane's prompts are a firehose it never
             // reads.
-            if !client.subscribed || client.role != Role::Interface {
+            if Some(*id) == exclude || !client.subscribed || client.role != Role::Interface {
                 continue;
             }
             if client.outbox.send(message.clone()).is_err() {
