@@ -66,6 +66,20 @@ pub struct Launch {
     pub env: BTreeMap<String, String>,
 }
 
+/// How to run a harness once, on one task, without a person at the keyboard.
+///
+/// Delegation needs a form that finishes: an interactive agent waits for input
+/// forever, so a caller blocking on one would never be answered. A harness
+/// without this cannot be delegated to, and Dispatch says so rather than
+/// guessing at flags that may mean something else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskLaunch {
+    /// Arguments for the one-shot form. Exactly one `{task}` placeholder is
+    /// expected; it is replaced as a single argument.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 /// A registered coding agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessDef {
@@ -86,6 +100,10 @@ pub struct HarnessDef {
     /// Environment variables to set for the child process.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+
+    /// The non-interactive form used when another agent delegates to this one.
+    #[serde(default)]
+    pub task: Option<TaskLaunch>,
 
     /// Settings the harness manager offers for this harness.
     #[serde(default)]
@@ -125,5 +143,26 @@ impl HarnessDef {
                 .or_insert_with(|| value.clone());
         }
         launch
+    }
+
+    /// The launch for running `task` once, or `None` when the harness has no
+    /// non-interactive form.
+    ///
+    /// The task replaces `{task}` inside each argument, which keeps it one
+    /// argv element however the harness spells the flag — `"{task}"` or
+    /// `"--prompt={task}"`. It is never passed through a shell, so quotes,
+    /// newlines and `$(…)` in a task are inert.
+    #[must_use]
+    pub fn task_launch(&self, task: &str) -> Option<Launch> {
+        let form = self.task.as_ref()?;
+        let mut launch = self.launch_for_current_platform();
+
+        launch.args = form
+            .args
+            .iter()
+            .map(|arg| arg.replace("{task}", task))
+            .collect();
+
+        Some(launch)
     }
 }

@@ -7,6 +7,9 @@ args = []
 command = "cmd.exe"
 args = ["/c", "codex"]
 
+[task]
+args = ["exec", "{task}"]
+
 [[settings]]
 key = "model"
 label = "Model"
