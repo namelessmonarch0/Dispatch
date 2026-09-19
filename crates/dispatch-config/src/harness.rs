@@ -66,6 +66,14 @@ pub struct Launch {
     pub env: BTreeMap<String, String>,
 }
 
+/// One platform's arguments for a one-shot run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskArgs {
+    /// Arguments, with `{task}` standing for the task.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 /// How to run a harness once, on one task, without a person at the keyboard.
 ///
 /// Delegation needs a form that finishes: an interactive agent waits for input
@@ -74,10 +82,15 @@ pub struct Launch {
 /// guessing at flags that may mean something else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskLaunch {
-    /// Arguments for the one-shot form. Exactly one `{task}` placeholder is
-    /// expected; it is replaced as a single argument.
+    /// Arguments for the one-shot form, with `{task}` standing for the task.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Per-platform overrides, keyed by `std::env::consts::OS` exactly as
+    /// `HarnessDef::platform` is. A platform whose interactive launch needs a
+    /// wrapper needs it here too: the wrapper is how the executable is reached,
+    /// and a one-shot run reaches it the same way.
+    #[serde(default)]
+    pub platform: BTreeMap<String, TaskArgs>,
 }
 
 /// A registered coding agent.
@@ -145,24 +158,31 @@ impl HarnessDef {
         launch
     }
 
-    /// The launch for running `task` once, or `None` when the harness has no
-    /// non-interactive form.
-    ///
-    /// The task replaces `{task}` inside each argument, which keeps it one
-    /// argv element however the harness spells the flag — `"{task}"` or
-    /// `"--prompt={task}"`. It is never passed through a shell, so quotes,
-    /// newlines and `$(…)` in a task are inert.
+    /// The launch for running `task` once on the current platform.
     #[must_use]
     pub fn task_launch(&self, task: &str) -> Option<Launch> {
+        self.task_launch_for(std::env::consts::OS, task)
+    }
+
+    /// The launch for running `task` once on a named platform.
+    ///
+    /// Returns `None` when the harness has no one-shot form for that platform,
+    /// including when its argument list is empty: without arguments there is no
+    /// way to tell the agent what the task is, so there is nothing to run.
+    #[must_use]
+    pub fn task_launch_for(&self, os: &str, task: &str) -> Option<Launch> {
         let form = self.task.as_ref()?;
-        let mut launch = self.launch_for_current_platform();
 
-        launch.args = form
-            .args
-            .iter()
-            .map(|arg| arg.replace("{task}", task))
-            .collect();
+        let args = match form.platform.get(os) {
+            Some(override_) => &override_.args,
+            None => &form.args,
+        };
+        if args.is_empty() {
+            return None;
+        }
 
+        let mut launch = self.launch_for(os);
+        launch.args = args.iter().map(|arg| arg.replace("{task}", task)).collect();
         Some(launch)
     }
 }

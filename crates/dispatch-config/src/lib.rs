@@ -6,7 +6,7 @@ pub mod harness;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub use harness::{HarnessDef, Launch, SettingDef, SettingKind, TaskLaunch};
+pub use harness::{HarnessDef, Launch, SettingDef, SettingKind, TaskArgs, TaskLaunch};
 
 /// Failures while loading configuration.
 ///

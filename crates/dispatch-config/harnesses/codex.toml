@@ -10,6 +10,9 @@ args = ["/c", "codex"]
 [task]
 args = ["exec", "{task}"]
 
+[task.platform.windows]
+args = ["/c", "codex", "exec", "{task}"]
+
 [[settings]]
 key = "model"
 label = "Model"

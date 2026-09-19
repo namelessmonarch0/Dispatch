@@ -501,3 +501,59 @@ fn the_built_in_agents_that_can_be_delegated_to_say_so() {
         );
     }
 }
+
+#[test]
+fn a_windows_wrapper_survives_a_one_shot_run() {
+    // claude installs on Windows as a .cmd shim that has to be run through
+    // cmd.exe. A one-shot run reaches the agent the same way an interactive one
+    // does, or it runs cmd.exe and never the agent.
+    let dir = TempDir::new("windows-task-wrapper");
+    write_missing_built_ins(dir.path()).expect("the built-ins are written");
+    let registry = HarnessRegistry::load_from_dir(dir.path()).expect("they load");
+
+    let claude = registry.get("claude").expect("the built-in exists");
+    let launch = claude
+        .task_launch_for("windows", "write the tests")
+        .expect("claude can be delegated to on Windows");
+
+    assert_eq!(launch.command, "cmd.exe");
+    assert_eq!(
+        launch.args,
+        vec!["/c", "claude", "-p", "write the tests"],
+        "the shim wrapper has to stay in front of the one-shot flags"
+    );
+}
+
+#[test]
+fn a_platform_without_its_own_form_uses_the_default_one() {
+    let dir = TempDir::new("platform-fallback");
+    write_missing_built_ins(dir.path()).expect("the built-ins are written");
+    let registry = HarnessRegistry::load_from_dir(dir.path()).expect("they load");
+
+    let launch = registry
+        .get("claude")
+        .expect("the built-in exists")
+        .task_launch_for("linux", "write the tests")
+        .expect("claude can be delegated to on Linux");
+
+    assert_eq!(launch.command, "claude");
+    assert_eq!(launch.args, vec!["-p", "write the tests"]);
+}
+
+#[test]
+fn a_task_form_with_no_arguments_is_no_task_form() {
+    // Nothing to carry the task in, so there is nothing to run.
+    let def: HarnessDef = toml::from_str(
+        r#"
+id = "empty"
+display_name = "Empty"
+command = "empty"
+
+[task]
+args = []
+"#,
+    )
+    .expect("the definition parses");
+
+    assert!(def.task_launch("anything").is_none());
+}
