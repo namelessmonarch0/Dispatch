@@ -14,3 +14,6 @@ vendor/libghostty-vt/.zig-cache/
 # Zig fetches dependencies into the vendored tree on first build
 vendor/libghostty-vt/zig-pkg/
 vendor/libghostty-vt/zig-out/
+
+# Subagent-driven development scratch: ledgers, briefs, review packages
+/.superpowers
