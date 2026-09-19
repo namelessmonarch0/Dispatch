@@ -1,19 +1,29 @@
 //! The daemon's event loop.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use dispatch_config::HarnessRegistry;
-use dispatch_core::{PaneId, PaneStatus, Project, ProjectId, ProjectSource};
+use dispatch_config::{DelegationLimits, HarnessRegistry};
+use dispatch_core::{PaneId, PaneStatus, Project, ProjectId, ProjectSource, RequestId};
 use dispatch_os::ipc::{Connection, Listener};
-use dispatch_proto::{ClientMessage, Frame, FrameError, PaneUpdate, ProtocolError, ServerMessage};
+use dispatch_proto::{
+    ClientMessage, DelegateOutcome, Frame, FrameError, PaneUpdate, ProtocolError, Role,
+    ServerMessage,
+};
 use dispatch_pty::{Pty, RunState, Size};
 
+use crate::delegation::Pending;
 use crate::pane::DaemonPane;
+
+/// How much of a subagent's output its caller is given.
+///
+/// Enough for an agent to act on, far short of a session: the pane keeps the
+/// rest, and a person can open it.
+const TAIL_BYTES: usize = 8 * 1024;
 
 /// How long the loop waits for an event before checking panes again.
 ///
@@ -73,6 +83,10 @@ struct Client {
     /// Whether it has asked for pane events. A client that has not subscribed
     /// is still connected but silent, which is what a one-shot command wants.
     subscribed: bool,
+    /// What the connection is for, from its `Hello`. Output and delegation
+    /// prompts are broadcast to interface clients only; a delegate caller
+    /// wants the fate of its own request and nothing else.
+    role: Role,
 }
 
 /// The daemon.
@@ -85,12 +99,29 @@ pub struct Daemon {
     sender: Sender<Event>,
     device: String,
     stop: Arc<AtomicBool>,
+    limits: DelegationLimits,
+    /// Requests asked about and not yet answered.
+    pending: HashMap<RequestId, Pending>,
+    /// Panes the user has approved for every future request, for as long as
+    /// this daemon runs.
+    blanket: HashSet<PaneId>,
 }
 
 impl Daemon {
-    /// Creates a daemon serving `harnesses`.
+    /// Creates a daemon serving `harnesses`, with the default delegation
+    /// limits.
     #[must_use]
     pub fn new(harnesses: HarnessRegistry, device: impl Into<String>) -> Self {
+        Self::with_limits(harnesses, device, DelegationLimits::default())
+    }
+
+    /// Creates a daemon serving `harnesses`, with explicit delegation limits.
+    #[must_use]
+    pub fn with_limits(
+        harnesses: HarnessRegistry,
+        device: impl Into<String>,
+        limits: DelegationLimits,
+    ) -> Self {
         let (sender, events) = channel();
 
         Self {
@@ -102,6 +133,9 @@ impl Daemon {
             sender,
             device: device.into(),
             stop: Arc::new(AtomicBool::new(false)),
+            limits,
+            pending: HashMap::new(),
+            blanket: HashSet::new(),
         }
     }
 
@@ -225,12 +259,14 @@ impl Daemon {
                     Client {
                         outbox,
                         subscribed: false,
+                        role: Role::default(),
                     },
                 );
                 tracing::info!(client = id, "client attached");
             }
             Event::Detached(id) => {
                 self.clients.remove(&id);
+                self.abandon(id);
                 tracing::info!(client = id, "client detached");
             }
             Event::Request(id, message) => self.handle_request(id, message),
@@ -242,7 +278,7 @@ impl Daemon {
             ClientMessage::Hello {
                 version,
                 client,
-                role: _,
+                role,
             } => {
                 if !dispatch_proto::VERSION.is_compatible_with(version) {
                     // Refuse rather than proceed: a major mismatch means the
@@ -258,6 +294,10 @@ impl Daemon {
                     );
                     self.clients.remove(&id);
                     return;
+                }
+
+                if let Some(existing) = self.clients.get_mut(&id) {
+                    existing.role = role;
                 }
 
                 tracing::info!(client = id, %version, name = %client, "handshake accepted");
@@ -293,7 +333,7 @@ impl Daemon {
                         pane: pane.id,
                         project: pane.project,
                         harness: pane.harness.clone(),
-                        parent: None,
+                        parent: pane.parent,
                     });
 
                     // What the pane has printed, so a client that reattaches
@@ -315,6 +355,12 @@ impl Daemon {
                             },
                         });
                     }
+                }
+
+                // A request already put to the user is put to this client too,
+                // rather than only to whoever was subscribed at the time.
+                for waiting in self.pending.values() {
+                    existing.push(waiting.announcement.clone());
                 }
 
                 for message in existing {
@@ -365,7 +411,11 @@ impl Daemon {
             ClientMessage::ClosePane { pane } => {
                 if let Some(mut target) = self.panes.remove(&pane) {
                     target.session.terminate();
+                    // A pane that is gone can be asked for nothing more, so its
+                    // blanket approval goes with it.
+                    self.blanket.remove(&pane);
                     self.broadcast(ServerMessage::PaneClosed { pane });
+                    self.drop_children_of(pane);
                 } else {
                     self.send(
                         id,
@@ -383,30 +433,41 @@ impl Daemon {
                 harness,
                 task,
                 size,
-            } => {
-                // TODO: Implement delegation logic in a later task.
-                tracing::debug!(
-                    client = id,
-                    ?parent,
-                    %harness,
-                    %task,
-                    ?size,
-                    "received delegation request (not yet implemented)"
-                );
-            }
+            } => self.delegate_request(id, parent, harness, task, size),
 
             ClientMessage::DelegateDecision {
                 request,
                 approve,
                 blanket,
             } => {
-                // TODO: Implement delegation logic in a later task.
-                tracing::debug!(
-                    client = id,
-                    ?request,
-                    %approve,
-                    %blanket,
-                    "received delegation decision (not yet implemented)"
+                let Some(waiting) = self.pending.remove(&request) else {
+                    // Already answered, by another client or by the deadline.
+                    return;
+                };
+
+                if !approve {
+                    self.send(
+                        waiting.caller,
+                        ServerMessage::DelegateResolved {
+                            request: waiting.id,
+                            outcome: DelegateOutcome::Denied,
+                        },
+                    );
+                    return;
+                }
+
+                if blanket {
+                    self.blanket.insert(waiting.parent);
+                }
+
+                self.approve(
+                    waiting.id,
+                    waiting.parent,
+                    &waiting.harness,
+                    &waiting.task,
+                    waiting.size,
+                    waiting.caller,
+                    blanket,
                 );
             }
 
@@ -482,7 +543,11 @@ impl Daemon {
             return;
         };
 
-        let launch = def.launch_for_current_platform();
+        let mut launch = def.launch_for_current_platform();
+        let id = PaneId::new();
+        for (key, value) in self.pane_env(id) {
+            launch.env.entry(key).or_insert(value);
+        }
 
         let session = match Pty::spawn(&launch, &root, size) {
             Ok(session) => session,
@@ -497,7 +562,6 @@ impl Daemon {
             }
         };
 
-        let id = PaneId::new();
         self.panes.insert(
             id,
             DaemonPane {
@@ -507,6 +571,10 @@ impl Daemon {
                 project,
                 history: Vec::new(),
                 status: PaneStatus::Starting,
+                parent: None,
+                durable: true,
+                request: None,
+                caller: None,
             },
         );
 
@@ -518,6 +586,319 @@ impl Daemon {
             harness: harness.to_string(),
             parent: None,
         });
+    }
+
+    /// The environment a pane needs to talk back to this daemon.
+    ///
+    /// `DISPATCH_PANE` is attribution, not a permission: the socket is
+    /// owner-only, and anything that can connect can already spawn panes. It
+    /// decides which pane a request is attributed to, and protects nothing.
+    ///
+    /// `PATH` gains the directory holding the `dispatch` binary — a sibling of
+    /// this executable — so `dispatch delegate` is runnable from inside a pane.
+    /// Where there is no sibling, `PATH` is left alone: "command not found" is
+    /// honest, and a daemon pretending otherwise is not.
+    fn pane_env(&self, pane: PaneId) -> BTreeMap<String, String> {
+        let mut env = BTreeMap::new();
+        env.insert("DISPATCH_PANE".to_string(), pane.to_string());
+
+        if let Ok(dir) = dispatch_os::paths::config_dir() {
+            env.insert(
+                dispatch_os::paths::CONFIG_DIR_ENV.to_string(),
+                dir.display().to_string(),
+            );
+        }
+
+        if let Some(bin) = client_binary_dir() {
+            let existing = std::env::var("PATH").unwrap_or_default();
+            let separator = if cfg!(windows) { ";" } else { ":" };
+            env.insert(
+                "PATH".to_string(),
+                format!("{}{separator}{existing}", bin.display()),
+            );
+        }
+
+        env
+    }
+
+    /// Refuses, approves, or asks about a request to delegate.
+    fn delegate_request(
+        &mut self,
+        caller: ClientId,
+        parent: PaneId,
+        harness: String,
+        task: String,
+        size: (u16, u16),
+    ) {
+        let Some(asking) = self.panes.get(&parent) else {
+            self.send(
+                caller,
+                ServerMessage::Error {
+                    error: ProtocolError::NoSuchPane(parent),
+                },
+            );
+            return;
+        };
+
+        let project = asking.project;
+        // An empty harness means "whatever the asking pane is running": an agent
+        // delegating to another of itself is the common case.
+        let harness = if harness.is_empty() {
+            asking.harness.clone()
+        } else {
+            harness
+        };
+
+        let depth = self.depth_of(parent);
+        let live = self.live_children(parent);
+        let has_task_form = self
+            .harnesses
+            .get(&harness)
+            .is_some_and(|def| def.task.is_some());
+
+        if let Some(reason) =
+            crate::delegation::refusal(depth, live, self.limits, has_task_form, &harness)
+        {
+            tracing::info!(%parent, %harness, %reason, "refused a delegation");
+            self.send(
+                caller,
+                ServerMessage::DelegateResolved {
+                    request: RequestId::new(),
+                    outcome: DelegateOutcome::Refused { reason },
+                },
+            );
+            return;
+        }
+
+        let request = RequestId::new();
+
+        // A pane the user has already approved for everything does not ask
+        // again, for as long as this daemon runs.
+        if self.blanket.contains(&parent) {
+            self.approve(request, parent, &harness, &task, size, caller, true);
+            return;
+        }
+
+        let announcement = ServerMessage::DelegatePending {
+            request,
+            parent,
+            project,
+            harness: harness.clone(),
+            task: task.clone(),
+            depth,
+        };
+
+        self.pending.insert(
+            request,
+            Pending {
+                id: request,
+                parent,
+                harness,
+                task,
+                size,
+                caller,
+                asked: Instant::now(),
+                announcement: announcement.clone(),
+            },
+        );
+
+        self.broadcast(announcement);
+    }
+
+    /// How many parents the pane already has above it.
+    fn depth_of(&self, pane: PaneId) -> u8 {
+        let mut depth: u8 = 0;
+        let mut current = self.panes.get(&pane).and_then(|p| p.parent);
+
+        while let Some(id) = current {
+            depth = depth.saturating_add(1);
+            current = self.panes.get(&id).and_then(|p| p.parent);
+        }
+
+        depth
+    }
+
+    /// How many of a pane's subagents are still running.
+    fn live_children(&self, parent: PaneId) -> usize {
+        self.panes
+            .values()
+            .filter(|p| p.parent == Some(parent))
+            .filter(|p| matches!(p.session.state(), RunState::Running))
+            .count()
+    }
+
+    /// Starts an approved subagent and tells everyone.
+    #[allow(clippy::too_many_arguments)]
+    fn approve(
+        &mut self,
+        request: RequestId,
+        parent: PaneId,
+        harness: &str,
+        task: &str,
+        size: (u16, u16),
+        caller: ClientId,
+        durable: bool,
+    ) {
+        let Some(asking) = self.panes.get(&parent) else {
+            return;
+        };
+        let project = asking.project;
+
+        let Some(root) = self.projects.get(&project).map(|p| p.root.clone()) else {
+            return;
+        };
+
+        let Some(launch) = self
+            .harnesses
+            .get(harness)
+            .and_then(|def| def.task_launch(task))
+        else {
+            self.send(
+                caller,
+                ServerMessage::DelegateResolved {
+                    request,
+                    outcome: DelegateOutcome::Refused {
+                        reason: format!("harness {harness:?} has no [task] form"),
+                    },
+                },
+            );
+            return;
+        };
+
+        let id = PaneId::new();
+        let mut launch = launch;
+        for (key, value) in self.pane_env(id) {
+            launch.env.entry(key).or_insert(value);
+        }
+
+        let session = match Pty::spawn(&launch, &root, Size::new(size.0, size.1)) {
+            Ok(session) => session,
+            Err(error) => {
+                self.send(
+                    caller,
+                    ServerMessage::DelegateResolved {
+                        request,
+                        outcome: DelegateOutcome::Refused {
+                            reason: format!("failed to start {harness}: {error}"),
+                        },
+                    },
+                );
+                return;
+            }
+        };
+
+        self.panes.insert(
+            id,
+            DaemonPane {
+                id,
+                session,
+                harness: harness.to_string(),
+                project,
+                history: Vec::new(),
+                status: PaneStatus::Starting,
+                parent: Some(parent),
+                durable,
+                request: Some(request),
+                caller: Some(caller),
+            },
+        );
+
+        self.send(
+            caller,
+            ServerMessage::DelegateResolved {
+                request,
+                outcome: DelegateOutcome::Approved { pane: id },
+            },
+        );
+
+        self.broadcast(ServerMessage::PaneSpawned {
+            pane: id,
+            project,
+            harness: harness.to_string(),
+            parent: Some(parent),
+        });
+    }
+
+    /// Drops what a departed client was waiting on.
+    ///
+    /// A one-off subagent exists to answer a caller. No caller, no reason to keep
+    /// spending, so it goes. A blanket-approved one keeps running: that is what
+    /// the user said when they approved the pane rather than the request.
+    fn abandon(&mut self, caller: ClientId) {
+        self.pending.retain(|_, waiting| waiting.caller != caller);
+
+        let orphaned: Vec<PaneId> = self
+            .panes
+            .values()
+            .filter(|pane| pane.caller == Some(caller) && !pane.durable)
+            .map(|pane| pane.id)
+            .collect();
+
+        self.terminate_panes(orphaned);
+    }
+
+    /// Terminates a closed pane's one-off children, leaving durable ones running.
+    ///
+    /// A closed pane can ask for nothing more, so anything it started to answer
+    /// a caller that no longer exists goes with it; a blanket-approved child is
+    /// the user's own approval of that pane's work, not of this one, and outlives
+    /// it.
+    fn drop_children_of(&mut self, parent: PaneId) {
+        let orphaned: Vec<PaneId> = self
+            .panes
+            .values()
+            .filter(|pane| pane.parent == Some(parent) && !pane.durable)
+            .map(|pane| pane.id)
+            .collect();
+
+        self.terminate_panes(orphaned);
+    }
+
+    /// Terminates and announces each of the given panes.
+    fn terminate_panes(&mut self, ids: Vec<PaneId>) {
+        for id in ids {
+            if let Some(mut pane) = self.panes.remove(&id) {
+                tracing::info!(pane = %id, "a subagent's reason to run is gone");
+                pane.session.terminate();
+                self.broadcast(ServerMessage::PaneClosed { pane: id });
+            }
+        }
+    }
+
+    /// Refuses requests whose time is up.
+    ///
+    /// The daemon owns this deadline. Without it an agent on an unattended daemon
+    /// waits for a person who is not there, and a late approval would start a
+    /// subagent nobody is waiting for.
+    fn expire_requests(&mut self) {
+        let limit = Duration::from_secs(self.limits.request_timeout_secs);
+
+        let expired: Vec<RequestId> = self
+            .pending
+            .iter()
+            .filter(|(_, waiting)| waiting.asked.elapsed() >= limit)
+            .map(|(id, _)| *id)
+            .collect();
+
+        for request in expired {
+            let Some(waiting) = self.pending.remove(&request) else {
+                continue;
+            };
+
+            tracing::info!(%request, "a delegation request went unanswered");
+            self.send(
+                waiting.caller,
+                ServerMessage::DelegateResolved {
+                    request,
+                    outcome: DelegateOutcome::Refused {
+                        reason: format!(
+                            "nobody answered within {} seconds",
+                            self.limits.request_timeout_secs
+                        ),
+                    },
+                },
+            );
+        }
     }
 
     /// Moves pane output out to clients and notices processes that exited.
@@ -545,13 +926,13 @@ impl Daemon {
             }
         }
 
-        for (id, code) in exited {
+        for (id, code) in &exited {
             // The pane stays until a client closes it, so its final output can
             // still be read.
             messages.push(ServerMessage::PaneChanged {
-                pane: id,
+                pane: *id,
                 update: PaneUpdate::Status {
-                    status: PaneStatus::Exited(code),
+                    status: PaneStatus::Exited(*code),
                 },
             });
         }
@@ -559,6 +940,32 @@ impl Daemon {
         for message in messages {
             self.broadcast(message);
         }
+
+        // A subagent's caller is waiting on exactly this.
+        let mut answers = Vec::new();
+        for (id, code) in &exited {
+            let Some(pane) = self.panes.get_mut(id) else {
+                continue;
+            };
+
+            if let (Some(request), Some(caller)) = (pane.request.take(), pane.caller) {
+                let start = pane.history.len().saturating_sub(TAIL_BYTES);
+                answers.push((
+                    caller,
+                    ServerMessage::DelegateFinished {
+                        request,
+                        exit: *code,
+                        tail: pane.history[start..].to_vec(),
+                    },
+                ));
+            }
+        }
+
+        for (caller, answer) in answers {
+            self.send(caller, answer);
+        }
+
+        self.expire_requests();
     }
 
     /// Sends to one client.
@@ -579,7 +986,10 @@ impl Daemon {
         let mut gone = Vec::new();
 
         for (id, client) in &self.clients {
-            if !client.subscribed {
+            // A delegate caller wants the fate of its own request; the fleet's
+            // output and every other pane's prompts are a firehose it never
+            // reads.
+            if !client.subscribed || client.role != Role::Interface {
                 continue;
             }
             if client.outbox.send(message.clone()).is_err() {
@@ -590,6 +1000,24 @@ impl Daemon {
         for id in gone {
             self.clients.remove(&id);
         }
+    }
+}
+
+/// The directory holding the `dispatch` client binary, when it sits beside this
+/// one.
+fn client_binary_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let name = if cfg!(windows) {
+        "dispatch.exe"
+    } else {
+        "dispatch"
+    };
+
+    let candidate = exe.with_file_name(name);
+    if candidate.is_file() {
+        exe.parent().map(Path::to_path_buf)
+    } else {
+        None
     }
 }
 
