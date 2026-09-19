@@ -61,6 +61,7 @@ fn hello() -> ClientMessage {
     ClientMessage::Hello {
         version: dispatch_proto::VERSION,
         client: "test".into(),
+        role: dispatch_proto::Role::Interface,
     }
 }
 
@@ -139,6 +140,7 @@ fn an_incompatible_major_version_is_refused_and_the_client_dropped() {
                 minor: 0,
             },
             client: "from the future".into(),
+            role: dispatch_proto::Role::Interface,
         },
     );
 

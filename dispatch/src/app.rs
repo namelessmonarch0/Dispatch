@@ -329,6 +329,7 @@ impl App {
                 pane,
                 project,
                 harness,
+                parent: _,
             } => self.adopt_remote(pane, project, &harness),
 
             ServerMessage::PaneOutput { pane, bytes } => {
@@ -382,7 +383,12 @@ impl App {
             }
 
             // The handshake is done by the client, and nothing here pings.
-            ServerMessage::Welcome { .. } | ServerMessage::Pong { .. } => false,
+            // Delegation messages are for delegate callers, not interface clients.
+            ServerMessage::Welcome { .. }
+            | ServerMessage::Pong { .. }
+            | ServerMessage::DelegatePending { .. }
+            | ServerMessage::DelegateResolved { .. }
+            | ServerMessage::DelegateFinished { .. } => false,
         }
     }
 

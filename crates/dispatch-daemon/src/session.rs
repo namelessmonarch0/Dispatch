@@ -239,7 +239,11 @@ impl Daemon {
 
     fn handle_request(&mut self, id: ClientId, message: ClientMessage) {
         match message {
-            ClientMessage::Hello { version, client } => {
+            ClientMessage::Hello {
+                version,
+                client,
+                role: _,
+            } => {
                 if !dispatch_proto::VERSION.is_compatible_with(version) {
                     // Refuse rather than proceed: a major mismatch means the
                     // peer may misread anything sent after this.
@@ -289,6 +293,7 @@ impl Daemon {
                         pane: pane.id,
                         project: pane.project,
                         harness: pane.harness.clone(),
+                        parent: None,
                     });
 
                     // What the pane has printed, so a client that reattaches
@@ -372,6 +377,38 @@ impl Daemon {
             }
 
             ClientMessage::Ping { token } => self.send(id, ServerMessage::Pong { token }),
+
+            ClientMessage::DelegateRequest {
+                parent,
+                harness,
+                task,
+                size,
+            } => {
+                // TODO: Implement delegation logic in a later task.
+                tracing::debug!(
+                    client = id,
+                    ?parent,
+                    %harness,
+                    %task,
+                    ?size,
+                    "received delegation request (not yet implemented)"
+                );
+            }
+
+            ClientMessage::DelegateDecision {
+                request,
+                approve,
+                blanket,
+            } => {
+                // TODO: Implement delegation logic in a later task.
+                tracing::debug!(
+                    client = id,
+                    ?request,
+                    %approve,
+                    %blanket,
+                    "received delegation decision (not yet implemented)"
+                );
+            }
         }
     }
 
@@ -472,6 +509,7 @@ impl Daemon {
             pane: id,
             project,
             harness: harness.to_string(),
+            parent: None,
         });
     }
 

@@ -26,6 +26,7 @@ fn every_client_message_round_trips() {
         ClientMessage::Hello {
             version: crate::VERSION,
             client: "test".into(),
+            role: Role::Interface,
         },
         ClientMessage::Subscribe,
         ClientMessage::OpenProject {
@@ -93,6 +94,7 @@ fn every_server_message_round_trips() {
             pane: PaneId::new(),
             project: ProjectId::new(),
             harness: "codex".into(),
+            parent: None,
         },
         ServerMessage::PaneClosed {
             pane: PaneId::new(),
@@ -212,6 +214,7 @@ fn a_field_missing_from_an_older_peer_falls_back_to_its_default() {
         ClientMessage::Hello {
             version: crate::VERSION,
             client: String::new(),
+            role: Role::Interface,
         }
     );
 }
@@ -255,4 +258,103 @@ fn an_unknown_failure_can_still_be_explained() {
     // variant for, rather than being reduced to "error".
     let error = ProtocolError::Other("worktree is locked".into());
     assert_eq!(round_trip(&error).to_string(), "worktree is locked");
+}
+
+#[test]
+fn the_delegation_messages_round_trip() {
+    let request = RequestId::new();
+    let messages = vec![
+        ClientMessage::DelegateRequest {
+            parent: PaneId::new(),
+            harness: "claude".into(),
+            task: "write the tests".into(),
+            size: (80, 24),
+        },
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    ];
+    for message in messages {
+        assert_eq!(round_trip(&message), message);
+    }
+
+    let replies = vec![
+        ServerMessage::DelegatePending {
+            request,
+            parent: PaneId::new(),
+            project: ProjectId::new(),
+            harness: "claude".into(),
+            task: "write the tests".into(),
+            depth: 0,
+        },
+        ServerMessage::DelegateResolved {
+            request,
+            outcome: DelegateOutcome::Approved {
+                pane: PaneId::new(),
+            },
+        },
+        ServerMessage::DelegateResolved {
+            request,
+            outcome: DelegateOutcome::Refused {
+                reason: "harness \"agy\" has no [task] form".into(),
+            },
+        },
+        ServerMessage::DelegateFinished {
+            request,
+            exit: 0,
+            tail: b"done\r\n".to_vec(),
+        },
+    ];
+    for message in replies {
+        assert_eq!(round_trip(&message), message);
+    }
+}
+
+#[test]
+fn an_older_peer_is_an_interface_client() {
+    // A client built before delegation existed sends no role, and is exactly
+    // what Interface means: it draws panes.
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum OldClientMessage {
+        Hello { version: Version, client: String },
+    }
+
+    let old = OldClientMessage::Hello {
+        version: crate::VERSION,
+        client: "old dispatch".into(),
+    };
+
+    let mut buf = Vec::new();
+    Frame::write(&mut buf, &old).expect("writing succeeds");
+    let read: ClientMessage = Frame::read(&mut buf.as_slice()).expect("reading succeeds");
+
+    assert_eq!(
+        read,
+        ClientMessage::Hello {
+            version: crate::VERSION,
+            client: "old dispatch".into(),
+            role: Role::Interface,
+        }
+    );
+}
+
+#[test]
+fn a_delegate_callers_tail_is_binary_not_a_list_of_numbers() {
+    // Same reason pane output is: this is the bulk of what the message carries.
+    let message = ServerMessage::DelegateFinished {
+        request: RequestId::new(),
+        exit: 0,
+        tail: vec![0u8; 1024],
+    };
+
+    let mut buf = Vec::new();
+    Frame::write(&mut buf, &message).expect("writing succeeds");
+    assert!(
+        buf.len() < 1024 * 2,
+        "1 KiB of output should not cost {} bytes",
+        buf.len()
+    );
 }

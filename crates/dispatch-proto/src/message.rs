@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use dispatch_core::{PaneId, PaneStatus, Project, ProjectId};
+use dispatch_core::{PaneId, PaneStatus, Project, ProjectId, RequestId};
 use serde::{Deserialize, Serialize};
 
 /// A protocol version.
@@ -65,6 +65,43 @@ pub enum ProtocolError {
     Other(String),
 }
 
+/// What a connection is for.
+///
+/// The two audiences want different traffic. An interface draws panes and wants
+/// every byte they produce; a delegate caller wants the fate of its own request
+/// and nothing else, so sending it pane output would be a firehose it never
+/// reads — and would slow the call down on a busy fleet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// A client that draws the fleet. The default, because a peer built before
+    /// roles existed is one of these.
+    #[default]
+    Interface,
+    /// A `dispatch delegate` call waiting on one request.
+    Delegate,
+}
+
+/// How a delegation request ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DelegateOutcome {
+    /// The user approved it, and this pane is running the task.
+    Approved {
+        /// The subagent's pane.
+        pane: PaneId,
+    },
+    /// The user denied it.
+    Denied,
+    /// The daemon refused it without asking: a cap, a missing task form, or a
+    /// deadline that passed.
+    Refused {
+        /// Why, in words, because an agent reads this and should be able to act
+        /// on it.
+        reason: String,
+    },
+}
+
 /// Something a client asks of the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -76,6 +113,9 @@ pub enum ClientMessage {
         /// Human-readable client description, for the daemon's log.
         #[serde(default)]
         client: String,
+        /// What the connection is for.
+        #[serde(default)]
+        role: Role,
     },
 
     /// Asks for the current state of everything.
@@ -132,6 +172,33 @@ pub enum ClientMessage {
         /// Echoed back in the reply.
         #[serde(default)]
         token: u64,
+    },
+
+    /// Asks for a subagent to be started on a task.
+    ///
+    /// Sent by `dispatch delegate` from inside a pane. The daemon decides
+    /// whether it is allowed, and the user whether it happens.
+    DelegateRequest {
+        /// The pane asking, from `DISPATCH_PANE` in its environment.
+        parent: PaneId,
+        /// Which harness should run the task.
+        harness: String,
+        /// What to do, verbatim.
+        task: String,
+        /// Initial size in cells.
+        size: (u16, u16),
+    },
+
+    /// Answers a [`ServerMessage::DelegatePending`].
+    DelegateDecision {
+        /// Which request.
+        request: RequestId,
+        /// Whether it may run.
+        approve: bool,
+        /// Whether every later request from the same pane is approved too, for
+        /// as long as this daemon runs.
+        #[serde(default)]
+        blanket: bool,
     },
 }
 
@@ -192,6 +259,9 @@ pub enum ServerMessage {
         project: ProjectId,
         /// Which harness is running.
         harness: String,
+        /// The pane that delegated this one's work, when it was delegated.
+        #[serde(default)]
+        parent: Option<PaneId>,
     },
 
     /// A pane is gone.
@@ -205,6 +275,45 @@ pub enum ServerMessage {
         /// The token from the ping.
         #[serde(default)]
         token: u64,
+    },
+
+    /// A pane is asking to delegate, and a user has to decide.
+    ///
+    /// Sent to subscribed interface clients only.
+    DelegatePending {
+        /// Which request.
+        request: RequestId,
+        /// The pane asking.
+        parent: PaneId,
+        /// Its project.
+        project: ProjectId,
+        /// Which harness would run.
+        harness: String,
+        /// What it would be asked to do, in full: approving something you
+        /// cannot read is not approval.
+        task: String,
+        /// How deep the parent already is, for display.
+        #[serde(default)]
+        depth: u8,
+    },
+
+    /// A request will not be asked about again.
+    DelegateResolved {
+        /// Which request.
+        request: RequestId,
+        /// What happened.
+        outcome: DelegateOutcome,
+    },
+
+    /// A subagent has exited, and its caller can stop waiting.
+    DelegateFinished {
+        /// Which request.
+        request: RequestId,
+        /// The subagent's exit code.
+        exit: i32,
+        /// The tail of what it printed, for the caller to hand to its agent.
+        #[serde(with = "serde_bytes_compat")]
+        tail: Vec<u8>,
     },
 }
 

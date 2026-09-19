@@ -374,6 +374,7 @@ fn connect(name: &str, endpoint: &Path) -> Result<Connected, ClientError> {
         &ClientMessage::Hello {
             version: dispatch_proto::VERSION,
             client: name.to_string(),
+            role: dispatch_proto::Role::Interface,
         },
     )
     .map_err(|e| ClientError::Handshake(e.to_string()))?;

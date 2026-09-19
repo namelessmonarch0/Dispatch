@@ -162,6 +162,7 @@ fn attach() -> (Receiver<ServerMessage>, impl std::io::Write) {
         &ClientMessage::Hello {
             version: dispatch_proto::VERSION,
             client: "integration test".into(),
+            role: dispatch_proto::Role::Interface,
         },
     )
     .expect("writing succeeds");
@@ -280,6 +281,7 @@ fn a_client_drives_a_pane_through_the_socket() {
         &ClientMessage::Hello {
             version: dispatch_proto::VERSION,
             client: "integration test".into(),
+            role: dispatch_proto::Role::Interface,
         },
     )
     .expect("writing succeeds");
