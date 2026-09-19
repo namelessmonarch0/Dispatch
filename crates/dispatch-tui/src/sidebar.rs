@@ -4,7 +4,7 @@
 //! every project is reserved for the federation slice, which lights it green
 //! or red per device; in Slice 1 every project is local and the dot is dim.
 
-use dispatch_core::{AppState, PaneStatus, ProjectId};
+use dispatch_core::{AppState, Pane, PaneId, PaneStatus, ProjectId};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -77,6 +77,23 @@ fn status_style(status: PaneStatus) -> Style {
     }
 }
 
+/// What a pane's outcome looks like in one glyph, drawn at the end of its row.
+///
+/// The status dot says what a live pane is doing; this says how a subagent's
+/// run turned out, which is the question a parent pane's row exists to
+/// answer once its children have started finishing.
+fn outcome(pane: &Pane) -> (&'static str, Style) {
+    if pane.closed {
+        return ("⊘", Style::default().fg(Color::DarkGray));
+    }
+
+    match pane.status {
+        PaneStatus::Exited(0) => ("✓", Style::default().fg(Color::Green)),
+        PaneStatus::Exited(_) => ("!", Style::default().fg(Color::Red)),
+        _ => ("⋯", Style::default().fg(Color::DarkGray)),
+    }
+}
+
 impl Widget for Sidebar<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
@@ -94,25 +111,26 @@ impl Widget for Sidebar<'_> {
 
             y = self.render_project(buf, area, y, project.id, selected);
 
+            // `panes_for` is unfiltered, so a closed pane still appears here
+            // when it is kept as a tombstone for live children below it — the
+            // sidebar is where that row earns its keep.
             for pane in self.state.panes_for(project.id) {
+                if pane.parent.is_some() {
+                    // Drawn under its parent, below, not in its own right.
+                    continue;
+                }
                 if y >= area.y + area.height {
                     return;
                 }
 
-                let marker = if focused == Some(pane.id) { "▸" } else { " " };
-                let style = if focused == Some(pane.id) {
-                    Style::default().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
+                y = self.render_pane(buf, area, y, pane, focused, 2);
 
-                let x = write(buf, area, area.x + 2, y, marker, style);
-                let x = write(buf, area, x + 1, y, DOT, status_style(pane.status));
-
-                let room = (area.x + area.width).saturating_sub(x + 2) as usize;
-                write(buf, area, x + 2, y, &truncate(&pane.title, room), style);
-
-                y += 1;
+                for child in self.state.children_of(pane.id) {
+                    if y >= area.y + area.height {
+                        return;
+                    }
+                    y = self.render_pane(buf, area, y, child, focused, 4);
+                }
             }
         }
     }
@@ -156,6 +174,52 @@ impl Sidebar<'_> {
 
         let room = (area.x + area.width).saturating_sub(x + 1) as usize;
         write(buf, area, x + 1, y, &truncate(&project.name, room), style);
+
+        y + 1
+    }
+
+    /// Draws one pane row `indent` columns in from the sidebar's edge, and
+    /// returns the next line.
+    ///
+    /// A child sits two columns further in than its parent, which is the only
+    /// difference between drawing a top-level pane and one of its subagents.
+    fn render_pane(
+        &self,
+        buf: &mut Buffer,
+        area: Rect,
+        y: u16,
+        pane: &Pane,
+        focused: Option<PaneId>,
+        indent: u16,
+    ) -> u16 {
+        // A tombstone has no process behind it, so it can never be the row
+        // the user is focused on.
+        let is_focused = !pane.closed && focused == Some(pane.id);
+        let marker = if is_focused { "▸" } else { " " };
+        let style = if is_focused {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else if pane.closed {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+
+        let dot_style = if pane.closed {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            status_style(pane.status)
+        };
+
+        let x = write(buf, area, area.x + indent, y, marker, style);
+        let x = write(buf, area, x + 1, y, DOT, dot_style);
+
+        // The outcome glyph lives in the row's last column, so a long title
+        // is cut short before it rather than drawn under it.
+        let (glyph, glyph_style) = outcome(pane);
+        let right = (area.x + area.width).saturating_sub(2);
+        let room = right.saturating_sub(x + 2) as usize;
+        write(buf, area, x + 2, y, &truncate(&pane.title, room), style);
+        write(buf, area, right + 1, y, glyph, glyph_style);
 
         y + 1
     }

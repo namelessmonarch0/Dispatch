@@ -1,6 +1,6 @@
 //! The running application: state, panes, and the event loop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -98,6 +98,12 @@ pub struct App {
     router: InputRouter,
     /// Where each pane was drawn last frame, for resolving the pointer.
     layout: Vec<(PaneId, Rect)>,
+    /// Subagents the user has opened, so they join the tiled grid.
+    ///
+    /// Which rows are open is a per-client choice, not a property of the
+    /// pane itself — two clients on one fleet can disagree about it, so this
+    /// never goes to the daemon.
+    expanded: HashSet<PaneId>,
     status: String,
     quit: bool,
 }
@@ -129,6 +135,7 @@ impl App {
             harnesses,
             router: InputRouter::new(),
             layout: Vec::new(),
+            expanded: HashSet::new(),
             status: String::new(),
             quit: false,
         }
@@ -844,9 +851,23 @@ impl App {
         }
     }
 
+    /// The panes to tile this frame.
+    ///
+    /// Children are left out unless the user has opened them: ten subagents
+    /// would otherwise shrink every pane to nothing. Which rows are open is
+    /// this client's business, so the daemon is never told.
+    fn tileable(&self) -> Vec<PaneId> {
+        self.state
+            .visible_panes()
+            .iter()
+            .filter(|pane| pane.parent.is_none() || self.expanded.contains(&pane.id))
+            .map(|pane| pane.id)
+            .collect()
+    }
+
     /// Where each visible pane goes this frame.
     fn compute_layout(&self, area: Rect) -> Vec<(PaneId, Rect)> {
-        let visible: Vec<PaneId> = self.state.visible_panes().iter().map(|p| p.id).collect();
+        let visible = self.tileable();
 
         if let Some(zoomed) = self.state.zoomed_pane()
             && visible.contains(&zoomed)
@@ -955,5 +976,43 @@ impl App {
     #[must_use]
     pub fn poll_timeout(last_draw: Instant) -> Duration {
         FRAME.saturating_sub(last_draw.elapsed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dispatch_core::{Project, ProjectSource};
+
+    #[test]
+    fn a_delegated_pane_is_not_tiled_until_the_user_opens_it() {
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let parent = app
+            .state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+
+        let mut child = CorePane::new(project, HarnessId::new("claude"));
+        child.parent = Some(parent);
+        app.state.adopt_pane(child).expect("the project exists");
+
+        assert_eq!(app.tileable(), vec![parent], "the child is left out");
+
+        let child_id = app
+            .state
+            .children_of(parent)
+            .first()
+            .expect("the child is registered")
+            .id;
+        app.expanded.insert(child_id);
+
+        assert_eq!(
+            app.tileable(),
+            vec![parent, child_id],
+            "opening the child brings it into the grid"
+        );
     }
 }
