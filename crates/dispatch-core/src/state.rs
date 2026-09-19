@@ -5,6 +5,8 @@
 //! transitions from the wire, so each one has to be a single named operation
 //! with its invariants enforced in one place.
 
+use std::collections::HashSet;
+
 use crate::id::{PaneId, ProjectId};
 use crate::pane::{HarnessId, Pane, PaneStatus};
 use crate::project::Project;
@@ -181,9 +183,31 @@ impl AppState {
     /// finished, go with their parent — their transcripts were reachable
     /// through the pane being closed, and rows for finished work under a pane
     /// that no longer exists are debris.
+    ///
+    /// That same rule applies all the way down: a doomed child can itself have
+    /// live durable children (reachable once `max_depth` allows a delegated
+    /// pane to delegate again), so cleaning it up asks the same survivor
+    /// question rather than deleting it outright.
     pub fn close_pane(&mut self, id: PaneId) -> Result<(), StateError> {
         if !self.panes.iter().any(|p| p.id == id) {
             return Err(StateError::NoSuchPane(id));
+        }
+
+        let mut judged = HashSet::new();
+        self.close_or_tombstone(id, &mut judged);
+
+        Ok(())
+    }
+
+    /// Closes `id`, recursively applying the same survivor rule to whatever it
+    /// dooms.
+    ///
+    /// `judged` guards the walk against a corrupt cycle in `parent` links:
+    /// each pane is judged at most once per call, so a cycle ends the walk
+    /// instead of recursing forever.
+    fn close_or_tombstone(&mut self, id: PaneId, judged: &mut HashSet<PaneId>) {
+        if !judged.insert(id) {
+            return;
         }
 
         let survivors: Vec<PaneId> = self
@@ -201,20 +225,19 @@ impl AppState {
             .collect();
 
         for child in doomed {
-            self.remove_pane(child);
+            self.close_or_tombstone(child, judged);
         }
 
         if survivors.is_empty() {
-            // Read before the child is removed: once it is gone, its parent
+            // Read before the pane is removed: once it is gone, its parent
             // link goes with it.
             let tombstone = self.parent_tombstone(id);
             self.remove_pane(id);
 
             // A tombstone exists only for its children. Closing the last one
-            // takes the row with it.
-            if let Some(parent) = tombstone {
-                self.remove_pane(parent);
-            }
+            // takes the row with it — and may do the same to the tombstone
+            // above that, so the collapse has to walk, not just look once.
+            self.collapse_tombstones(tombstone);
         } else if let Some(pane) = self.panes.iter_mut().find(|p| p.id == id) {
             pane.closed = true;
             if self.focused_pane == Some(id) {
@@ -224,8 +247,6 @@ impl AppState {
                 self.zoomed_pane = None;
             }
         }
-
-        Ok(())
     }
 
     /// The closed parent of `child`, when that parent is only still present to
@@ -243,6 +264,30 @@ impl AppState {
         }
 
         (self.live_children(parent) <= 1).then_some(parent)
+    }
+
+    /// Walks a chain of tombstones upward, removing each one that the removal
+    /// below it just left holding no live children of its own.
+    ///
+    /// An iterative loop with a visited set rather than recursion: a corrupt
+    /// cycle in `parent` links must not spin this forever or overflow a call
+    /// stack, so each candidate is removed at most once and a repeat ends the
+    /// walk instead.
+    fn collapse_tombstones(&mut self, first: Option<PaneId>) {
+        let mut current = first;
+        let mut visited = HashSet::new();
+
+        while let Some(id) = current {
+            if !visited.insert(id) {
+                break;
+            }
+
+            // Read before this tombstone is removed, for the same reason as
+            // in `close_or_tombstone`: its parent link goes with it.
+            let next = self.parent_tombstone(id);
+            self.remove_pane(id);
+            current = next;
+        }
     }
 
     /// Removes one pane and repairs focus and zoom around it.
@@ -805,5 +850,121 @@ mod tests {
 
         assert!(state.pane(parent).is_none());
         assert!(state.pane(child).is_none());
+    }
+
+    #[test]
+    fn closing_a_parent_judges_each_child_on_its_own_terms() {
+        // One survivor, two that go: the rule is per-child, and a mixed family is
+        // the normal case rather than an edge one.
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let parent = state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+
+        let mut durable_live = Pane::new(project, HarnessId::new("claude"));
+        durable_live.parent = Some(parent);
+        durable_live.durable = true;
+        let survivor = durable_live.id;
+        state.adopt_pane(durable_live).expect("the project exists");
+
+        let mut one_off = Pane::new(project, HarnessId::new("claude"));
+        one_off.parent = Some(parent);
+        let doomed_live = one_off.id;
+        state.adopt_pane(one_off).expect("the project exists");
+
+        let mut durable_done = Pane::new(project, HarnessId::new("claude"));
+        durable_done.parent = Some(parent);
+        durable_done.durable = true;
+        durable_done.status = PaneStatus::Exited(0);
+        let doomed_finished = durable_done.id;
+        state.adopt_pane(durable_done).expect("the project exists");
+
+        state.close_pane(parent).expect("the pane exists");
+
+        assert!(
+            state.pane(survivor).is_some(),
+            "live durable work continues"
+        );
+        assert!(
+            state.pane(doomed_live).is_none(),
+            "a one-off goes with its caller"
+        );
+        assert!(
+            state.pane(doomed_finished).is_none(),
+            "finished work goes with the pane it was reachable through"
+        );
+        assert!(
+            state.pane(parent).expect("the row stays").closed,
+            "the parent stays only as a tombstone"
+        );
+    }
+
+    #[test]
+    fn a_doomed_child_does_not_orphan_its_own_children() {
+        // Reachable whenever max_depth is raised: without recursion the grandchild's
+        // parent id names a pane that no longer exists, and nothing ever cleans it.
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let parent = state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+
+        let mut child = Pane::new(project, HarnessId::new("claude"));
+        child.parent = Some(parent);
+        let child_id = child.id;
+        state.adopt_pane(child).expect("the project exists");
+
+        let mut grandchild = Pane::new(project, HarnessId::new("claude"));
+        grandchild.parent = Some(child_id);
+        grandchild.durable = true;
+        let grandchild_id = grandchild.id;
+        state.adopt_pane(grandchild).expect("the project exists");
+
+        state.close_pane(parent).expect("the pane exists");
+
+        assert!(state.pane(parent).is_none());
+        assert!(
+            state.pane(child_id).is_some_and(|p| p.closed),
+            "a doomed child with live durable work of its own becomes a tombstone"
+        );
+        assert!(
+            state.pane(grandchild_id).is_some(),
+            "and its work continues"
+        );
+    }
+
+    #[test]
+    fn a_chain_of_tombstones_collapses_together() {
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let parent = state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+
+        let mut child = Pane::new(project, HarnessId::new("claude"));
+        child.parent = Some(parent);
+        child.durable = true;
+        let child_id = child.id;
+        state.adopt_pane(child).expect("the project exists");
+
+        let mut grandchild = Pane::new(project, HarnessId::new("claude"));
+        grandchild.parent = Some(child_id);
+        grandchild.durable = true;
+        let grandchild_id = grandchild.id;
+        state.adopt_pane(grandchild).expect("the project exists");
+
+        state.close_pane(parent).expect("the pane exists");
+        state.close_pane(child_id).expect("the pane exists");
+
+        // Closing the last live descendant should take both tombstones with it.
+        state.close_pane(grandchild_id).expect("the pane exists");
+
+        assert!(state.pane(grandchild_id).is_none());
+        assert!(state.pane(child_id).is_none(), "its tombstone goes too");
+        assert!(
+            state.pane(parent).is_none(),
+            "and so does the one above that"
+        );
     }
 }
