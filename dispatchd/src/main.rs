@@ -48,7 +48,28 @@ fn main() -> Result<()> {
         .context("failed to load harness definitions")?;
     tracing::info!(count = harnesses.len(), "harnesses registered");
 
-    let mut daemon = Daemon::new(harnesses, args.device.clone());
+    // Absent means default. Unknown keys are logged rather than rejected: a
+    // newer Dispatch's key must not stop an older daemon starting, and a typo
+    // must not be silent either.
+    let config_path =
+        dispatch_os::paths::config_file().context("failed to locate the configuration file")?;
+    let loaded = dispatch_config::Config::load_reporting(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    if !loaded.unknown.is_empty() {
+        tracing::warn!(
+            keys = ?loaded.unknown,
+            path = %config_path.display(),
+            "ignoring unknown configuration keys"
+        );
+    }
+    tracing::info!(
+        max_depth = loaded.config.delegation.max_depth,
+        max_live_per_parent = loaded.config.delegation.max_live_per_parent,
+        request_timeout_secs = loaded.config.delegation.request_timeout_secs,
+        "delegation limits"
+    );
+
+    let mut daemon = Daemon::with_limits(harnesses, args.device.clone(), loaded.config.delegation);
 
     let projects = if args.projects.is_empty() {
         vec![std::env::current_dir().context("failed to read the working directory")?]

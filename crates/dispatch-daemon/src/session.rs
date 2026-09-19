@@ -358,9 +358,13 @@ impl Daemon {
                 }
 
                 // A request already put to the user is put to this client too,
-                // rather than only to whoever was subscribed at the time.
-                for waiting in self.pending.values() {
-                    existing.push(waiting.announcement.clone());
+                // rather than only to whoever was subscribed at the time — but
+                // only when this client is one the prompt is for; a delegate
+                // caller does not draw prompts.
+                if self.clients.get(&id).map(|c| c.role) == Some(Role::Interface) {
+                    for waiting in self.pending.values() {
+                        existing.push(waiting.announcement.clone());
+                    }
                 }
 
                 for message in existing {
@@ -415,6 +419,7 @@ impl Daemon {
                     // blanket approval goes with it.
                     self.blanket.remove(&pane);
                     self.broadcast(ServerMessage::PaneClosed { pane });
+                    self.refuse_requests_from(pane);
                     self.drop_children_of(pane);
                 } else {
                     self.send(
@@ -446,13 +451,7 @@ impl Daemon {
                 };
 
                 if !approve {
-                    self.send(
-                        waiting.caller,
-                        ServerMessage::DelegateResolved {
-                            request: waiting.id,
-                            outcome: DelegateOutcome::Denied,
-                        },
-                    );
+                    self.resolve(waiting.id, waiting.caller, DelegateOutcome::Denied);
                     return;
                 }
 
@@ -630,6 +629,11 @@ impl Daemon {
         task: String,
         size: (u16, u16),
     ) {
+        // One id for the whole call: a refusal answers with the same id a
+        // pending entry would have carried, rather than one the caller never
+        // saw.
+        let request = RequestId::new();
+
         let Some(asking) = self.panes.get(&parent) else {
             self.send(
                 caller,
@@ -651,26 +655,22 @@ impl Daemon {
 
         let depth = self.depth_of(parent);
         let live = self.live_children(parent);
+        // The same predicate `approve` will use to actually launch it: a
+        // harness with `[task]` but an empty argument list has no form either,
+        // and asking the user about it only to refuse it after they approve is
+        // worse than refusing up front.
         let has_task_form = self
             .harnesses
             .get(&harness)
-            .is_some_and(|def| def.task.is_some());
+            .is_some_and(|def| def.task_launch(&task).is_some());
 
         if let Some(reason) =
             crate::delegation::refusal(depth, live, self.limits, has_task_form, &harness)
         {
             tracing::info!(%parent, %harness, %reason, "refused a delegation");
-            self.send(
-                caller,
-                ServerMessage::DelegateResolved {
-                    request: RequestId::new(),
-                    outcome: DelegateOutcome::Refused { reason },
-                },
-            );
+            self.resolve(request, caller, DelegateOutcome::Refused { reason });
             return;
         }
-
-        let request = RequestId::new();
 
         // A pane the user has already approved for everything does not ask
         // again, for as long as this daemon runs.
@@ -739,12 +739,38 @@ impl Daemon {
         caller: ClientId,
         durable: bool,
     ) {
+        // The pane or its project can be gone by the time an approval reaches
+        // here — a decision that crossed with the pane closing, or a blanket
+        // approval racing a close within the same call. Either way the caller
+        // must be answered rather than left hanging: `DelegateDecision` has
+        // already dropped this request's `Pending` entry, so nothing else will
+        // ever get to it. No prompt needs withdrawing from anyone else here:
+        // a request whose pane closed while pending was already resolved by
+        // `refuse_requests_from`, and a blanket approval never had one.
         let Some(asking) = self.panes.get(&parent) else {
+            self.send(
+                caller,
+                ServerMessage::DelegateResolved {
+                    request,
+                    outcome: DelegateOutcome::Refused {
+                        reason: "the pane that asked has been closed".into(),
+                    },
+                },
+            );
             return;
         };
         let project = asking.project;
 
         let Some(root) = self.projects.get(&project).map(|p| p.root.clone()) else {
+            self.send(
+                caller,
+                ServerMessage::DelegateResolved {
+                    request,
+                    outcome: DelegateOutcome::Refused {
+                        reason: format!("project {project} no longer exists"),
+                    },
+                },
+            );
             return;
         };
 
@@ -753,13 +779,11 @@ impl Daemon {
             .get(harness)
             .and_then(|def| def.task_launch(task))
         else {
-            self.send(
+            self.resolve(
+                request,
                 caller,
-                ServerMessage::DelegateResolved {
-                    request,
-                    outcome: DelegateOutcome::Refused {
-                        reason: format!("harness {harness:?} has no [task] form"),
-                    },
+                DelegateOutcome::Refused {
+                    reason: format!("harness {harness:?} has no [task] form"),
                 },
             );
             return;
@@ -774,13 +798,11 @@ impl Daemon {
         let session = match Pty::spawn(&launch, &root, Size::new(size.0, size.1)) {
             Ok(session) => session,
             Err(error) => {
-                self.send(
+                self.resolve(
+                    request,
                     caller,
-                    ServerMessage::DelegateResolved {
-                        request,
-                        outcome: DelegateOutcome::Refused {
-                            reason: format!("failed to start {harness}: {error}"),
-                        },
+                    DelegateOutcome::Refused {
+                        reason: format!("failed to start {harness}: {error}"),
                     },
                 );
                 return;
@@ -803,13 +825,7 @@ impl Daemon {
             },
         );
 
-        self.send(
-            caller,
-            ServerMessage::DelegateResolved {
-                request,
-                outcome: DelegateOutcome::Approved { pane: id },
-            },
-        );
+        self.resolve(request, caller, DelegateOutcome::Approved { pane: id });
 
         self.broadcast(ServerMessage::PaneSpawned {
             pane: id,
@@ -819,20 +835,72 @@ impl Daemon {
         });
     }
 
+    /// Resolves a request: answers its caller, and tells every interface
+    /// client so a prompt already on screen does not linger past its answer.
+    fn resolve(&mut self, request: RequestId, caller: ClientId, outcome: DelegateOutcome) {
+        let message = ServerMessage::DelegateResolved { request, outcome };
+        self.send(caller, message.clone());
+        self.broadcast(message);
+    }
+
+    /// Refuses the requests a closing pane was waiting on.
+    ///
+    /// Its agent is going away with it, so there is nobody left to hand a
+    /// subagent's output to, and a prompt for a pane that no longer exists must
+    /// not be answerable.
+    fn refuse_requests_from(&mut self, parent: PaneId) {
+        let orphaned: Vec<RequestId> = self
+            .pending
+            .iter()
+            .filter(|(_, waiting)| waiting.parent == parent)
+            .map(|(id, _)| *id)
+            .collect();
+
+        for request in orphaned {
+            let Some(waiting) = self.pending.remove(&request) else {
+                continue;
+            };
+            self.resolve(
+                request,
+                waiting.caller,
+                DelegateOutcome::Refused {
+                    reason: "the pane that asked has been closed".into(),
+                },
+            );
+        }
+    }
+
     /// Drops what a departed client was waiting on.
     ///
-    /// A one-off subagent exists to answer a caller. No caller, no reason to keep
-    /// spending, so it goes. A blanket-approved one keeps running: that is what
-    /// the user said when they approved the pane rather than the request.
+    /// A one-off subagent still running exists to answer a caller. No caller,
+    /// no reason to keep spending, so it goes. A blanket-approved one keeps
+    /// running: that is what the user said when they approved the pane rather
+    /// than the request.
+    ///
+    /// A one-off subagent that has already exited is a different case: in
+    /// practice `dispatch delegate` exits the instant it has its
+    /// `DelegateFinished`, so this runs on almost every successful delegation.
+    /// The pane's output is exactly what [`TAIL_BYTES`] exists so a person can
+    /// still read past the caller's own slice of it; reaping it here would
+    /// throw that away for no reason. It is orphaned rather than terminated: its
+    /// `caller` and `request` are cleared so nothing later tries to answer a
+    /// caller that is gone, and it is left for a person to close.
     fn abandon(&mut self, caller: ClientId) {
         self.pending.retain(|_, waiting| waiting.caller != caller);
 
-        let orphaned: Vec<PaneId> = self
-            .panes
-            .values()
-            .filter(|pane| pane.caller == Some(caller) && !pane.durable)
-            .map(|pane| pane.id)
-            .collect();
+        let mut orphaned = Vec::new();
+        for pane in self.panes.values_mut() {
+            if pane.caller != Some(caller) || pane.durable {
+                continue;
+            }
+
+            if matches!(pane.session.state(), RunState::Running) {
+                orphaned.push(pane.id);
+            } else {
+                pane.caller = None;
+                pane.request = None;
+            }
+        }
 
         self.terminate_panes(orphaned);
     }
@@ -843,15 +911,31 @@ impl Daemon {
     /// a caller that no longer exists goes with it; a blanket-approved child is
     /// the user's own approval of that pane's work, not of this one, and outlives
     /// it.
+    ///
+    /// Recurses into each dropped pane's own children, or a grandchild would be
+    /// left with a `parent` pointing at nothing: `depth_of` would under-report
+    /// its depth and `live_children` would undercount its parent's live
+    /// subagents. Guarded on the ids already collected in this call, not the
+    /// whole pane table, so a parent link that somehow formed a cycle cannot
+    /// loop forever — it can still revisit a pane through two different
+    /// branches, and the guard is what keeps that from being infinite rather
+    /// than merely redundant.
     fn drop_children_of(&mut self, parent: PaneId) {
-        let orphaned: Vec<PaneId> = self
-            .panes
-            .values()
-            .filter(|pane| pane.parent == Some(parent) && !pane.durable)
-            .map(|pane| pane.id)
-            .collect();
+        let mut ids = Vec::new();
+        self.collect_children(parent, &mut ids);
+        self.terminate_panes(ids);
+    }
 
-        self.terminate_panes(orphaned);
+    /// Collects the one-off descendants of `parent`, depth-first, appending
+    /// their ids to `into` without duplicates.
+    fn collect_children(&self, parent: PaneId, into: &mut Vec<PaneId>) {
+        for pane in self.panes.values() {
+            if pane.parent != Some(parent) || pane.durable || into.contains(&pane.id) {
+                continue;
+            }
+            into.push(pane.id);
+            self.collect_children(pane.id, into);
+        }
     }
 
     /// Terminates and announces each of the given panes.
@@ -860,7 +944,9 @@ impl Daemon {
             if let Some(mut pane) = self.panes.remove(&id) {
                 tracing::info!(pane = %id, "a subagent's reason to run is gone");
                 pane.session.terminate();
+                self.blanket.remove(&id);
                 self.broadcast(ServerMessage::PaneClosed { pane: id });
+                self.refuse_requests_from(id);
             }
         }
     }
@@ -886,16 +972,14 @@ impl Daemon {
             };
 
             tracing::info!(%request, "a delegation request went unanswered");
-            self.send(
+            self.resolve(
+                request,
                 waiting.caller,
-                ServerMessage::DelegateResolved {
-                    request,
-                    outcome: DelegateOutcome::Refused {
-                        reason: format!(
-                            "nobody answered within {} seconds",
-                            self.limits.request_timeout_secs
-                        ),
-                    },
+                DelegateOutcome::Refused {
+                    reason: format!(
+                        "nobody answered within {} seconds",
+                        self.limits.request_timeout_secs
+                    ),
                 },
             );
         }

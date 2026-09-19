@@ -1252,6 +1252,9 @@ fn a_pane_the_daemon_does_not_own_cannot_delegate() {
 #[test]
 fn a_delegate_caller_is_not_sent_pane_output() {
     // It waits on one request; the fleet's output is a firehose it never reads.
+    // Subscribing here matters: an unsubscribed client is already excluded by
+    // `broadcast`, which would let this pass even if the role filter were
+    // missing. Subscribing puts the assertion on the role check alone.
     let (mut daemon, project, _dir) = daemon("delegate-quiet");
     let ui = daemon.attach_for_test(1);
     daemon.request_for_test(1, hello());
@@ -1259,6 +1262,9 @@ fn a_delegate_caller_is_not_sent_pane_output() {
     let parent = spawn_pane_for_test(&mut daemon, &ui, project);
 
     let caller = ask(&mut daemon, parent, "echo quiet");
+    daemon.request_for_test(9, ClientMessage::Subscribe);
+    let _ = drain(&caller);
+
     daemon.request_for_test(
         1,
         ClientMessage::WritePane {
@@ -1276,5 +1282,139 @@ fn a_delegate_caller_is_not_sent_pane_output() {
             .iter()
             .any(|m| matches!(m, ServerMessage::PaneOutput { .. })),
         "a delegate caller hears about its own request only"
+    );
+}
+
+#[test]
+fn a_finished_subagent_survives_its_caller_detaching() {
+    // `dispatch delegate` exits the instant it has its answer, so this is the
+    // common case, not an edge case: reaping the pane here would throw away
+    // the very output TAIL_BYTES exists so a person can still read.
+    let (mut daemon, project, _dir) = daemon("delegate-finished-orphan");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask(&mut daemon, parent, "echo done-42");
+    let request = pending(&drain(&ui)).expect("the interface is asked");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+    wait_for(&mut daemon, &caller, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { .. }))
+    });
+
+    // The delegate process is gone by now in real use.
+    daemon.detach_for_test(9);
+    daemon.tick();
+
+    assert_eq!(
+        daemon.pane_count(),
+        2,
+        "a finished subagent is not reaped just because its caller is gone"
+    );
+}
+
+#[test]
+fn closing_the_asking_pane_refuses_its_pending_request() {
+    // Without this, the caller's `Pending` entry is gone the moment the
+    // decision arrives (there is none to time out), and `approve`'s missing-
+    // pane branch used to return silently: the caller would hang until the
+    // daemon itself died.
+    let (mut daemon, project, _dir) = daemon("delegate-parent-closed");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask(&mut daemon, parent, "echo never");
+    let _request = pending(&drain(&ui)).expect("the interface is asked");
+
+    daemon.request_for_test(1, ClientMessage::ClosePane { pane: parent });
+
+    let seen = drain(&caller);
+    assert!(
+        seen.iter().any(|m| matches!(
+            m,
+            ServerMessage::DelegateResolved {
+                outcome: dispatch_proto::DelegateOutcome::Refused { .. },
+                ..
+            }
+        )),
+        "a caller must not hang forever on a pane that closed before answering, got {seen:#?}"
+    );
+}
+
+#[test]
+fn every_interface_client_is_told_when_a_request_is_resolved() {
+    // The next task draws the prompt on every interface client that saw it;
+    // without this, a denied or expired request stays on screen for everyone
+    // but the one who answered it.
+    let (mut daemon, project, _dir) = daemon("delegate-resolved-broadcast");
+    let first = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let second = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &first, project);
+    let _ = drain(&second);
+
+    let caller = ask(&mut daemon, parent, "echo resolved");
+    let request = pending(&drain(&first)).expect("the first client sees the prompt");
+    assert!(
+        pending(&drain(&second)).is_some(),
+        "the second interface client sees the same prompt"
+    );
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: false,
+            blanket: false,
+        },
+    );
+    let _ = drain(&caller);
+
+    let seen = drain(&second);
+    assert!(
+        seen.iter().any(|m| matches!(
+            m,
+            ServerMessage::DelegateResolved {
+                outcome: dispatch_proto::DelegateOutcome::Denied,
+                ..
+            }
+        )),
+        "an interface client that saw the prompt should be told it is resolved, got {seen:#?}"
+    );
+}
+
+#[test]
+fn a_delegate_caller_that_subscribes_is_not_told_about_pending_requests() {
+    // The Subscribe catch-up is for interface clients drawing the fleet; a
+    // delegate caller does not draw prompts, and `broadcast` already excludes
+    // it for the same reason once a request is live.
+    let (mut daemon, project, _dir) = daemon("delegate-catchup");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let caller = ask(&mut daemon, parent, "echo catchup");
+    let _ = drain(&caller);
+
+    daemon.request_for_test(9, ClientMessage::Subscribe);
+
+    assert!(
+        !drain(&caller)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::DelegatePending { .. })),
+        "a delegate caller's own Subscribe catch-up must not include prompts"
     );
 }
