@@ -176,9 +176,21 @@ pub struct App {
     /// way to pick one of its rows out of the list — this is what a click is
     /// matched against.
     sidebar_area: Rect,
-    /// Where the approval prompt was last drawn, so scrolling can be probed
+    /// Where the approval prompt was last drawn, so scrolling can be clamped
     /// against the box's actual size rather than a guess.
     approval_area: Rect,
+    /// The last (request, width, more-queued-behind-it, total rows) computed
+    /// by `Approval::total_rows`.
+    ///
+    /// Rendering the whole prompt off-screen to measure it is not free, and
+    /// holding a scroll key sends the same request at the same width over and
+    /// over — this is what keeps that to one render rather than one per key.
+    /// The third field matters because `Approval` renders an extra "N more
+    /// waiting" row whenever the queue holds more than the one shown: without
+    /// it, a second request arriving while the first is on screen would grow
+    /// the rendered prompt by a row while the cache kept the old, one-row-
+    /// short answer.
+    approval_rows: Option<(RequestId, u16, bool, u16)>,
     /// Subagents the user has opened, so they join the tiled grid.
     ///
     /// Which rows are open is a per-client choice, not a property of the
@@ -224,6 +236,7 @@ impl App {
             layout: Vec::new(),
             sidebar_area: Rect::default(),
             approval_area: Rect::default(),
+            approval_rows: None,
             expanded: HashSet::new(),
             pending: VecDeque::new(),
             status: String::new(),
@@ -908,14 +921,12 @@ impl App {
 
     /// Scrolls the task text of the request currently shown.
     ///
-    /// Scrolling down is accepted only if the offset it would land on still
-    /// has fresh content at the bottom — found by actually rendering the
-    /// prompt there, not by predicting how many rows wrapping will produce.
-    /// A word-wrap can waste up to a whole row's width of columns when the
-    /// next word will not fit, so a computed bound is only ever an estimate;
-    /// asking ratatui what it painted is not. Approving something you cannot
-    /// read is not approval, and that includes a task cut short by a wrong
-    /// estimate of its own length.
+    /// Clamped against [`Approval::total_rows`] for the box as it was last
+    /// drawn, not `task.lines().count()`: a task delivered as one long line —
+    /// exactly what `dispatch delegate "…"` sends — still wraps into several
+    /// rows once rendered, and counting logical lines would leave everything
+    /// past the first screenful unreachable. Approving something you cannot
+    /// read is not approval.
     fn scroll_approval(&mut self, down: bool) {
         if !down {
             if let Some(Overlay::Approval { scroll }) = &mut self.overlay {
@@ -924,35 +935,46 @@ impl App {
             return;
         }
 
-        let Some(Overlay::Approval { scroll }) = &self.overlay else {
+        if !matches!(self.overlay, Some(Overlay::Approval { .. })) {
+            return;
+        }
+        let Some(request) = self.pending.front().map(|waiting| waiting.request) else {
             return;
         };
-        let candidate = scroll.saturating_add(1);
 
-        if self.approval_has_more_to_show(candidate) {
-            if let Some(Overlay::Approval { scroll }) = &mut self.overlay {
-                *scroll = candidate;
-            }
+        let inner = Approval::inner(self.approval_area);
+        let max = if inner.width == 0 || inner.height == 0 {
+            0
+        } else {
+            self.rows_for(request, inner.width)
+                .saturating_sub(inner.height)
+        };
+
+        if let Some(Overlay::Approval { scroll }) = &mut self.overlay {
+            *scroll = scroll.saturating_add(1).min(max);
         }
     }
 
-    /// Whether scrolling the approval prompt to `scroll` would still have
-    /// fresh content at the bottom of the box.
-    ///
-    /// Renders the request at the front of the queue into a buffer the size
-    /// of the box's own content area — one viewport's worth of cells, cheap
-    /// enough to pay on every keystroke.
-    fn approval_has_more_to_show(&self, scroll: u16) -> bool {
-        let inner = Approval::inner(self.approval_area);
-        if inner.width == 0 || inner.height == 0 {
-            return false;
+    /// How many rows the approval prompt needs for `request` at `width`,
+    /// from cache when the last computation still applies.
+    fn rows_for(&mut self, request: RequestId, width: u16) -> u16 {
+        // Whether `Approval` renders its "N more waiting" row — the only way
+        // the queue's length affects how many rows the prompt needs.
+        let more_queued = self.pending.len() > 1;
+
+        if let Some((cached_request, cached_width, cached_more_queued, rows)) = self.approval_rows
+            && cached_request == request
+            && cached_width == width
+            && cached_more_queued == more_queued
+        {
+            return rows;
         }
 
-        let Some(widget) = self.approval_widget(scroll) else {
-            return false;
-        };
-
-        widget.has_more_to_show(inner.width, inner.height)
+        let rows = self
+            .approval_widget(0)
+            .map_or(0, |widget| widget.total_rows(width));
+        self.approval_rows = Some((request, width, more_queued, rows));
+        rows
     }
 
     /// Builds the approval widget for the request at the front of the queue,
@@ -2081,12 +2103,127 @@ mod tests {
     }
 
     #[test]
+    fn paragraphs_separated_by_blank_lines_can_be_scrolled_to_their_final_words_and_legend() {
+        // A task is prose an agent wrote, and a blank line between
+        // paragraphs is ordinary in it. Checking only the last row or two of
+        // the viewport for "still has content" cannot tell a deliberate
+        // paragraph break apart from having scrolled past the true end —
+        // eight paragraphs at this box's own default width of 74 stalled
+        // three rows in when seventeen were needed, leaving the whole key
+        // legend unreachable. An exact total does not confuse the two.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (mut app, _) = app_with_one_pending();
+        let mut paragraphs: Vec<String> = (0..7)
+            .map(|n| {
+                (0..20)
+                    .map(|i| format!("paragraph{n}word{i}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        paragraphs.push(format!(
+            "{} final-words-right-here",
+            (0..20)
+                .map(|i| format!("paragraph7word{i}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+        let task = paragraphs.join("\n\n");
+        app.pending.front_mut().expect("set up").task = task;
+
+        // 120 columns puts the prompt at its own default content width of 74.
+        let mut terminal =
+            Terminal::new(TestBackend::new(120, 30)).expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("drawing succeeds");
+
+        for _ in 0..100 {
+            app.scroll_approval(true);
+        }
+
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("drawing succeeds");
+
+        let buf = terminal.backend().buffer();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .filter_map(|x| buf.cell((x, y)))
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            text.contains("final-words-right-here"),
+            "scrolling should reach the task's own final words:\n{text}"
+        );
+        assert!(
+            text.contains("approve"),
+            "and the key legend after them, not stall on a paragraph break:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_line_can_be_scrolled_past() {
+        // A line of only spaces has no words at all, so it must still count
+        // for exactly the one row it occupies — the same accounting a blank
+        // line needs — rather than being skipped and undercounting the total.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (mut app, _) = app_with_one_pending();
+        let filler: Vec<String> = (0..80).map(|i| format!("word{i}")).collect();
+        let task = format!(
+            "{}\n   \n{} final-words-right-here",
+            filler.join(" "),
+            filler.join(" ")
+        );
+        app.pending.front_mut().expect("set up").task = task;
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(100, 30)).expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("drawing succeeds");
+
+        for _ in 0..100 {
+            app.scroll_approval(true);
+        }
+
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("drawing succeeds");
+
+        let buf = terminal.backend().buffer();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .filter_map(|x| buf.cell((x, y)))
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            text.contains("final-words-right-here"),
+            "a whitespace-only line must not undercount the rows before it:\n{text}"
+        );
+    }
+
+    #[test]
     fn scrolling_past_the_end_of_a_short_task_still_shows_its_key_legend() {
-        // The probe accepts an offset only if it still paints something, so
-        // scrolling far past a five-line prompt's own content should settle
-        // exactly where its last line — the key legend — is still on screen,
-        // not scroll it away and leave the content area blank underneath an
-        // otherwise-untouched border.
+        // A content-shorter-than-the-viewport task should not scroll at all:
+        // the clamp is `total_rows - height`, which for a five-line prompt in
+        // an eighteen-row viewport is zero. Pressing down anyway should not
+        // move it, and the key legend should stay exactly where it always
+        // was rather than being scrolled away.
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 

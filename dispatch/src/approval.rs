@@ -8,6 +8,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 /// One request, as the user needs to see it.
 pub struct Approval<'a> {
@@ -81,10 +82,6 @@ impl<'a> Approval<'a> {
 
     /// Renders the task and its surrounding chrome — everything but the
     /// border — at this prompt's own `scroll`.
-    ///
-    /// Split out of [`Widget::render`] so [`Self::has_more_to_show`] can ask
-    /// what one offset paints without nesting a second border inside the
-    /// first.
     fn render_content(&self, area: Rect, buf: &mut Buffer) {
         Paragraph::new(self.lines())
             .wrap(Wrap { trim: false })
@@ -92,35 +89,74 @@ impl<'a> Approval<'a> {
             .render(area, buf);
     }
 
-    /// Whether this prompt, scrolled to its own `scroll`, still has fresh
-    /// content to show at the bottom of a `width`×`height` box.
+    /// How many rows this prompt needs once wrapped to `width` columns, at
+    /// no scroll — the true total, not an estimate.
     ///
-    /// How far the prompt can scroll is answered by asking this rather than
-    /// by predicting a row count: a word-wrap can waste up to a whole row's
-    /// width of columns when the next word will not fit, so any bound
-    /// computed from the text is only ever an estimate, and an estimate that
-    /// undercounts cuts off exactly the tail this prompt exists to show.
+    /// A caller clamping how far this can scroll needs this rather than
+    /// `task.lines().count()`: `Paragraph::scroll` counts *wrapped* rows, and
+    /// a task delivered as a single long line — exactly what `dispatch
+    /// delegate "…"` sends — still wraps into several of them once rendered.
     ///
-    /// Checked against the last two rows, not the whole box: once `scroll`
-    /// has gone past the true end, `Paragraph::scroll` paints nothing there
-    /// at all, but checking only the very last row would risk mistaking one
-    /// of this prompt's own blank separator lines for that — there is
-    /// always at least one, and this layout never stacks two in a row, so
-    /// two rows absorbs it safely without needing to know how many rows the
-    /// content actually has.
+    /// Found by rendering into a buffer proven tall enough that nothing can
+    /// be clipped, then scanning up for the last painted row. The proof:
+    /// greedy word-wrap places at least one word-fragment on every row it
+    /// emits — a row is only ever broken because the next fragment will not
+    /// fit, and a word wider than `width` is itself split into
+    /// `ceil(word_width / width)` fragments — so one logical line can never
+    /// need more rows than the fragments its own words split into:
+    ///
+    /// `rows(line) <= max(1, sum over words in line of ceil(word_width / width))`
+    ///
+    /// `max(1, …)` covers a blank or whitespace-only line, which has no
+    /// words at all but still occupies a row. Summing that over every line
+    /// this prompt renders — its chrome included, not only the task — gives
+    /// a buffer height that cannot clip, so the scan for the last painted
+    /// row finds the exact total rather than a guess at it.
+    ///
+    /// A word's width is measured with `unicode-width` (pinned to the exact
+    /// version ratatui itself depends on) via the same `UnicodeWidthStr`
+    /// trait `Span::width`/`Line::width` use internally, so a task with wide
+    /// characters or combining marks is bounded the same way this widget
+    /// actually measures it.
     #[must_use]
-    pub fn has_more_to_show(&self, width: u16, height: u16) -> bool {
-        if width == 0 || height == 0 {
-            return false;
+    pub fn total_rows(&self, width: u16) -> u16 {
+        if width == 0 {
+            return 0;
         }
 
-        let area = Rect::new(0, 0, width, height);
-        let mut buf = Buffer::empty(area);
-        self.render_content(area, &mut buf);
+        let lines = self.lines();
 
-        let checked = height.min(2);
-        ((height - checked)..height)
-            .any(|y| (0..width).any(|x| buf.cell((x, y)).is_some_and(|cell| cell.symbol() != " ")))
+        let bound: usize = lines
+            .iter()
+            .map(|line| {
+                let text: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                text.split_whitespace()
+                    .map(|word| UnicodeWidthStr::width(word).div_ceil(usize::from(width)))
+                    .sum::<usize>()
+                    .max(1)
+            })
+            .sum();
+        let bound = u16::try_from(bound).unwrap_or(u16::MAX);
+
+        let area = Rect::new(0, 0, width, bound);
+        let mut buf = Buffer::empty(area);
+        // Deliberately unscrolled: this measures the whole content once,
+        // independent of whatever `self.scroll` happens to be right now.
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(area, &mut buf);
+
+        // The greatest row that still has anything painted on it.
+        (0..bound)
+            .rev()
+            .find(|&y| {
+                (0..width).any(|x| buf.cell((x, y)).is_some_and(|cell| cell.symbol() != " "))
+            })
+            .map_or(0, |y| y + 1)
     }
 }
 

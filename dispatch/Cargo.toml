@@ -20,6 +20,7 @@ dispatch-pty = { workspace = true }
 dispatch-tui = { workspace = true }
 crossterm = { workspace = true }
 ratatui = { workspace = true }
+unicode-width = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
