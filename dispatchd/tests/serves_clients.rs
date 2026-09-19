@@ -421,8 +421,48 @@ fn a_delegate_caller_and_an_interface_client_share_one_daemon() {
         })
         .expect("checked by wait_for");
 
-    // The delegate caller.
+    // The parent has history before the delegate caller ever connects, and the
+    // interface client's own receipt of it is confirmed first. Without this, a
+    // caller that merely happened to subscribe before any output existed would
+    // pass the "spared the fleet's output" assertion below even with no role
+    // filter on `Subscribe`'s catch-up at all.
+    Frame::write(
+        &mut ui_writer,
+        &ClientMessage::WritePane {
+            pane: parent,
+            bytes: b"echo history\n".to_vec(),
+        },
+    )
+    .expect("writing succeeds");
+    wait_for(&ui, "the parent's own history", |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneOutput { pane, .. } if *pane == parent))
+    });
+
+    // The delegate caller. It subscribes, via `attach_as`, exactly like the
+    // interface client above — onto a pane that already has history and an
+    // already-broadcast spawn to catch up on.
     let (caller, mut caller_writer) = attach_as(dispatch_proto::Role::Delegate);
+
+    // A generous pause for whatever `Subscribe`'s catch-up was going to send —
+    // over a local socket, on the order of milliseconds — followed by taking
+    // whatever arrived. `wait_for` cannot express "nothing more is coming";
+    // only a bounded wait can.
+    std::thread::sleep(Duration::from_millis(500));
+    let caught_up: Vec<ServerMessage> = std::iter::from_fn(|| caller.try_recv().ok()).collect();
+    assert!(
+        !caught_up
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PaneOutput { .. })),
+        "a delegate caller's own Subscribe catch-up must not replay pane history, got {caught_up:#?}"
+    );
+    assert!(
+        !caught_up
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. })),
+        "a delegate caller's own Subscribe catch-up must not announce panes either, got {caught_up:#?}"
+    );
+
     Frame::write(
         &mut caller_writer,
         &ClientMessage::DelegateRequest {

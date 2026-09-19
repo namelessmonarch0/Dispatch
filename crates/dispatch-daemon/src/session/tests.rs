@@ -1306,6 +1306,59 @@ fn a_delegate_caller_is_not_sent_pane_output() {
 }
 
 #[test]
+fn a_delegate_callers_subscribe_catch_up_carries_none_of_the_fleet() {
+    // `broadcast` keeps the fleet's ongoing traffic from a delegate caller, but
+    // `Subscribe`'s catch-up is a separate path that replays what already
+    // happened before this client asked — a pane with history already has
+    // something to replay by the time this runs. Building the pane and its
+    // history first, and confirming an interface client actually saw the
+    // output, is what makes this assertion rest on the role filter rather than
+    // on the pane happening to be silent when the delegate caller connects.
+    let (mut daemon, project, _dir) = daemon("delegate-catchup-history");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane: parent,
+            bytes: b"echo history\r".to_vec(),
+        },
+    );
+    wait_for(&mut daemon, &ui, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneOutput { .. }))
+    });
+
+    let caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(9, ClientMessage::Subscribe);
+
+    let seen = drain(&caller);
+    assert!(
+        !seen
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PaneOutput { .. })),
+        "a delegate caller's Subscribe catch-up must not replay pane history, got {seen:#?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. })),
+        "a delegate caller's Subscribe catch-up must not announce panes either, got {seen:#?}"
+    );
+}
+
+#[test]
 fn a_finished_subagent_survives_its_caller_detaching() {
     // `dispatch delegate` exits the instant it has its answer, so this is the
     // common case, not an edge case: reaping the pane here would throw away

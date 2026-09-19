@@ -311,8 +311,19 @@ impl Daemon {
             }
 
             ClientMessage::Subscribe => {
+                let role = self.clients.get(&id).map(|c| c.role).unwrap_or_default();
                 if let Some(client) = self.clients.get_mut(&id) {
                     client.subscribed = true;
+                }
+
+                // A delegate caller draws nothing: it waits on the fate of one
+                // request, and the fleet's projects, panes, history, statuses
+                // and prompts would be a firehose it never reads. `broadcast`
+                // already keeps all of that from reaching it as things happen;
+                // without this, `Subscribe`'s catch-up would hand it the same
+                // firehose in one burst the instant it asked.
+                if role != Role::Interface {
+                    return;
                 }
 
                 // Describe what already exists, so a client attaching to a
@@ -358,13 +369,9 @@ impl Daemon {
                 }
 
                 // A request already put to the user is put to this client too,
-                // rather than only to whoever was subscribed at the time — but
-                // only when this client is one the prompt is for; a delegate
-                // caller does not draw prompts.
-                if self.clients.get(&id).map(|c| c.role) == Some(Role::Interface) {
-                    for waiting in self.pending.values() {
-                        existing.push(waiting.announcement.clone());
-                    }
+                // rather than only to whoever was subscribed at the time.
+                for waiting in self.pending.values() {
+                    existing.push(waiting.announcement.clone());
                 }
 
                 for message in existing {

@@ -66,6 +66,20 @@ pub fn run(harness: Option<String>, size: (u16, u16), task: &str) -> Result<Exit
     // the two must never race to answer the same request.
     let backstop = Instant::now() + Duration::from_secs(24 * 60 * 60);
 
+    // The client reconnects on its own, so a dropped socket is not the end of the
+    // wait: the request is still in that daemon's pending map with its deadline
+    // running. What cannot be waited out is a *different* daemon — a restart
+    // takes the pending request with it, and nothing will ever answer — which a
+    // change of generation is exactly what identifies.
+    let generation = client.generation();
+
+    // How long to tolerate a connection that has dropped before giving up on it.
+    // Long enough for the supervisor's backoff to reconnect several times over;
+    // short enough that a daemon which is never coming back does not hold an
+    // agent forever.
+    const RECONNECT_GRACE: Duration = Duration::from_secs(60);
+    let mut disconnected_since: Option<Instant> = None;
+
     loop {
         for message in client.poll() {
             match message {
@@ -117,9 +131,24 @@ pub fn run(harness: Option<String>, size: (u16, u16), task: &str) -> Result<Exit
             }
         }
 
-        if !client.is_connected() {
-            eprintln!("[dispatch] the daemon stopped answering");
+        if client.generation() != generation {
+            eprintln!("[dispatch] the daemon restarted; this request is gone");
             return Ok(ExitCode::from(exit::TEMPFAIL));
+        }
+
+        if client.is_connected() {
+            disconnected_since = None;
+        } else {
+            let since = disconnected_since.get_or_insert_with(|| {
+                eprintln!(
+                    "[dispatch] the daemon is not answering; waiting to see if it reconnects"
+                );
+                Instant::now()
+            });
+            if since.elapsed() >= RECONNECT_GRACE {
+                eprintln!("[dispatch] the daemon stopped answering");
+                return Ok(ExitCode::from(exit::TEMPFAIL));
+            }
         }
 
         if Instant::now() >= backstop {
