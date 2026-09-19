@@ -51,7 +51,8 @@ DelegateDecision { request: RequestId, approve: bool, #[serde(default)] blanket:
 DelegatePending  { request: RequestId, parent: PaneId, project: ProjectId,
                    harness: String, task: String, depth: u8 }
 DelegateResolved { request: RequestId, outcome: DelegateOutcome }
-DelegateFinished { request: RequestId, exit: i32, tail: Vec<u8> }
+DelegateFinished { request: RequestId, exit: i32,
+                   #[serde(with = "serde_bytes_compat")] tail: Vec<u8> }
 
 enum Role { Interface, Delegate }                 // Interface is the default
 enum DelegateOutcome { Approved { pane: PaneId }, Denied, Refused { reason: String } }
@@ -126,7 +127,9 @@ A request is handled in this order:
    agent never exits.
 
 4. **Approve or ask.** A parent in `blanket` is approved at once. Otherwise the
-   request is queued and `DelegatePending` goes to `Interface` clients only.
+   request is queued and `DelegatePending` goes to subscribed `Interface` clients
+   only. A request made while no client is subscribed simply waits, which is what
+   the deadline below is for.
 
 **On approval** the daemon spawns the pane as `SpawnPane` does, with two
 differences: the launch comes from the harness's `[task]` form with the task
@@ -146,8 +149,13 @@ approved:
 - blanket (`A`) — it keeps running. If its parent pane has been closed, the parent
   remains as a tombstone.
 
-Closing a parent applies the same split per child. When the last live child of a
-tombstone ends, the tombstone goes.
+Closing a parent applies the same split per child, and finished children go with
+it: their transcripts were reachable through the parent the user has just closed,
+and keeping rows for work that is over under a pane that is gone would leave the
+sidebar collecting debris. So closing a parent removes it and every child except
+its live durable ones; those keep the parent as a tombstone, and the tombstone
+goes when the last of them ends. A pane's blanket approval is forgotten when the
+pane is closed, since no further request can come from it.
 
 Daemon shutdown still terminates everything: a durable subagent is durable
 against its caller, not against the daemon that owns it.
@@ -159,10 +167,13 @@ an outcome marker — `⋯` running, `✓` clean exit, `!` non-zero, `⊘` tombs
 child's first title is the opening words of its task, which the title scanner
 replaces as soon as the agent names itself.
 
-Children are not tiled. `AppState::visible_panes` — what `tile()` consumes —
-excludes them until the user opens one, so ten subagents do not shrink the grid to
-nothing. Expansion is client-local view state on `App`, not daemon state: a laptop
-and a desktop can look at one fleet with different rows open. Enter on a child row
+Children are not tiled. Expansion is client-local view state on `App`, not daemon
+state — a laptop and a desktop can look at one fleet with different rows open — so
+the filtering belongs to the client too: `dispatch-core` grows `children_of` and
+keeps `visible_panes` meaning "every pane of the selected project", and `App`
+subtracts the children it has not been asked to open before handing the list to
+`tile()`. Ten subagents therefore do not shrink the grid to nothing, and nothing
+about which rows are open reaches the daemon. Enter on a child row
 opens it and gives it focus; closing it restores the grid.
 
 The approval prompt is a new `Overlay::Approval` beside the existing pickers, so
@@ -213,15 +224,19 @@ The built-ins for `claude` and `codex` ship with a `[task]` form. `agy` and
 wrong guess runs a process with flags that mean something else. The refusal path
 names the harness and tells the user to add one.
 
-Deferral has a floor. At `request_timeout_secs` the shim gives up, reports what
-happened, and exits non-zero, so an agent waiting on an unattended daemon fails
-cleanly. The daemon drops the request at the same moment, so a late approval
-cannot spawn a subagent nobody is waiting for.
+Deferral has a floor. The daemon owns that deadline: at `request_timeout_secs`
+it drops the pending request and answers the caller `Refused { reason }`, so a
+late approval cannot spawn a subagent nobody is waiting for. The shim keeps a
+deadline of its own, slightly longer, purely as a backstop for a daemon that dies
+mid-request without closing its socket cleanly; reaching it exits 75. One clock is
+authoritative and the other only stops a hang.
 
 ## The shim
 
 `--harness` defaults to the parent's own harness, so the common case is
-`dispatch delegate "write the tests"`. `DISPATCH_PANE` is required, and its
+`dispatch delegate "write the tests"`. `--size` defaults to 80x24: a subagent is
+not on screen when it starts, and it is resized to its rectangle the first time
+the user opens it, exactly as any pane is. `DISPATCH_PANE` is required, and its
 absence is reported plainly: running the command from an ordinary shell is a
 mistake worth a clear message.
 
