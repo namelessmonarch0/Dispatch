@@ -409,6 +409,13 @@ impl Daemon {
                     "received delegation decision (not yet implemented)"
                 );
             }
+
+            ClientMessage::Unknown => {
+                tracing::debug!(
+                    client = id,
+                    "received an unknown message from a newer peer; ignoring"
+                );
+            }
         }
     }
 

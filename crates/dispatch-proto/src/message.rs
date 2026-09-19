@@ -200,6 +200,15 @@ pub enum ClientMessage {
         #[serde(default)]
         blanket: bool,
     },
+
+    /// A message this build does not know.
+    ///
+    /// The protocol's promise is that an older peer skips what it does not
+    /// understand rather than misreading it, and that promise needs somewhere
+    /// for the unknown to land: without this, one unrecognised `type` tag fails
+    /// the whole frame and takes the connection with it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Something the daemon tells a client.
@@ -315,6 +324,15 @@ pub enum ServerMessage {
         #[serde(with = "serde_bytes_compat")]
         tail: Vec<u8>,
     },
+
+    /// A message this build does not know.
+    ///
+    /// The protocol's promise is that an older peer skips what it does not
+    /// understand rather than misreading it, and that promise needs somewhere
+    /// for the unknown to land: without this, one unrecognised `type` tag fails
+    /// the whole frame and takes the connection with it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A change to a pane other than output.

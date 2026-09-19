@@ -297,6 +297,10 @@ fn the_delegation_messages_round_trip() {
         },
         ServerMessage::DelegateResolved {
             request,
+            outcome: DelegateOutcome::Denied,
+        },
+        ServerMessage::DelegateResolved {
+            request,
             outcome: DelegateOutcome::Refused {
                 reason: "harness \"agy\" has no [task] form".into(),
             },
@@ -344,17 +348,64 @@ fn an_older_peer_is_an_interface_client() {
 #[test]
 fn a_delegate_callers_tail_is_binary_not_a_list_of_numbers() {
     // Same reason pane output is: this is the bulk of what the message carries.
+    //
+    // The bytes are deliberately above 0x7f. A byte below that encodes as a
+    // one-byte positive fixint, so a sequence of zeroes costs exactly what
+    // binary does and a size assertion over it proves nothing.
     let message = ServerMessage::DelegateFinished {
         request: RequestId::new(),
         exit: 0,
-        tail: vec![0u8; 1024],
+        tail: vec![200u8; 1024],
     };
 
     let mut buf = Vec::new();
     Frame::write(&mut buf, &message).expect("writing succeeds");
     assert!(
-        buf.len() < 1024 * 2,
-        "1 KiB of output should not cost {} bytes",
+        buf.len() < 1200,
+        "1 KiB of output should cost about 1 KiB, not {} bytes — a sequence \
+         encoding would need two bytes for every byte above 0x7f",
         buf.len()
     );
+}
+
+#[test]
+fn a_message_from_a_newer_peer_is_skipped_rather_than_fatal() {
+    // A newer daemon may send a message this build has no name for. Failing the
+    // frame would take the whole connection down over something ignorable.
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum FutureServerMessage {
+        SomethingNewEntirely { detail: String },
+    }
+
+    let future = FutureServerMessage::SomethingNewEntirely {
+        detail: "from a later version".into(),
+    };
+
+    let mut buf = Vec::new();
+    Frame::write(&mut buf, &future).expect("writing succeeds");
+    let read: ServerMessage = Frame::read(&mut buf.as_slice()).expect("an unknown message decodes");
+
+    assert_eq!(read, ServerMessage::Unknown);
+}
+
+#[test]
+fn an_unknown_client_message_is_skipped_rather_than_fatal() {
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum FutureClientMessage {
+        AskSomethingNew { detail: String },
+    }
+
+    let mut buf = Vec::new();
+    Frame::write(
+        &mut buf,
+        &FutureClientMessage::AskSomethingNew {
+            detail: "from a later version".into(),
+        },
+    )
+    .expect("writing succeeds");
+    let read: ClientMessage = Frame::read(&mut buf.as_slice()).expect("an unknown message decodes");
+
+    assert_eq!(read, ClientMessage::Unknown);
 }

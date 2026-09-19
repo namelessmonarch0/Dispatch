@@ -384,11 +384,13 @@ impl App {
 
             // The handshake is done by the client, and nothing here pings.
             // Delegation messages are for delegate callers, not interface clients.
+            // Unknown messages from newer peers are ignored.
             ServerMessage::Welcome { .. }
             | ServerMessage::Pong { .. }
             | ServerMessage::DelegatePending { .. }
             | ServerMessage::DelegateResolved { .. }
-            | ServerMessage::DelegateFinished { .. } => false,
+            | ServerMessage::DelegateFinished { .. }
+            | ServerMessage::Unknown => false,
         }
     }
 
