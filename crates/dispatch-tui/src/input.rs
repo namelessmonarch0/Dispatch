@@ -64,6 +64,14 @@ pub enum Action {
     Scrollback,
     /// Reopen the approval prompt for whatever delegation requests are queued.
     Approvals,
+    /// Focus the focused pane's next child, opening it into the tiled grid.
+    ///
+    /// Cycles through several children one at a time — the mouse is not the
+    /// only way to reach a subagent's pane.
+    ExpandChild,
+    /// If the focused pane is a subagent, remove it from the tiled grid and
+    /// return focus to its parent.
+    CollapseChild,
     /// Quit.
     Quit,
 }
@@ -238,6 +246,12 @@ fn command_for(event: &KeyEvent) -> Action {
         // `p` is already the project picker, so approvals go on `a` instead —
         // mnemonic with the `a` that approves one once the prompt is open.
         KeyCode::Char('a') => Action::Approvals,
+        // A subagent otherwise has no keyboard way in: `FocusDirection`
+        // searches the tiled grid, which excludes an unopened child by
+        // construction, and a click is not available over SSH without mouse
+        // reporting.
+        KeyCode::Char('s') => Action::ExpandChild,
+        KeyCode::Char('c') => Action::CollapseChild,
         KeyCode::Char('[') => Action::Scrollback,
         KeyCode::Char('q') => Action::Quit,
         // An unbound key after the prefix does nothing rather than reaching

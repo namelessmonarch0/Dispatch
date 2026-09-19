@@ -21,7 +21,8 @@ use dispatch_pty::{
 use crate::approval::Approval;
 use crate::backend::{Backend, RemotePane};
 use dispatch_tui::input::{
-    Action, Direction, Event, InputRouter, KeyCode, KeyEventKind, MouseEventKind,
+    Action, Direction, Event, InputRouter, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseEventKind,
 };
 use dispatch_tui::{Item, PaneWidget, Picker, Sidebar, sidebar};
 use ratatui::Frame;
@@ -175,6 +176,15 @@ pub struct App {
     /// way to pick one of its rows out of the list — this is what a click is
     /// matched against.
     sidebar_area: Rect,
+    /// Where the approval prompt was last drawn, so scrolling can be clamped
+    /// against the box's actual size rather than a guess.
+    approval_area: Rect,
+    /// The last (request, width, rows) computed by `Approval::total_rows`.
+    ///
+    /// Rendering the whole prompt off-screen to measure it is not free, and
+    /// holding a scroll key sends the same request at the same width over and
+    /// over — this is what keeps that to one render rather than one per key.
+    approval_rows: Option<(RequestId, u16, u16)>,
     /// Subagents the user has opened, so they join the tiled grid.
     ///
     /// Which rows are open is a per-client choice, not a property of the
@@ -185,6 +195,10 @@ pub struct App {
     pending: VecDeque<PendingRequest>,
     status: String,
     quit: bool,
+    /// Every `ClientMessage` a decision would have sent, kept only so tests
+    /// can tell `a` and `A` apart without a real daemon to send it to.
+    #[cfg(test)]
+    sent: Vec<ClientMessage>,
 }
 
 impl App {
@@ -215,10 +229,14 @@ impl App {
             router: InputRouter::new(),
             layout: Vec::new(),
             sidebar_area: Rect::default(),
+            approval_area: Rect::default(),
+            approval_rows: None,
             expanded: HashSet::new(),
             pending: VecDeque::new(),
             status: String::new(),
             quit: false,
+            #[cfg(test)]
+            sent: Vec::new(),
         }
     }
 
@@ -495,27 +513,41 @@ impl App {
 
                 // A keystroke meant for an agent must never land on an
                 // approval, which cuts both ways: this only takes the
-                // keyboard when nothing else already has it.
+                // keyboard when nothing else already has it. Routed through
+                // `open_next_approval` — the only place that ever constructs
+                // `Overlay::Approval` — rather than written here directly, so
+                // there is no second place that could show it over an empty
+                // queue.
                 if self.overlay.is_none() {
-                    self.overlay = Some(Overlay::Approval { scroll: 0 });
+                    self.open_next_approval();
                 }
 
                 true
             }
 
             ServerMessage::DelegateResolved { request, .. } => {
-                // Answered here, elsewhere, or by the daemon's own deadline —
-                // any of the three means this client's queue no longer has a
-                // reason to hold it. A decision this client made itself is
-                // already gone from `pending` (see `decide`), so this mostly
-                // withdraws a prompt someone else, or nobody, has just settled.
-                let front_was = self.pending.front().map(|waiting| waiting.request);
+                // Whether this client's own decision resolved it (already
+                // popped out of `pending` — see `decide`), another client's
+                // did, or the daemon's own deadline did, the queue has no
+                // further reason to hold it.
+                let showing_this_one = matches!(self.overlay, Some(Overlay::Approval { .. }))
+                    && self
+                        .pending
+                        .front()
+                        .is_some_and(|waiting| waiting.request == request);
+
                 self.pending.retain(|waiting| waiting.request != request);
 
-                if matches!(self.overlay, Some(Overlay::Approval { .. }))
-                    && front_was != self.pending.front().map(|waiting| waiting.request)
-                {
-                    self.open_next_approval();
+                // Only a genuine withdrawal reaches here: a decision this
+                // client made itself already closed or advanced the overlay
+                // in `decide`, before this message was ever sent. Substituting
+                // the next request under the user's fingers would risk
+                // approving something they never read; closing and leaving
+                // the reminder (see `draw_status`) is what `decide` itself
+                // does for the next request too, except deliberately, only
+                // once the user asks with `^a a`.
+                if showing_this_one {
+                    self.overlay = None;
                 }
 
                 true
@@ -656,6 +688,8 @@ impl App {
             Action::HarnessManager => self.open_harness_manager(),
             Action::Scrollback => self.scroll_focused(-10),
             Action::Approvals => self.open_next_approval(),
+            Action::ExpandChild => self.expand_child(),
+            Action::CollapseChild => self.collapse_child(),
         }
 
         Ok(())
@@ -679,6 +713,53 @@ impl App {
         }
     }
 
+    /// Opens the focused pane's next child into the grid and focuses it, or
+    /// cycles to the next sibling if focus is already on one of them.
+    ///
+    /// A subagent otherwise has no keyboard way in: `focus_direction` only
+    /// searches the tiled grid, which excludes an unopened child by
+    /// construction, and a sidebar click needs a mouse. Starting from
+    /// whichever pane already has focus — the parent, or a child reached this
+    /// same way — is what makes repeating this cycle through several rather
+    /// than opening the first one over and over.
+    fn expand_child(&mut self) {
+        let Some(focused) = self.state.focused_pane() else {
+            return;
+        };
+
+        let parent = self
+            .state
+            .pane(focused)
+            .and_then(|pane| pane.parent)
+            .unwrap_or(focused);
+
+        let children = self.state.children_of(parent);
+        if children.is_empty() {
+            return;
+        }
+
+        let next = children
+            .iter()
+            .position(|child| child.id == focused)
+            .map_or(0, |index| (index + 1) % children.len());
+
+        self.focus_pane(children[next].id);
+    }
+
+    /// If the focused pane is a subagent, removes it from the tiled grid and
+    /// returns focus to its parent.
+    fn collapse_child(&mut self) {
+        let Some(focused) = self.state.focused_pane() else {
+            return;
+        };
+        let Some(parent) = self.state.pane(focused).and_then(|pane| pane.parent) else {
+            return;
+        };
+
+        self.expanded.remove(&focused);
+        self.focus_pane(parent);
+    }
+
     /// Handles input while an overlay has the keyboard.
     fn handle_overlay(&mut self, event: &Event, area: Size) -> Result<()> {
         let Event::Key(key) = event else {
@@ -689,7 +770,7 @@ impl App {
         }
 
         if matches!(self.overlay, Some(Overlay::Approval { .. })) {
-            self.handle_approval_key(key.code);
+            self.handle_approval_key(key);
             return Ok(());
         }
 
@@ -735,59 +816,136 @@ impl App {
 
     /// Handles a key while the approval prompt has the keyboard.
     ///
+    /// Matched on the *exact* modifiers, not just the code. `Ctrl-a` is the
+    /// default prefix — the most-pressed combination in the program, and the
+    /// first half of the very `^a a` chord that reopens this prompt — so
+    /// reading its `Char('a')` as the plain `a` that approves would grant a
+    /// subagent by reaching for a command. A modified key is never an
+    /// approval action, `Esc` and the scroll keys included.
+    ///
     /// `Esc` defers rather than denies — a mistaken deny throws away work the
     /// agent has already reasoned about — so it is the only key here that
     /// leaves the request in `pending` rather than answering it.
-    fn handle_approval_key(&mut self, code: KeyCode) {
-        match code {
-            KeyCode::Esc => {
-                self.overlay = None;
-                if !self.pending.is_empty() {
-                    self.status = format!("{} delegation(s) waiting — ^a a", self.pending.len());
-                }
-            }
-            KeyCode::Char('a') => self.decide(true, false),
-            KeyCode::Char('d') => self.decide(false, false),
-            KeyCode::Char('A') => self.decide(true, true),
-            KeyCode::Up => self.scroll_approval(false),
-            KeyCode::Down => self.scroll_approval(true),
+    fn handle_approval_key(&mut self, key: &KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, KeyModifiers::NONE) => self.overlay = None,
+            (KeyCode::Char('a'), KeyModifiers::NONE) => self.decide(true, false),
+            (KeyCode::Char('d'), KeyModifiers::NONE) => self.decide(false, false),
+            (KeyCode::Char('A'), KeyModifiers::SHIFT) => self.decide(true, true),
+            (KeyCode::Up, KeyModifiers::NONE) => self.scroll_approval(false),
+            (KeyCode::Down, KeyModifiers::NONE) => self.scroll_approval(true),
             _ => {}
         }
     }
 
     /// Answers the request at the front of the queue, and moves on to the
     /// next one if there is one waiting.
+    ///
+    /// Advancing to that next request here — under the same keystroke that
+    /// just answered the one before it — is deliberate: it is the user's own
+    /// action carrying them forward through the queue, unlike a withdrawal
+    /// (see `apply`'s `DelegateResolved` arm), which never puts a new request
+    /// under their fingers uninvited.
     fn decide(&mut self, approve: bool, blanket: bool) {
         let Some(waiting) = self.pending.pop_front() else {
             self.overlay = None;
             return;
         };
 
+        let message = ClientMessage::DelegateDecision {
+            request: waiting.request,
+            approve,
+            blanket,
+        };
+
+        #[cfg(test)]
+        self.sent.push(message.clone());
+
         if let Mode::Attached(client) = &self.mode {
-            client.send(ClientMessage::DelegateDecision {
-                request: waiting.request,
-                approve,
-                blanket,
-            });
+            client.send(message);
         }
 
         self.open_next_approval();
     }
 
     /// Scrolls the task text of the request currently shown.
+    ///
+    /// Clamped against [`Approval::total_rows`] for the box as it was last
+    /// drawn, not `task.lines().count()`: a task delivered as one long line —
+    /// exactly what `dispatch delegate "…"` sends — still wraps into several
+    /// rows once rendered, and counting logical lines would leave everything
+    /// past the first screenful unreachable. Approving something you cannot
+    /// read is not approval.
     fn scroll_approval(&mut self, down: bool) {
-        let Some(Overlay::Approval { scroll }) = &mut self.overlay else {
+        if !down {
+            if let Some(Overlay::Approval { scroll }) = &mut self.overlay {
+                *scroll = scroll.saturating_sub(1);
+            }
+            return;
+        }
+
+        if !matches!(self.overlay, Some(Overlay::Approval { .. })) {
+            return;
+        }
+        let Some(request) = self.pending.front().map(|waiting| waiting.request) else {
             return;
         };
 
-        if down {
-            let max = self.pending.front().map_or(0, |waiting| {
-                u16::try_from(waiting.task.lines().count()).unwrap_or(u16::MAX)
-            });
-            *scroll = scroll.saturating_add(1).min(max);
+        let inner = Approval::inner(self.approval_area);
+        let max = if inner.width == 0 || inner.height == 0 {
+            0
         } else {
-            *scroll = scroll.saturating_sub(1);
+            self.rows_for(request, inner.width)
+                .saturating_sub(inner.height)
+        };
+
+        if let Some(Overlay::Approval { scroll }) = &mut self.overlay {
+            *scroll = scroll.saturating_add(1).min(max);
         }
+    }
+
+    /// How many rows the approval prompt needs for `request` at `width`,
+    /// from cache when the last computation still applies.
+    fn rows_for(&mut self, request: RequestId, width: u16) -> u16 {
+        if let Some((cached_request, cached_width, rows)) = self.approval_rows
+            && cached_request == request
+            && cached_width == width
+        {
+            return rows;
+        }
+
+        let rows = self
+            .approval_widget(0)
+            .map_or(0, |widget| widget.total_rows(width));
+        self.approval_rows = Some((request, width, rows));
+        rows
+    }
+
+    /// Builds the approval widget for the request at the front of the queue,
+    /// if there is one, at the given scroll offset.
+    fn approval_widget(&self, scroll: u16) -> Option<Approval<'_>> {
+        let request = self.pending.front()?;
+
+        let asking = self
+            .state
+            .pane(request.parent)
+            .map_or("a pane", |pane| pane.title.as_str());
+        let project = self
+            .state
+            .projects()
+            .iter()
+            .find(|project| project.id == request.project)
+            .map_or("an unknown project", |project| project.name.as_str());
+
+        Some(Approval {
+            asking,
+            harness: &request.harness,
+            project,
+            depth: request.depth,
+            task: &request.task,
+            waiting: self.pending.len().saturating_sub(1),
+            scroll,
+        })
     }
 
     /// Opens the approval prompt for whatever is at the front of the queue,
@@ -795,7 +953,9 @@ impl App {
     ///
     /// This is `Action::Approvals`, reached with the queue as it stands
     /// whenever nothing new has arrived; it is also how the prompt advances
-    /// to the next request after one is answered.
+    /// to the next request after one is answered. It is also the *only*
+    /// place `Overlay::Approval` is ever constructed, so it showing over an
+    /// empty queue is not just unlikely — nothing else can make it happen.
     fn open_next_approval(&mut self) {
         self.overlay = if self.pending.is_empty() {
             None
@@ -1098,7 +1258,7 @@ impl App {
     }
 
     /// Draws whichever overlay is open, if any.
-    fn draw_overlay(&self, frame: &mut Frame<'_>, panes_area: Rect) {
+    fn draw_overlay(&mut self, frame: &mut Frame<'_>, panes_area: Rect) {
         let Some(overlay) = &self.overlay else {
             return;
         };
@@ -1111,35 +1271,18 @@ impl App {
         let Overlay::Approval { scroll } = overlay else {
             return;
         };
+        let scroll = *scroll;
+
+        let rect = centred_approval(panes_area);
+        self.approval_area = rect;
+
         // The queue can only be empty here for one frame, between the last
         // request being answered and `open_next_approval` closing the
         // overlay; nothing to draw is not a bug worth a fallback screen for.
-        let Some(request) = self.pending.front() else {
+        let Some(widget) = self.approval_widget(scroll) else {
             return;
         };
 
-        let asking = self
-            .state
-            .pane(request.parent)
-            .map_or("a pane", |pane| pane.title.as_str());
-        let project = self
-            .state
-            .projects()
-            .iter()
-            .find(|project| project.id == request.project)
-            .map_or("an unknown project", |project| project.name.as_str());
-
-        let widget = Approval {
-            asking,
-            harness: &request.harness,
-            project,
-            depth: request.depth,
-            task: &request.task,
-            waiting: self.pending.len().saturating_sub(1),
-            scroll: *scroll,
-        };
-
-        let rect = centred_approval(panes_area);
         Clear.render(rect, frame.buffer_mut());
         frame.render_widget(widget, rect);
     }
@@ -1207,10 +1350,23 @@ impl App {
 
         let row = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
 
+        // Derived live from the queue rather than stamped once when `Esc`
+        // defers: a stamped string can be clobbered by any later write to
+        // `self.status`, and a deadline the daemon enforces means a deferral
+        // whose reminder went missing is decided by inaction — the one
+        // outcome this whole feature exists to prevent. Silent while the
+        // prompt itself is on screen, since it would only repeat what is
+        // already in front of the user.
+        let waiting_reminder = (!self.pending.is_empty()
+            && !matches!(self.overlay, Some(Overlay::Approval { .. })))
+        .then(|| format!("{} delegation(s) waiting — ^a a", self.pending.len()));
+
         let text = if self.router.is_armed() {
             // A prefix that armed invisibly is how a keystroke goes missing
             // with no explanation.
             "PREFIX".to_string()
+        } else if let Some(reminder) = waiting_reminder {
+            reminder
         } else if !self.status.is_empty() {
             self.status.clone()
         } else {
@@ -1220,7 +1376,9 @@ impl App {
             let where_ = self
                 .device()
                 .map_or_else(String::new, |device| format!("  {device}"));
-            format!("{panes} pane(s){where_}  ^a n new  ^a x close  ^a z zoom  ^a q quit")
+            format!(
+                "{panes} pane(s){where_}  ^a n new  ^a x close  ^a z zoom  ^a s child  ^a c collapse  ^a q quit"
+            )
         };
 
         let style = if self.router.is_armed() {
@@ -1276,7 +1434,33 @@ impl App {
 mod tests {
     use super::*;
     use dispatch_core::{Project, ProjectSource};
-    use dispatch_tui::input::{KeyEvent, KeyModifiers};
+    use dispatch_proto::DelegateOutcome;
+
+    /// An `App` with one project, one parent pane, and one queued delegation
+    /// request from it, with the approval prompt already open.
+    fn app_with_one_pending() -> (App, RequestId) {
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let parent = app
+            .state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+
+        let request = RequestId::new();
+        app.pending.push_back(PendingRequest {
+            request,
+            parent,
+            project,
+            harness: "claude".into(),
+            task: "write the tests".into(),
+            depth: 0,
+        });
+        app.overlay = Some(Overlay::Approval { scroll: 0 });
+
+        (app, request)
+    }
 
     #[test]
     fn a_delegated_pane_is_not_tiled_until_the_user_opens_it() {
@@ -1335,6 +1519,66 @@ mod tests {
     }
 
     #[test]
+    fn the_keyboard_alone_can_reach_and_leave_a_child_pane() {
+        // A subagent otherwise has no keyboard way in: the mouse is not
+        // available over SSH without mouse reporting, and `focus_direction`
+        // only ever searches the tiled grid, which by construction excludes
+        // an unopened child. `^a s` and `^a c` are that way in and back out.
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let parent = app
+            .state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+
+        let mut first = CorePane::new(project, HarnessId::new("claude"));
+        first.parent = Some(parent);
+        let first_id = app.state.adopt_pane(first).expect("the project exists");
+
+        let mut second = CorePane::new(project, HarnessId::new("claude"));
+        second.parent = Some(parent);
+        let second_id = app.state.adopt_pane(second).expect("the project exists");
+
+        app.state.focus(parent).expect("the pane exists");
+
+        let area = Size::new(80, 24);
+        let prefix = Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        let s = Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        let c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+        app.handle(&prefix, area).expect("handling never fails");
+        app.handle(&s, area).expect("handling never fails");
+        assert_eq!(
+            app.state.focused_pane(),
+            Some(first_id),
+            "^a s should open and focus the first child"
+        );
+        assert!(app.expanded.contains(&first_id));
+
+        app.handle(&prefix, area).expect("handling never fails");
+        app.handle(&s, area).expect("handling never fails");
+        assert_eq!(
+            app.state.focused_pane(),
+            Some(second_id),
+            "a second ^a s should cycle to the next child"
+        );
+
+        app.handle(&prefix, area).expect("handling never fails");
+        app.handle(&c, area).expect("handling never fails");
+        assert_eq!(
+            app.state.focused_pane(),
+            Some(parent),
+            "^a c should return focus to the parent"
+        );
+        assert!(
+            !app.expanded.contains(&second_id),
+            "collapsing should remove the child from the grid"
+        );
+    }
+
+    #[test]
     fn closing_a_pane_forgets_that_it_was_opened() {
         let mut app = App::new(HarnessRegistry::default());
         let project = app
@@ -1388,6 +1632,178 @@ mod tests {
         assert!(
             matches!(app.overlay, Some(Overlay::Approval { .. })),
             "the queued request should be shown now that the picker is gone"
+        );
+    }
+
+    #[test]
+    fn a_modified_key_is_never_an_approval() {
+        // Ctrl-a is the prefix, the most-pressed combination in the program and
+        // the first half of the chord that reopens this very prompt. If it
+        // approves, the user grants a subagent by reaching for a command.
+        let (mut app, _) = app_with_one_pending();
+
+        let modified = [
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('A'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
+        ];
+
+        for key in modified {
+            app.handle_overlay(&Event::Key(key), Size::new(80, 24))
+                .expect("handling a key never fails");
+        }
+
+        assert_eq!(
+            app.pending.len(),
+            1,
+            "no modified key should have answered the request"
+        );
+        assert!(
+            matches!(app.overlay, Some(Overlay::Approval { .. })),
+            "the prompt should still be open"
+        );
+    }
+
+    #[test]
+    fn plain_a_approves_without_a_blanket() {
+        let (mut app, request) = app_with_one_pending();
+
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.handle_overlay(&Event::Key(key), Size::new(80, 24))
+            .expect("handling a key never fails");
+
+        assert!(app.pending.is_empty(), "the request should be answered");
+        assert_eq!(
+            app.sent,
+            vec![ClientMessage::DelegateDecision {
+                request,
+                approve: true,
+                blanket: false,
+            }],
+            "plain `a` should approve without a blanket"
+        );
+    }
+
+    #[test]
+    fn shift_a_approves_with_a_blanket() {
+        let (mut app, request) = app_with_one_pending();
+
+        let key = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
+        app.handle_overlay(&Event::Key(key), Size::new(80, 24))
+            .expect("handling a key never fails");
+
+        assert!(app.pending.is_empty(), "the request should be answered");
+        assert_eq!(
+            app.sent,
+            vec![ClientMessage::DelegateDecision {
+                request,
+                approve: true,
+                blanket: true,
+            }],
+            "`A` should approve every later request from this pane too"
+        );
+    }
+
+    #[test]
+    fn esc_defers_and_leaves_the_queue_intact() {
+        let (mut app, request) = app_with_one_pending();
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        app.handle_overlay(&Event::Key(esc), Size::new(80, 24))
+            .expect("handling an escape never fails");
+
+        assert_eq!(
+            app.pending.front().map(|waiting| waiting.request),
+            Some(request),
+            "Esc must not answer the request, only stop showing it"
+        );
+        assert!(app.overlay.is_none(), "the prompt should have closed");
+    }
+
+    #[test]
+    fn a_withdrawal_closes_the_prompt_rather_than_advancing_it() {
+        // The daemon broadcasts `DelegateResolved` to every subscribed
+        // interface client, not only the one that answered — this is what
+        // withdraws a prompt someone else just settled, or one that expired
+        // on the daemon's own deadline.
+        let (mut app, request) = app_with_one_pending();
+
+        // A second request queued behind the first: if withdrawal substituted
+        // it under the user's fingers, this is the one that would appear.
+        app.pending.push_back(PendingRequest {
+            request: RequestId::new(),
+            parent: app.pending.front().expect("set up").parent,
+            project: app.pending.front().expect("set up").project,
+            harness: "claude".into(),
+            task: "a second task".into(),
+            depth: 0,
+        });
+
+        app.apply(ServerMessage::DelegateResolved {
+            request,
+            outcome: DelegateOutcome::Denied,
+        });
+
+        assert!(
+            app.overlay.is_none(),
+            "withdrawal should close the prompt, not show the next request"
+        );
+        assert_eq!(
+            app.pending.len(),
+            1,
+            "the second request should still be queued, just not shown"
+        );
+    }
+
+    #[test]
+    fn a_long_task_on_one_line_can_be_scrolled_to_its_final_words() {
+        // `Paragraph::scroll` counts *wrapped* rows, not `str::lines` — a task
+        // delivered as a single long line (exactly what `dispatch delegate
+        // "…"` sends) still wraps into several rows once rendered, so
+        // clamping against logical lines left everything past the first
+        // screenful unreachable. Approving something you cannot read is not
+        // approval.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (mut app, _) = app_with_one_pending();
+        let words: Vec<String> = (0..700).map(|i| format!("word{i}")).collect();
+        let task = format!("start {} final-words-right-here", words.join(" "));
+        app.pending.front_mut().expect("set up").task = task.clone();
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(100, 30)).expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("drawing succeeds");
+
+        // Scroll well past where the end could possibly be; the clamp should
+        // stop it there rather than blank the box.
+        for _ in 0..500 {
+            app.scroll_approval(true);
+        }
+
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("drawing succeeds");
+
+        let buf = terminal.backend().buffer();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .filter_map(|x| buf.cell((x, y)))
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            text.contains("final-words-right-here"),
+            "scrolling should reach the end of a long task:\n{text}"
         );
     }
 }

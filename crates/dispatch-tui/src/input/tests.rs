@@ -104,6 +104,8 @@ fn every_command_is_bound() {
         ('p', Action::ProjectPicker),
         ('H', Action::HarnessManager),
         ('a', Action::Approvals),
+        ('s', Action::ExpandChild),
+        ('c', Action::CollapseChild),
         ('[', Action::Scrollback),
         ('q', Action::Quit),
         ('h', Action::FocusDirection(Direction::Left)),
