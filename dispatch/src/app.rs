@@ -179,12 +179,18 @@ pub struct App {
     /// Where the approval prompt was last drawn, so scrolling can be clamped
     /// against the box's actual size rather than a guess.
     approval_area: Rect,
-    /// The last (request, width, rows) computed by `Approval::total_rows`.
+    /// The last (request, width, more-queued-behind-it, rows) computed by
+    /// `Approval::total_rows`.
     ///
     /// Rendering the whole prompt off-screen to measure it is not free, and
     /// holding a scroll key sends the same request at the same width over and
     /// over — this is what keeps that to one render rather than one per key.
-    approval_rows: Option<(RequestId, u16, u16)>,
+    /// The third field matters because `Approval` renders an extra "N more
+    /// waiting" row whenever the queue holds more than the one shown: without
+    /// it, a second request arriving while the first is on screen would grow
+    /// the rendered prompt by a row while the cache kept the old, one-row-
+    /// short answer.
+    approval_rows: Option<(RequestId, u16, bool, u16)>,
     /// Subagents the user has opened, so they join the tiled grid.
     ///
     /// Which rows are open is a per-client choice, not a property of the
@@ -713,37 +719,61 @@ impl App {
         }
     }
 
-    /// Opens the focused pane's next child into the grid and focuses it, or
-    /// cycles to the next sibling if focus is already on one of them.
+    /// Opens the focused pane's first child into the grid and focuses it; if
+    /// it has none of its own, cycles to the next sibling under the same
+    /// parent instead.
     ///
     /// A subagent otherwise has no keyboard way in: `focus_direction` only
     /// searches the tiled grid, which excludes an unopened child by
-    /// construction, and a sidebar click needs a mouse. Starting from
-    /// whichever pane already has focus — the parent, or a child reached this
-    /// same way — is what makes repeating this cycle through several rather
-    /// than opening the first one over and over.
+    /// construction, and a sidebar click needs a mouse. Descending before
+    /// cycling is what makes a grandchild reachable at all — the daemon
+    /// enforces a depth cap greater than one, so there can be one — since
+    /// cycling alone only ever visits siblings at a single generation.
     fn expand_child(&mut self) {
         let Some(focused) = self.state.focused_pane() else {
             return;
         };
 
-        let parent = self
-            .state
-            .pane(focused)
-            .and_then(|pane| pane.parent)
-            .unwrap_or(focused);
-
-        let children = self.state.children_of(parent);
-        if children.is_empty() {
+        // Descend into the focused pane's own children first — the only way
+        // a grandchild is reachable at all, since cycling only ever visits
+        // one generation. Only once it has none of its own does this fall
+        // back to cycling its siblings under the same parent.
+        let own_children = self.open_children(focused);
+        if let Some(&first) = own_children.first() {
+            self.focus_pane(first);
             return;
         }
 
-        let next = children
-            .iter()
-            .position(|child| child.id == focused)
-            .map_or(0, |index| (index + 1) % children.len());
+        let Some(parent) = self.state.pane(focused).and_then(|pane| pane.parent) else {
+            return;
+        };
 
-        self.focus_pane(children[next].id);
+        let siblings = self.open_children(parent);
+        if siblings.is_empty() {
+            return;
+        }
+
+        let next = siblings
+            .iter()
+            .position(|&id| id == focused)
+            .map_or(0, |index| (index + 1) % siblings.len());
+
+        self.focus_pane(siblings[next]);
+    }
+
+    /// The live — not tombstoned — children of `parent`, in spawn order.
+    ///
+    /// `AppState::children_of` keeps a closed pane's row around so a
+    /// surviving child still has somewhere to be drawn under; `expand_child`
+    /// has no use for a row with no process behind it and no place in the
+    /// tiled grid to put it.
+    fn open_children(&self, parent: PaneId) -> Vec<PaneId> {
+        self.state
+            .children_of(parent)
+            .into_iter()
+            .filter(|child| !child.closed)
+            .map(|child| child.id)
+            .collect()
     }
 
     /// If the focused pane is a subagent, removes it from the tiled grid and
@@ -814,26 +844,47 @@ impl App {
         Ok(())
     }
 
+    /// Modifiers that disqualify a key from being an approval action.
+    ///
+    /// `Ctrl-a` is the default prefix — the most-pressed combination in the
+    /// program, and the first half of the very `^a a` chord that reopens this
+    /// prompt — so reading its `Char('a')` as the plain `a` that approves
+    /// would grant a subagent by reaching for a command. `SHIFT` is
+    /// deliberately not here: Windows derives `SHIFT` from the physical key
+    /// alone, but derives a letter's *case* from `shift XOR caps lock`, so
+    /// with caps lock on, the plain `a` key arrives as `(Char('A'), NONE)`
+    /// and physical `Shift-a` as `(Char('a'), SHIFT)`. Rejecting `SHIFT`
+    /// outright would leave caps-lock users with no way to approve or deny at
+    /// all — only `Esc` would ever match.
+    const APPROVAL_REJECTED_MODIFIERS: KeyModifiers = KeyModifiers::CONTROL
+        .union(KeyModifiers::ALT)
+        .union(KeyModifiers::SUPER)
+        .union(KeyModifiers::HYPER)
+        .union(KeyModifiers::META);
+
     /// Handles a key while the approval prompt has the keyboard.
     ///
-    /// Matched on the *exact* modifiers, not just the code. `Ctrl-a` is the
-    /// default prefix — the most-pressed combination in the program, and the
-    /// first half of the very `^a a` chord that reopens this prompt — so
-    /// reading its `Char('a')` as the plain `a` that approves would grant a
-    /// subagent by reaching for a command. A modified key is never an
-    /// approval action, `Esc` and the scroll keys included.
+    /// Blanket intent is read off the character's own case (`'A'` versus
+    /// `'a'`), not off the `SHIFT` modifier: on Windows with caps lock on, the
+    /// physical `a` key arrives as `Char('A')` with no modifier at all, and
+    /// `Shift-a` arrives as `Char('a')` *with* `SHIFT` — the modifier and the
+    /// letter one might expect to go together do not.
     ///
     /// `Esc` defers rather than denies — a mistaken deny throws away work the
     /// agent has already reasoned about — so it is the only key here that
     /// leaves the request in `pending` rather than answering it.
     fn handle_approval_key(&mut self, key: &KeyEvent) {
-        match (key.code, key.modifiers) {
-            (KeyCode::Esc, KeyModifiers::NONE) => self.overlay = None,
-            (KeyCode::Char('a'), KeyModifiers::NONE) => self.decide(true, false),
-            (KeyCode::Char('d'), KeyModifiers::NONE) => self.decide(false, false),
-            (KeyCode::Char('A'), KeyModifiers::SHIFT) => self.decide(true, true),
-            (KeyCode::Up, KeyModifiers::NONE) => self.scroll_approval(false),
-            (KeyCode::Down, KeyModifiers::NONE) => self.scroll_approval(true),
+        if key.modifiers.intersects(Self::APPROVAL_REJECTED_MODIFIERS) {
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => self.overlay = None,
+            KeyCode::Char('a') => self.decide(true, false),
+            KeyCode::Char('A') => self.decide(true, true),
+            KeyCode::Char('d') | KeyCode::Char('D') => self.decide(false, false),
+            KeyCode::Up => self.scroll_approval(false),
+            KeyCode::Down => self.scroll_approval(true),
             _ => {}
         }
     }
@@ -907,9 +958,14 @@ impl App {
     /// How many rows the approval prompt needs for `request` at `width`,
     /// from cache when the last computation still applies.
     fn rows_for(&mut self, request: RequestId, width: u16) -> u16 {
-        if let Some((cached_request, cached_width, rows)) = self.approval_rows
+        // Whether `Approval` renders its "N more waiting" row — the only way
+        // the queue's length affects how many rows the prompt needs.
+        let more_queued = self.pending.len() > 1;
+
+        if let Some((cached_request, cached_width, cached_more_queued, rows)) = self.approval_rows
             && cached_request == request
             && cached_width == width
+            && cached_more_queued == more_queued
         {
             return rows;
         }
@@ -917,7 +973,7 @@ impl App {
         let rows = self
             .approval_widget(0)
             .map_or(0, |widget| widget.total_rows(width));
-        self.approval_rows = Some((request, width, rows));
+        self.approval_rows = Some((request, width, more_queued, rows));
         rows
     }
 
@@ -1357,6 +1413,12 @@ impl App {
         // outcome this whole feature exists to prevent. Silent while the
         // prompt itself is on screen, since it would only repeat what is
         // already in front of the user.
+        //
+        // Appended rather than shown in place of `self.status`: a daemon
+        // disconnect or an error is worth knowing about more than a queued
+        // prompt is, and when the daemon is gone the prompt cannot be acted
+        // on anyway, so hiding the disconnect notice behind it would be
+        // exactly backwards.
         let waiting_reminder = (!self.pending.is_empty()
             && !matches!(self.overlay, Some(Overlay::Approval { .. })))
         .then(|| format!("{} delegation(s) waiting — ^a a", self.pending.len()));
@@ -1365,20 +1427,25 @@ impl App {
             // A prefix that armed invisibly is how a keystroke goes missing
             // with no explanation.
             "PREFIX".to_string()
-        } else if let Some(reminder) = waiting_reminder {
-            reminder
-        } else if !self.status.is_empty() {
-            self.status.clone()
         } else {
-            let panes = self.state.visible_panes().len();
-            // Attached is worth saying: it is the difference between closing
-            // Dispatch and killing the agents.
-            let where_ = self
-                .device()
-                .map_or_else(String::new, |device| format!("  {device}"));
-            format!(
-                "{panes} pane(s){where_}  ^a n new  ^a x close  ^a z zoom  ^a s child  ^a c collapse  ^a q quit"
-            )
+            let base = if !self.status.is_empty() {
+                self.status.clone()
+            } else {
+                let panes = self.state.visible_panes().len();
+                // Attached is worth saying: it is the difference between
+                // closing Dispatch and killing the agents.
+                let where_ = self
+                    .device()
+                    .map_or_else(String::new, |device| format!("  {device}"));
+                format!(
+                    "{panes} pane(s){where_}  ^a n new  ^a x close  ^a z zoom  ^a s child  ^a c collapse  ^a q quit"
+                )
+            };
+
+            match waiting_reminder {
+                Some(reminder) => format!("{base}  {reminder}"),
+                None => base,
+            }
         };
 
         let style = if self.router.is_armed() {
@@ -1579,6 +1646,102 @@ mod tests {
     }
 
     #[test]
+    fn expand_child_descends_into_a_grandchild_before_cycling_siblings() {
+        // The daemon enforces a depth cap greater than one, so a grandchild
+        // is a real pane that needs a real way in. Cycling siblings alone
+        // only ever visits one generation; descending first is what makes a
+        // second `^a s` reach it rather than the first child's sibling.
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let parent = app
+            .state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+
+        let mut child = CorePane::new(project, HarnessId::new("claude"));
+        child.parent = Some(parent);
+        let child_id = app.state.adopt_pane(child).expect("the project exists");
+
+        let mut grandchild = CorePane::new(project, HarnessId::new("claude"));
+        grandchild.parent = Some(child_id);
+        let grandchild_id = app
+            .state
+            .adopt_pane(grandchild)
+            .expect("the project exists");
+
+        // A sibling of `child`, to prove descending is preferred over cycling
+        // to it.
+        let mut sibling = CorePane::new(project, HarnessId::new("claude"));
+        sibling.parent = Some(parent);
+        app.state.adopt_pane(sibling).expect("the project exists");
+
+        app.state.focus(parent).expect("the pane exists");
+
+        app.expand_child();
+        assert_eq!(app.state.focused_pane(), Some(child_id));
+
+        app.expand_child();
+        assert_eq!(
+            app.state.focused_pane(),
+            Some(grandchild_id),
+            "a child with its own child should be descended into, not cycled past"
+        );
+    }
+
+    #[test]
+    fn expand_child_skips_a_closed_sibling() {
+        // `children_of` keeps a closed pane's row for a surviving durable
+        // child's sake; `tileable` already excludes a closed pane from the
+        // grid, and focusing one would land on a pane with nowhere to draw.
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let parent = app
+            .state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+
+        let mut doomed = CorePane::new(project, HarnessId::new("claude"));
+        doomed.parent = Some(parent);
+        let doomed_id = app.state.adopt_pane(doomed).expect("the project exists");
+
+        // Kept alive so `doomed` survives as a tombstone (`closed: true`)
+        // rather than being removed outright.
+        let mut survivor = CorePane::new(project, HarnessId::new("claude"));
+        survivor.parent = Some(doomed_id);
+        survivor.durable = true;
+        app.state.adopt_pane(survivor).expect("the project exists");
+
+        let mut open_child = CorePane::new(project, HarnessId::new("claude"));
+        open_child.parent = Some(parent);
+        let open_child_id = app
+            .state
+            .adopt_pane(open_child)
+            .expect("the project exists");
+
+        app.state.close_pane(doomed_id).expect("the pane exists");
+        assert!(
+            app.state
+                .pane(doomed_id)
+                .expect("kept as a tombstone")
+                .closed,
+            "set up: the first child should be a tombstone, not gone"
+        );
+
+        app.state.focus(parent).expect("the pane exists");
+        app.expand_child();
+
+        assert_eq!(
+            app.state.focused_pane(),
+            Some(open_child_id),
+            "the closed child should be skipped in favour of the open one"
+        );
+    }
+
+    #[test]
     fn closing_a_pane_forgets_that_it_was_opened() {
         let mut app = App::new(HarnessRegistry::default());
         let project = app
@@ -1708,6 +1871,52 @@ mod tests {
     }
 
     #[test]
+    fn caps_lock_shaped_a_still_grants_a_blanket() {
+        // Windows derives `SHIFT` from the physical key alone, but derives a
+        // letter's case from `shift XOR caps lock`: with caps lock on, the
+        // plain `a` key arrives as `(Char('A'), NONE)` — no modifier at all.
+        // Requiring `SHIFT` for a blanket would leave this key doing nothing.
+        let (mut app, request) = app_with_one_pending();
+
+        let key = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE);
+        app.handle_overlay(&Event::Key(key), Size::new(80, 24))
+            .expect("handling a key never fails");
+
+        assert_eq!(
+            app.sent,
+            vec![ClientMessage::DelegateDecision {
+                request,
+                approve: true,
+                blanket: true,
+            }],
+            "an unmodified `A` should still grant a blanket"
+        );
+    }
+
+    #[test]
+    fn caps_lock_shaped_shift_a_approves_without_a_blanket() {
+        // The other half of the same quirk: with caps lock on, physical
+        // Shift-a arrives as `(Char('a'), SHIFT)` — lowercase, but modified.
+        // Rejecting every modified key outright (Critical 1's first fix)
+        // would have left this doing nothing too.
+        let (mut app, request) = app_with_one_pending();
+
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT);
+        app.handle_overlay(&Event::Key(key), Size::new(80, 24))
+            .expect("handling a key never fails");
+
+        assert_eq!(
+            app.sent,
+            vec![ClientMessage::DelegateDecision {
+                request,
+                approve: true,
+                blanket: false,
+            }],
+            "a caps-lock-shaped Shift-a should approve without a blanket"
+        );
+    }
+
+    #[test]
     fn esc_defers_and_leaves_the_queue_intact() {
         let (mut app, request) = app_with_one_pending();
 
@@ -1721,6 +1930,40 @@ mod tests {
             "Esc must not answer the request, only stop showing it"
         );
         assert!(app.overlay.is_none(), "the prompt should have closed");
+    }
+
+    #[test]
+    fn the_status_line_shows_a_disconnect_notice_and_the_waiting_count_together() {
+        // A user needs to know the daemon is gone more than they need to know
+        // a prompt is queued — and when the daemon is gone, the queued prompt
+        // cannot be acted on anyway. Neither should hide the other.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (mut app, _) = app_with_one_pending();
+        app.overlay = None; // deferred, as `Esc` leaves it
+        app.status = "waiting for the daemon — the agents are still running".into();
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(100, 30)).expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("drawing succeeds");
+
+        let buf = terminal.backend().buffer();
+        let last_row: String = (0..buf.area.width)
+            .filter_map(|x| buf.cell((x, buf.area.height - 1)))
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(
+            last_row.contains("waiting for the daemon"),
+            "the disconnect notice must stay visible: {last_row}"
+        );
+        assert!(
+            last_row.contains("delegation(s) waiting"),
+            "the queued prompt should still be mentioned: {last_row}"
+        );
     }
 
     #[test]
@@ -1804,6 +2047,38 @@ mod tests {
         assert!(
             text.contains("final-words-right-here"),
             "scrolling should reach the end of a long task:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_row_count_cache_accounts_for_a_second_request_arriving() {
+        // `Approval` renders an extra "N more waiting" row once the queue
+        // holds more than the one shown. A cache keyed only on (request,
+        // width) would keep answering with the smaller, stale row count once
+        // a second request queues up behind the first — capping how far the
+        // prompt can scroll one row short of its own key legend.
+        let (mut app, request) = app_with_one_pending();
+        let width = 40;
+
+        let solo_rows = app.rows_for(request, width);
+
+        let waiting = app.pending.front().expect("set up");
+        app.pending.push_back(PendingRequest {
+            request: RequestId::new(),
+            parent: waiting.parent,
+            project: waiting.project,
+            harness: "claude".into(),
+            task: "a second task".into(),
+            depth: 0,
+        });
+
+        let with_one_more_waiting = app.rows_for(request, width);
+
+        assert_eq!(
+            with_one_more_waiting,
+            solo_rows + 1,
+            "a queued second request should grow the measured prompt by \
+             exactly the one \"more waiting\" row it adds"
         );
     }
 }

@@ -96,15 +96,20 @@ impl<'a> Approval<'a> {
 
         let lines = self.lines();
 
-        // A word-wrap can never produce more rows than there are characters
-        // to wrap, plus one per already-blank line: generous, but bounded,
-        // and only paid for while scrolling.
-        let bound = lines
+        // A hard break — the worst case, forced when a line has no word
+        // boundary to wrap at — needs exactly `line.width()` characters
+        // packed `width` to a row: `line.width().div_ceil(width)`. A word-wrap
+        // that instead breaks at whitespace can only need that many rows or
+        // one more per line, for whatever a word boundary leaves unused at
+        // the end of a row. Summed in `usize` rather than `u16` so a line
+        // past 65,535 columns is divided before it is ever truncated, not
+        // truncated first and divided short.
+        let bound: usize = lines
             .iter()
-            .map(|line| u16::try_from(line.width()).unwrap_or(u16::MAX))
-            .fold(0u16, u16::saturating_add)
-            .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX))
+            .map(|line| line.width().div_ceil(usize::from(width)).saturating_add(1))
+            .fold(0usize, usize::saturating_add)
             .max(1);
+        let bound = u16::try_from(bound).unwrap_or(u16::MAX);
 
         let area = Rect::new(0, 0, width, bound);
         let mut buf = Buffer::empty(area);
@@ -135,5 +140,59 @@ impl Widget for Approval<'_> {
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0))
             .render(inner, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approval<'a>(task: &'a str, waiting: usize) -> Approval<'a> {
+        Approval {
+            asking: "Claude Code",
+            harness: "claude",
+            project: "dispatch",
+            depth: 0,
+            task,
+            waiting,
+            scroll: 0,
+        }
+    }
+
+    #[test]
+    fn a_hard_break_needs_exactly_one_row_per_width_worth_of_characters() {
+        // A single "word" with no whitespace at all cannot wrap at a word
+        // boundary, so ratatui hard-breaks it every `width` columns — the
+        // worst case `total_rows`'s bound is built around. 4000 columns at a
+        // width of 68 needs ceil(4000 / 68) = 59 rows for the task alone.
+        let task = "x".repeat(4000);
+        let widget = approval(&task, 0);
+
+        let task_rows = 4000usize.div_ceil(68);
+        // harness/project/depth (1) + blank (1) + task + blank (1) + legend (1).
+        let expected = u16::try_from(task_rows + 4).expect("fits comfortably in a u16");
+
+        assert_eq!(widget.total_rows(68), expected);
+    }
+
+    #[test]
+    fn a_queued_second_request_adds_exactly_one_row() {
+        // The only way the queue's length changes what is rendered: an extra
+        // "N more waiting" line, once there is one.
+        let solo = approval("a short task", 0);
+        let with_one_more = approval("a short task", 1);
+
+        assert_eq!(with_one_more.total_rows(40), solo.total_rows(40) + 1);
+    }
+
+    #[test]
+    fn an_empty_task_still_measures_the_chrome_around_it() {
+        // `str::lines` yields nothing for an empty string, so the task
+        // contributes no rows of its own here — only the chrome does:
+        // harness/project/depth (1) + blank (1) + blank (1) + legend (1). A
+        // wide enough box that neither of those two text lines wraps on its
+        // own — this is about the chrome's line *count*, not its wrapping.
+        let widget = approval("", 0);
+        assert_eq!(widget.total_rows(100), 4);
     }
 }
