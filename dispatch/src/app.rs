@@ -435,13 +435,13 @@ impl App {
             changed |= self.apply(message);
         }
 
-        // Said once, and only once: a status line rewritten every frame would
-        // bury whatever the user was reading. The agents are the daemon's, so
-        // this is a lost view rather than lost work.
-        if !connected && !self.status.starts_with("waiting") {
-            self.status = "waiting for the daemon — the agents are still running".into();
-            changed = true;
-        }
+        // Whether the daemon is gone is asked at draw time rather than stamped
+        // here. `connected` above is a snapshot, and the reconnection runs on
+        // another thread: read it a moment before the supervisor flips it and a
+        // stamped notice overwrites the "reattached" message and then outlives
+        // the disconnection it described, because the generation only changes
+        // once and nothing writes the status again. CI caught exactly that.
+        changed |= !connected;
 
         changed
     }
@@ -1520,12 +1520,26 @@ impl App {
             && !matches!(self.overlay, Some(Overlay::Approval { .. })))
         .then(|| format!("{} delegation(s) waiting — ^a a", self.pending.len()));
 
+        // Asked now, not remembered: the connection can come back on another
+        // thread at any moment, and a notice that outlives the disconnection is
+        // worse than none — it says the agents are unreachable when they are
+        // not.
+        let disconnected = match &self.mode {
+            Mode::Attached(client) => !client.is_connected(),
+            Mode::Standalone => false,
+        };
+
         let text = if self.router.is_armed() {
             // A prefix that armed invisibly is how a keystroke goes missing
             // with no explanation.
             "PREFIX".to_string()
         } else {
-            let base = if !self.status.is_empty() {
+            let base = if disconnected {
+                // Ahead of `self.status`, which may still hold whatever was
+                // happening when the connection went: a user needs to know the
+                // agents are out of reach more than they need the last message.
+                "waiting for the daemon — the agents are still running".to_string()
+            } else if !self.status.is_empty() {
                 self.status.clone()
             } else {
                 let panes = self.state.visible_panes().len();
