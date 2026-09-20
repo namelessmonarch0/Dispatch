@@ -1726,3 +1726,90 @@ fn closing_a_pane_drops_its_whole_delegation_subtree() {
         "closing the root must drop the whole subtree, not just its direct child"
     );
 }
+
+#[test]
+fn a_prompt_whose_caller_has_gone_is_withdrawn_rather_than_left_on_screen() {
+    // Ctrl-C on `dispatch delegate` closes the socket, and the request goes
+    // with it. Dropped in silence, the prompt stayed on every interface client:
+    // the user presses `a`, `DelegateDecision` finds no pending entry, returns,
+    // and nothing whatsoever happens. Every other resolution path broadcasts,
+    // and a withdrawal is exactly what closes a prompt.
+    let (mut daemon, project, _dir) = daemon("delegate-caller-gone");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _caller = ask(&mut daemon, parent, "echo never");
+    let request = pending(&drain(&ui)).expect("the interface is asked");
+
+    daemon.detach_for_test(9);
+
+    let seen = drain(&ui);
+    assert!(
+        seen.iter().any(|m| matches!(
+            m,
+            ServerMessage::DelegateResolved {
+                request: withdrawn,
+                outcome: dispatch_proto::DelegateOutcome::Refused { .. },
+            } if *withdrawn == request
+        )),
+        "the prompt must be withdrawn from the interface, got {seen:#?}"
+    );
+
+    // And answering it afterwards is answering nothing, which is precisely why
+    // it must not still be on screen.
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+    daemon.tick();
+    assert_eq!(
+        daemon.pane_count(),
+        1,
+        "a withdrawn request cannot be approved into a subagent"
+    );
+}
+
+#[test]
+fn a_late_subscriber_is_told_about_pending_requests_oldest_first() {
+    // The client documents its queue as oldest first and shows the front of it;
+    // `HashMap` order would hand a reattaching client the prompts in whatever
+    // order the hasher happened to like, so the request the user has been
+    // waiting on longest need not be the one they are shown.
+    let (mut daemon, project, _dir) = daemon("delegate-catch-up-order");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    // Six, because one hash order in a handful agreeing with insertion order is
+    // luck; six agreeing is not.
+    let mut asked = Vec::new();
+    for (index, id) in (20..26).enumerate() {
+        let _caller = ask_as(&mut daemon, id, parent, &format!("task {index}"));
+        asked.push(
+            pending(&drain(&ui)).unwrap_or_else(|| panic!("the interface is asked about {index}")),
+        );
+    }
+
+    let late = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+
+    let replayed: Vec<dispatch_core::RequestId> = drain(&late)
+        .iter()
+        .filter_map(|m| match m {
+            ServerMessage::DelegatePending { request, .. } => Some(*request),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        replayed, asked,
+        "a late subscriber should be caught up in the order the requests were asked"
+    );
+}

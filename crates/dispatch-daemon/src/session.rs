@@ -371,8 +371,16 @@ impl Daemon {
 
                 // A request already put to the user is put to this client too,
                 // rather than only to whoever was subscribed at the time.
-                for waiting in self.pending.values() {
-                    existing.push(waiting.announcement.clone());
+                //
+                // Oldest first: that is the order the client documents its own
+                // queue in and the order it shows them, so `HashMap` order would
+                // otherwise decide which prompt a reattaching user is asked
+                // about first — and it would not be the one that has been
+                // waiting longest.
+                let mut waiting: Vec<&Pending> = self.pending.values().collect();
+                waiting.sort_by_key(|pending| pending.asked);
+                for pending in waiting {
+                    existing.push(pending.announcement.clone());
                 }
 
                 for message in existing {
@@ -930,7 +938,31 @@ impl Daemon {
     /// `caller` and `request` are cleared so nothing later tries to answer a
     /// caller that is gone, and it is left for a person to close.
     fn abandon(&mut self, caller: ClientId) {
-        self.pending.retain(|_, waiting| waiting.caller != caller);
+        // Withdrawn rather than silently dropped. Ctrl-C on `dispatch delegate`
+        // is the case the design names, and it is the one that used to leave a
+        // prompt on screen for a request that no longer exists: the user presses
+        // `a`, `DelegateDecision` finds no pending entry, and nothing at all
+        // happens. Every other resolution path goes through `resolve`, which
+        // broadcasts; this one cannot, because the client `resolve` would answer
+        // is the one that just went away. So only the interface clients hear it,
+        // and they hear exactly what closes a prompt.
+        let dropped: Vec<RequestId> = self
+            .pending
+            .iter()
+            .filter(|(_, waiting)| waiting.caller == caller)
+            .map(|(id, _)| *id)
+            .collect();
+
+        for request in dropped {
+            self.pending.remove(&request);
+            tracing::info!(%request, "the caller of a pending delegation has gone");
+            self.broadcast(ServerMessage::DelegateResolved {
+                request,
+                outcome: DelegateOutcome::Refused {
+                    reason: "the call that asked for it has gone".into(),
+                },
+            });
+        }
 
         let mut orphaned = Vec::new();
         for pane in self.panes.values_mut() {
