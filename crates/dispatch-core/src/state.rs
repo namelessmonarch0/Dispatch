@@ -124,18 +124,6 @@ impl AppState {
             .collect()
     }
 
-    /// How many of `parent`'s children are still running.
-    ///
-    /// What the delegation cap counts: work in progress, not work that has
-    /// been done.
-    #[must_use]
-    pub fn live_children(&self, parent: PaneId) -> usize {
-        self.children_of(parent)
-            .iter()
-            .filter(|p| p.status.is_live())
-            .count()
-    }
-
     /// Adds a pane to `project` and focuses it.
     ///
     /// A newly spawned agent is what the user is about to interact with, so it
@@ -858,7 +846,6 @@ mod tests {
 
         let children: Vec<PaneId> = state.children_of(parent).iter().map(|p| p.id).collect();
         assert_eq!(children, vec![child]);
-        assert_eq!(state.live_children(parent), 1);
         assert!(
             state.children_of(child).is_empty(),
             "a child has no children of its own"
@@ -866,15 +853,16 @@ mod tests {
     }
 
     #[test]
-    fn an_exited_child_is_not_a_live_child() {
-        // The cap counts what is running, not what has run.
+    fn an_exited_child_keeps_its_row_under_its_parent() {
+        // Its transcript is the only record of what the subagent did, so the row
+        // stays until someone closes it.
         let (mut state, parent, child) = parent_and_child(false);
         state
             .set_pane_status(child, PaneStatus::Exited(0))
             .expect("the pane exists");
 
-        assert_eq!(state.live_children(parent), 0);
-        assert_eq!(state.children_of(parent).len(), 1, "the row stays");
+        assert_eq!(state.children_of(parent).len(), 1);
+        assert!(!state.children_of(parent)[0].status.is_live());
     }
 
     #[test]
