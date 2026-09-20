@@ -35,7 +35,13 @@ dispatch-pty = { path = "crates/dispatch-pty" }
 dispatch-tui = { path = "crates/dispatch-tui" }
 
 # Interface
-ratatui = "0.29"
+# `unstable-rendered-line-info` exposes `Paragraph::line_count`, the exact
+# wrapped row count the render path itself computes. Three attempts at
+# reimplementing that count by hand (a character sum, a per-line `div_ceil`,
+# a two-row probe) were each wrong in a way tests at only one terminal width
+# missed; the version is pinned, so "unstable" here means "the API may move
+# under us later," not "unverified now."
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 
 # Runtime

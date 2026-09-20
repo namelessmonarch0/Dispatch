@@ -176,21 +176,9 @@ pub struct App {
     /// way to pick one of its rows out of the list — this is what a click is
     /// matched against.
     sidebar_area: Rect,
-    /// Where the approval prompt was last drawn, so scrolling can be clamped
-    /// against the box's actual size rather than a guess.
+    /// Where the approval prompt was last drawn, so its scroll can be
+    /// clamped against the box's actual size at draw time.
     approval_area: Rect,
-    /// The last (request, width, more-queued-behind-it, total rows) computed
-    /// by `Approval::total_rows`.
-    ///
-    /// Rendering the whole prompt off-screen to measure it is not free, and
-    /// holding a scroll key sends the same request at the same width over and
-    /// over — this is what keeps that to one render rather than one per key.
-    /// The third field matters because `Approval` renders an extra "N more
-    /// waiting" row whenever the queue holds more than the one shown: without
-    /// it, a second request arriving while the first is on screen would grow
-    /// the rendered prompt by a row while the cache kept the old, one-row-
-    /// short answer.
-    approval_rows: Option<(RequestId, u16, bool, u16)>,
     /// Subagents the user has opened, so they join the tiled grid.
     ///
     /// Which rows are open is a per-client choice, not a property of the
@@ -236,7 +224,6 @@ impl App {
             layout: Vec::new(),
             sidebar_area: Rect::default(),
             approval_area: Rect::default(),
-            approval_rows: None,
             expanded: HashSet::new(),
             pending: VecDeque::new(),
             status: String::new(),
@@ -919,62 +906,26 @@ impl App {
         self.open_next_approval();
     }
 
-    /// Scrolls the task text of the request currently shown.
+    /// Records a scroll of the task text of the request currently shown.
     ///
-    /// Clamped against [`Approval::total_rows`] for the box as it was last
-    /// drawn, not `task.lines().count()`: a task delivered as one long line —
-    /// exactly what `dispatch delegate "…"` sends — still wraps into several
-    /// rows once rendered, and counting logical lines would leave everything
-    /// past the first screenful unreachable. Approving something you cannot
-    /// read is not approval.
+    /// Not clamped here: only the draw knows the box's real inner width and
+    /// height, so `draw_overlay` is what clamps this against
+    /// [`Approval::total_rows`] before rendering, and persists the clamped
+    /// value back here. Clamping on the keystroke instead would drop a `↓`
+    /// that arrives before the prompt has ever been drawn (`approval_area`
+    /// would still be a zero rect) and would leave a stale, too-large offset
+    /// rendering blank after a resize to a wider box, until the next `↓`
+    /// happened to nudge it back into range.
     fn scroll_approval(&mut self, down: bool) {
-        if !down {
-            if let Some(Overlay::Approval { scroll }) = &mut self.overlay {
-                *scroll = scroll.saturating_sub(1);
-            }
-            return;
-        }
-
-        if !matches!(self.overlay, Some(Overlay::Approval { .. })) {
-            return;
-        }
-        let Some(request) = self.pending.front().map(|waiting| waiting.request) else {
+        let Some(Overlay::Approval { scroll }) = &mut self.overlay else {
             return;
         };
 
-        let inner = Approval::inner(self.approval_area);
-        let max = if inner.width == 0 || inner.height == 0 {
-            0
+        if down {
+            *scroll = scroll.saturating_add(1);
         } else {
-            self.rows_for(request, inner.width)
-                .saturating_sub(inner.height)
-        };
-
-        if let Some(Overlay::Approval { scroll }) = &mut self.overlay {
-            *scroll = scroll.saturating_add(1).min(max);
+            *scroll = scroll.saturating_sub(1);
         }
-    }
-
-    /// How many rows the approval prompt needs for `request` at `width`,
-    /// from cache when the last computation still applies.
-    fn rows_for(&mut self, request: RequestId, width: u16) -> u16 {
-        // Whether `Approval` renders its "N more waiting" row — the only way
-        // the queue's length affects how many rows the prompt needs.
-        let more_queued = self.pending.len() > 1;
-
-        if let Some((cached_request, cached_width, cached_more_queued, rows)) = self.approval_rows
-            && cached_request == request
-            && cached_width == width
-            && cached_more_queued == more_queued
-        {
-            return rows;
-        }
-
-        let rows = self
-            .approval_widget(0)
-            .map_or(0, |widget| widget.total_rows(width));
-        self.approval_rows = Some((request, width, more_queued, rows));
-        rows
     }
 
     /// Builds the approval widget for the request at the front of the queue,
@@ -1335,7 +1286,29 @@ impl App {
         // The queue can only be empty here for one frame, between the last
         // request being answered and `open_next_approval` closing the
         // overlay; nothing to draw is not a bug worth a fallback screen for.
-        let Some(widget) = self.approval_widget(scroll) else {
+        let Some(measured) = self.approval_widget(scroll) else {
+            return;
+        };
+
+        // Clamped here rather than where `↓` recorded it: this is the one
+        // place that knows the box's real inner size, this frame. Persisted
+        // back so the next `↓`/`↑` starts from what is actually on screen,
+        // not from an offset that keystroke-time clamping never saw. Measured
+        // with its own widget, rebuilt below for the render itself, because
+        // both borrow `self` and the persist in between needs it back.
+        let inner = Approval::inner(rect);
+        let max = measured
+            .total_rows(inner.width)
+            .saturating_sub(inner.height);
+        let clamped = scroll.min(max);
+
+        if clamped != scroll
+            && let Some(Overlay::Approval { scroll }) = &mut self.overlay
+        {
+            *scroll = clamped;
+        }
+
+        let Some(widget) = self.approval_widget(clamped) else {
             return;
         };
 
@@ -1527,6 +1500,42 @@ mod tests {
         app.overlay = Some(Overlay::Approval { scroll: 0 });
 
         (app, request)
+    }
+
+    /// Every cell of the last-drawn frame, as one string with a newline
+    /// between rows.
+    fn rendered_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .filter_map(|x| buf.cell((x, y)))
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A terminal sized so the approval prompt's own inner content area comes
+    /// out to exactly `inner_width` columns by 18 rows — worked backwards
+    /// through the sidebar's width and `centred_approval`'s
+    /// `clamp(20, 76)`, then the block's one-cell border on each side.
+    ///
+    /// Below the clamp's floor of 20, the only way to reach a narrower outer
+    /// width is through its own `.min(area.width)` escape hatch, which needs
+    /// `area.width` — the panes area, sidebar already subtracted — to equal
+    /// the target outer width exactly. At or above the floor, the ordinary
+    /// `area.width - 4` path is what reaches it, so the panes area has to be
+    /// four columns wider than the target instead.
+    fn terminal_for_inner_width(
+        inner_width: u16,
+    ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let outer = inner_width + 2;
+        let panes_width = if outer >= 20 { outer + 4 } else { outer };
+        let terminal_width = panes_width + sidebar::WIDTH;
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(terminal_width, 30))
+            .expect("a test backend can be created")
     }
 
     #[test]
@@ -2215,6 +2224,117 @@ mod tests {
             text.contains("final-words-right-here"),
             "a whitespace-only line must not undercount the rows before it:\n{text}"
         );
+    }
+
+    #[test]
+    fn a_single_hard_broken_word_can_be_scrolled_to_its_end_at_a_narrow_width() {
+        // A single 4000-character word has no whitespace to wrap at, so it
+        // is hard-broken every `width` columns — at a much narrower width
+        // than the box's own 74-column default, which is where every
+        // earlier attempt at this bound happened to be checked.
+        // "END" rather than the "final-words-right-here" marker other tests
+        // use at their much wider box: short enough, and its own whitespace-
+        // separated word, that it can never itself be hard-broken across
+        // rows here — a marker that wraps would need joining logic of its
+        // own to search for, which is exactly the kind of extra arithmetic
+        // this fix is trying to avoid needing at all.
+        let (mut app, _) = app_with_one_pending();
+        let task = format!("{} END", "x".repeat(4000));
+        app.pending.front_mut().expect("set up").task = task;
+
+        let mut terminal = terminal_for_inner_width(18);
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("drawing succeeds");
+
+        for _ in 0..300 {
+            app.scroll_approval(true);
+        }
+
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("drawing succeeds");
+
+        let text = rendered_text(&terminal);
+        assert!(
+            text.contains("END"),
+            "scrolling should reach the end at a narrow width too:\n{text}"
+        );
+    }
+
+    #[test]
+    fn irregular_interior_whitespace_is_accounted_for_at_a_narrow_width() {
+        // `Wrap { trim: false }` paints interior whitespace runs, but a
+        // measure that counts only words and discards the space between them
+        // does not — forty words joined by a run of twenty-five spaces each,
+        // at an inner width of eighteen, is the shape a fuzz run over this
+        // exact widget found undercounted by fourteen rows against a real
+        // render, once every earlier attempt's arithmetic is checked rather
+        // than trusted.
+        let (mut app, _) = app_with_one_pending();
+        let gap = " ".repeat(25);
+        let words: Vec<String> = (0..40).map(|i| format!("word{i}")).collect();
+        let task = format!("{} END", words.join(&gap));
+        app.pending.front_mut().expect("set up").task = task;
+
+        let mut terminal = terminal_for_inner_width(18);
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("drawing succeeds");
+
+        for _ in 0..300 {
+            app.scroll_approval(true);
+        }
+
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("drawing succeeds");
+
+        let text = rendered_text(&terminal);
+        assert!(
+            text.contains("END"),
+            "scrolling should not stall on the whitespace between words:\n{text}"
+        );
+        assert!(
+            text.contains("approve"),
+            "and the key legend after them:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_cjk_task_can_be_scrolled_to_its_end_at_two_narrow_widths() {
+        // Every character in this text is two columns wide, which breaks
+        // "a row fills to its last column": a row two columns short of
+        // `width` cannot take one more of these characters, unlike an ASCII
+        // one. Checked at two widths odd and even relative to that.
+        for width in [7u16, 9] {
+            let (mut app, _) = app_with_one_pending();
+            // "END" as its own whitespace-separated word, short enough to
+            // never itself be hard-broken at either width, the way it would
+            // be if appended straight onto the CJK text with nothing to wrap
+            // it away from.
+            let task = format!("{} END", "日本語のテキストです".repeat(50));
+            app.pending.front_mut().expect("set up").task = task;
+
+            let mut terminal = terminal_for_inner_width(width);
+            terminal
+                .draw(|frame| app.draw(frame))
+                .expect("drawing succeeds");
+
+            for _ in 0..1000 {
+                app.scroll_approval(true);
+            }
+
+            terminal
+                .draw(|frame| app.draw(frame))
+                .expect("drawing succeeds");
+
+            let text = rendered_text(&terminal);
+            assert!(
+                text.contains("END"),
+                "scrolling should reach the end at inner width {width}:\n{text}"
+            );
+        }
     }
 
     #[test]

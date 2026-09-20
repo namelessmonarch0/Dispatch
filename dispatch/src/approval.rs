@@ -8,7 +8,6 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
-use unicode_width::UnicodeWidthStr;
 
 /// One request, as the user needs to see it.
 pub struct Approval<'a> {
@@ -89,74 +88,30 @@ impl<'a> Approval<'a> {
             .render(area, buf);
     }
 
-    /// How many rows this prompt needs once wrapped to `width` columns, at
-    /// no scroll — the true total, not an estimate.
+    /// How many rows this prompt needs once wrapped to `width` columns — the
+    /// true total, not an estimate of it.
     ///
     /// A caller clamping how far this can scroll needs this rather than
     /// `task.lines().count()`: `Paragraph::scroll` counts *wrapped* rows, and
     /// a task delivered as a single long line — exactly what `dispatch
     /// delegate "…"` sends — still wraps into several of them once rendered.
     ///
-    /// Found by rendering into a buffer proven tall enough that nothing can
-    /// be clipped, then scanning up for the last painted row. The proof:
-    /// greedy word-wrap places at least one word-fragment on every row it
-    /// emits — a row is only ever broken because the next fragment will not
-    /// fit, and a word wider than `width` is itself split into
-    /// `ceil(word_width / width)` fragments — so one logical line can never
-    /// need more rows than the fragments its own words split into:
-    ///
-    /// `rows(line) <= max(1, sum over words in line of ceil(word_width / width))`
-    ///
-    /// `max(1, …)` covers a blank or whitespace-only line, which has no
-    /// words at all but still occupies a row. Summing that over every line
-    /// this prompt renders — its chrome included, not only the task — gives
-    /// a buffer height that cannot clip, so the scan for the last painted
-    /// row finds the exact total rather than a guess at it.
-    ///
-    /// A word's width is measured with `unicode-width` (pinned to the exact
-    /// version ratatui itself depends on) via the same `UnicodeWidthStr`
-    /// trait `Span::width`/`Line::width` use internally, so a task with wide
-    /// characters or combining marks is bounded the same way this widget
-    /// actually measures it.
+    /// Three attempts at reimplementing that count by hand — a character
+    /// sum, a per-line `div_ceil`, a two-row probe — were each wrong for text
+    /// a test at only one terminal width did not happen to exercise: interior
+    /// whitespace that `Wrap { trim: false }` paints and a plain word count
+    /// discards, multi-column graphemes that break "a row fills to its last
+    /// column," a paragraph break that looks identical to having scrolled
+    /// past the end. `Paragraph::line_count` is not a fourth guess: it drives
+    /// the same `WordWrapper` the render path itself uses, on the same
+    /// `Line`s and the same `Wrap`, so this is what will actually be drawn,
+    /// not a prediction of it.
     #[must_use]
     pub fn total_rows(&self, width: u16) -> u16 {
-        if width == 0 {
-            return 0;
-        }
-
-        let lines = self.lines();
-
-        let bound: usize = lines
-            .iter()
-            .map(|line| {
-                let text: String = line
-                    .spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect();
-                text.split_whitespace()
-                    .map(|word| UnicodeWidthStr::width(word).div_ceil(usize::from(width)))
-                    .sum::<usize>()
-                    .max(1)
-            })
-            .sum();
-        let bound = u16::try_from(bound).unwrap_or(u16::MAX);
-
-        let area = Rect::new(0, 0, width, bound);
-        let mut buf = Buffer::empty(area);
-        // Deliberately unscrolled: this measures the whole content once,
-        // independent of whatever `self.scroll` happens to be right now.
-        Paragraph::new(lines)
+        let count = Paragraph::new(self.lines())
             .wrap(Wrap { trim: false })
-            .render(area, &mut buf);
-
-        // The greatest row that still has anything painted on it.
-        (0..bound)
-            .rev()
-            .find(|&y| {
-                (0..width).any(|x| buf.cell((x, y)).is_some_and(|cell| cell.symbol() != " "))
-            })
-            .map_or(0, |y| y + 1)
+            .line_count(width);
+        u16::try_from(count).unwrap_or(u16::MAX)
     }
 }
 
@@ -169,5 +124,95 @@ impl Widget for Approval<'_> {
         block.render(area, buf);
 
         self.render_content(inner, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approval(task: &str) -> Approval<'_> {
+        Approval {
+            asking: "Claude Code",
+            harness: "claude",
+            project: "dispatch",
+            depth: 0,
+            task,
+            waiting: 0,
+            scroll: 0,
+        }
+    }
+
+    /// The row count found by brute force: render into a buffer generous
+    /// enough that nothing could possibly be clipped, then scan up for the
+    /// last painted row.
+    ///
+    /// An independent check on `total_rows`, not a second implementation of
+    /// it competing to be the one that is right — deliberately wasteful (a
+    /// large fixed buffer) rather than clever, so it has no wrapping
+    /// arithmetic of its own to get wrong.
+    fn brute_force_rows(widget: &Approval<'_>, width: u16) -> u16 {
+        const GENEROUS_HEIGHT: u16 = 4000;
+        let area = Rect::new(0, 0, width, GENEROUS_HEIGHT);
+        let mut buf = Buffer::empty(area);
+        Paragraph::new(widget.lines())
+            .wrap(Wrap { trim: false })
+            .render(area, &mut buf);
+
+        (0..GENEROUS_HEIGHT)
+            .rev()
+            .find(|&y| {
+                (0..width).any(|x| buf.cell((x, y)).is_some_and(|cell| cell.symbol() != " "))
+            })
+            .map_or(0, |y| y + 1)
+    }
+
+    #[test]
+    fn total_rows_agrees_with_a_brute_force_render_across_shapes_and_widths() {
+        // This is the test that would have caught every wrong bound this
+        // widget has had: it does not assert what the right answer *should*
+        // be, only that `total_rows` — whatever it does internally — never
+        // disagrees with what actually gets painted.
+        let long_word = "x".repeat(4000);
+        let ordinary_prose = (0..300)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let paragraphs = (0..8)
+            .map(|n| {
+                (0..20)
+                    .map(|i| format!("p{n}w{i}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let cjk = "日本語のテキストです".repeat(50);
+        let whitespace_line = format!("{}\n   \n{}", "a".repeat(50), "b".repeat(50));
+        let irregular_spacing = (0..40)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(&" ".repeat(25));
+
+        let tasks: [&str; 7] = [
+            "write the tests",
+            &long_word,
+            &ordinary_prose,
+            &paragraphs,
+            &cjk,
+            &whitespace_line,
+            &irregular_spacing,
+        ];
+
+        for task in tasks {
+            let widget = approval(task);
+            for width in [18u16, 20, 30, 74, 76] {
+                assert_eq!(
+                    widget.total_rows(width),
+                    brute_force_rows(&widget, width),
+                    "total_rows disagreed with a brute-force render for {task:?} at width {width}"
+                );
+            }
+        }
     }
 }
