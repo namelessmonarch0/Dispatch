@@ -535,6 +535,11 @@ impl App {
                     self.state.set_pane_status(pane, status).is_ok()
                 }
                 PaneUpdate::Title { title } => self.state.set_pane_title(pane, &title).is_ok(),
+                // A newer daemon's update this build has no name for. The
+                // protocol's promise is that it lands somewhere ignorable
+                // rather than failing the frame and taking the connection with
+                // it, and ignoring it is what that promise means here.
+                PaneUpdate::Unknown => false,
             },
 
             ServerMessage::PaneClosed { pane } => {
@@ -1823,6 +1828,29 @@ mod tests {
         assert_eq!(
             app.state.pane(pane).map(|pane| pane.title.as_str()),
             Some("codex")
+        );
+    }
+
+    #[test]
+    fn an_unknown_pane_update_is_ignored_rather_than_fatal() {
+        // `PaneUpdate` travels inside `PaneChanged`, so a newer daemon's extra
+        // variant must land somewhere ignorable rather than failing the frame
+        // and taking the connection down with it.
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = PaneId::new();
+
+        daemon
+            .send(spawned(pane, project, "claude", None, true))
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        assert!(!app.apply(ServerMessage::PaneChanged {
+            pane,
+            update: PaneUpdate::Unknown,
+        }));
+        assert!(
+            app.state.pane(pane).is_some(),
+            "the pane is untouched by an update this build cannot read"
         );
     }
 

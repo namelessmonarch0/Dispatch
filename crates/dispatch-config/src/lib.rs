@@ -4,6 +4,11 @@ pub mod config;
 pub mod defaults;
 pub mod harness;
 
+/// Shared by this crate's test modules, so there is one temporary-directory
+/// counter rather than one per module.
+#[cfg(test)]
+mod testing;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

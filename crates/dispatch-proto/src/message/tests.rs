@@ -412,6 +412,53 @@ fn an_unknown_client_message_is_skipped_rather_than_fatal() {
 }
 
 #[test]
+fn an_unknown_pane_update_is_skipped_rather_than_fatal() {
+    // `PaneUpdate` travels inside `PaneChanged`, so an unrecognised variant
+    // here fails the enclosing frame — and a client that drops its connection
+    // over a frame it cannot read reconnects and fails on the next one. That
+    // loop is what every `Unknown` in this module exists to prevent.
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum FuturePaneUpdate {
+        Cwd { path: String },
+    }
+
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum FutureServerMessage {
+        PaneChanged {
+            pane: PaneId,
+            update: FuturePaneUpdate,
+        },
+    }
+
+    let pane = PaneId::new();
+    let mut buf = Vec::new();
+    Frame::write(
+        &mut buf,
+        &FutureServerMessage::PaneChanged {
+            pane,
+            update: FuturePaneUpdate::Cwd {
+                path: "/somewhere/new".into(),
+            },
+        },
+    )
+    .expect("writing succeeds");
+
+    let read: ServerMessage =
+        Frame::read(&mut buf.as_slice()).expect("an unknown update must not fail the frame");
+
+    assert_eq!(
+        read,
+        ServerMessage::PaneChanged {
+            pane,
+            update: PaneUpdate::Unknown,
+        },
+        "the frame survives, carrying an update this build can ignore"
+    );
+}
+
+#[test]
 fn a_pane_announced_by_an_older_daemon_is_not_durable() {
     // `durable` decides whether a closed parent keeps its row over this pane,
     // and an older daemon says nothing about it. Not durable is the safe

@@ -204,8 +204,26 @@ fn wait_for(
     what: &str,
     predicate: impl Fn(&[ServerMessage]) -> bool,
 ) -> Vec<ServerMessage> {
+    wait_for_from(client, Vec::new(), what, predicate)
+}
+
+/// Waits for `predicate`, counting `seen` as already having arrived.
+///
+/// A test that polled before calling this has to hand what it got back in, or
+/// the messages it is waiting for are the ones it threw away: polling never
+/// blocks, so whether anything has arrived by then is a race with the reader
+/// thread.
+fn wait_for_from(
+    client: &Client,
+    mut seen: Vec<ServerMessage>,
+    what: &str,
+    predicate: impl Fn(&[ServerMessage]) -> bool,
+) -> Vec<ServerMessage> {
     let deadline = Instant::now() + PATIENCE;
-    let mut seen = Vec::new();
+
+    if predicate(&seen) {
+        return seen;
+    }
 
     while Instant::now() < deadline {
         seen.extend(client.poll());
@@ -315,8 +333,12 @@ fn messages_arrive_without_blocking_the_caller() {
 
     let client = Client::attach("test").expect("attaching succeeds");
 
-    // Polling an empty queue returns nothing rather than waiting.
-    let _ = client.poll();
+    // Polling never blocks, so this returns whatever has arrived so far —
+    // possibly everything the server wrote, since the reader thread is already
+    // running. Kept rather than discarded: thrown away, the two messages this
+    // test is waiting for could be in it, and the wait below would then only
+    // ever see the keepalive traffic.
+    let already = client.poll();
 
     // Keepalive answers are not what this is about, and a slow machine can slip
     // one in between the two messages that are.
@@ -327,7 +349,7 @@ fn messages_arrive_without_blocking_the_caller() {
             .collect()
     };
 
-    let seen = wait_for(&client, "the pane's output and title", |m| {
+    let seen = wait_for_from(&client, already, "the pane's output and title", |m| {
         interesting(m).len() >= 2
     });
     let seen = interesting(&seen);

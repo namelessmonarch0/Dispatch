@@ -2,40 +2,7 @@
 
 use super::*;
 
-/// A temporary directory that cleans itself up.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(label: &str) -> Self {
-        // Counter keeps parallel tests in the same process from colliding.
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-
-        let path = std::env::temp_dir().join(format!(
-            "dispatch-config-{}-{label}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).expect("temp dir is writable");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-
-    fn write(&self, name: &str, contents: &str) -> PathBuf {
-        let path = self.0.join(name);
-        std::fs::write(&path, contents).expect("temp dir is writable");
-        path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use crate::testing::TempDir;
 
 #[test]
 fn every_built_in_parses() {

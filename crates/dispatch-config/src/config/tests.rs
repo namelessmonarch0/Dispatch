@@ -2,42 +2,15 @@
 
 use super::*;
 
-/// A temporary directory that cleans itself up.
-struct TempDir(std::path::PathBuf);
-
-impl TempDir {
-    fn new(label: &str) -> Self {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-
-        let path = std::env::temp_dir().join(format!(
-            "dispatch-config-{}-{label}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).expect("temp dir is writable");
-        Self(path)
-    }
-
-    fn file(&self, contents: &str) -> std::path::PathBuf {
-        let path = self.0.join("config.toml");
-        std::fs::write(&path, contents).expect("temp dir is writable");
-        path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use crate::testing::TempDir;
 
 #[test]
 fn a_missing_file_means_the_defaults() {
     // A fresh install has no config.toml, and must behave like a configured one
     // that changed nothing.
     let dir = TempDir::new("missing");
-    let config = Config::load(&dir.0.join("config.toml")).expect("an absent file is not an error");
+    let config =
+        Config::load(&dir.path().join("config.toml")).expect("an absent file is not an error");
 
     assert_eq!(config, Config::default());
     assert_eq!(config.delegation.max_depth, 1);
@@ -48,7 +21,7 @@ fn a_missing_file_means_the_defaults() {
 #[test]
 fn the_caps_can_be_raised_deliberately() {
     let dir = TempDir::new("raised");
-    let path = dir.file(
+    let path = dir.config(
         r#"
 [delegation]
 max_depth = 2
@@ -66,7 +39,7 @@ request_timeout_secs = 60
 #[test]
 fn a_partly_written_section_keeps_the_other_defaults() {
     let dir = TempDir::new("partial");
-    let path = dir.file("[delegation]\nmax_depth = 2\n");
+    let path = dir.config("[delegation]\nmax_depth = 2\n");
 
     let config = Config::load(&path).expect("the file parses");
     assert_eq!(config.delegation.max_depth, 2);
@@ -81,7 +54,7 @@ fn a_key_this_build_does_not_know_is_kept_and_reported() {
     // A newer daemon's key must not stop an older one starting, and a typo must
     // not be silent.
     let dir = TempDir::new("unknown");
-    let path = dir.file(
+    let path = dir.config(
         r#"
 [delegation]
 max_depth = 1
@@ -101,7 +74,7 @@ max_liv_per_parent = 9
 #[test]
 fn a_broken_file_names_itself() {
     let dir = TempDir::new("broken");
-    let path = dir.file("[delegation\nmax_depth = 1\n");
+    let path = dir.config("[delegation\nmax_depth = 1\n");
 
     let error = Config::load(&path).expect_err("invalid TOML is an error");
     assert!(

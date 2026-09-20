@@ -38,6 +38,13 @@ impl std::fmt::Display for Version {
 }
 
 /// Why a connection was refused or ended.
+///
+/// Externally tagged — the variants carry data of their own and no `tag`
+/// attribute is set — so `#[serde(other)]` does not apply here: serde allows it
+/// only on an internally or adjacently tagged enum. [`ProtocolError::Other`] is
+/// this type's hatch instead: a variant added here would fail an older peer's
+/// whole frame, so a new reason travels as prose in `Other` rather than as a
+/// variant that peer has no name for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum ProtocolError {
     /// The peer speaks a major version this build cannot understand.
@@ -379,6 +386,15 @@ pub enum PaneUpdate {
         /// The new title.
         title: String,
     },
+    /// A change this build does not know.
+    ///
+    /// This enum travels inside [`ServerMessage::PaneChanged`], so without
+    /// somewhere for the unknown to land a newer daemon's extra variant fails
+    /// the whole frame rather than one update — and a client that drops its
+    /// connection over a frame it cannot read reconnects and fails on the next
+    /// one. That loop is what every `Unknown` in this module exists to prevent.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Encodes a byte vector compactly.
