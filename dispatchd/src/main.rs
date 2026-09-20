@@ -77,8 +77,7 @@ fn main() -> Result<()> {
         args.projects
     };
     for project in projects {
-        let root = project
-            .canonicalize()
+        let root = dispatch_os::paths::resolve(&project)
             .with_context(|| format!("no such directory: {}", project.display()))?;
         let id = daemon.open_project(root.clone());
         tracing::info!(project = %id, root = %root.display(), "serving a project");

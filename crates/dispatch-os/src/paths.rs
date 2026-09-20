@@ -1,6 +1,6 @@
 //! Where Dispatch keeps its configuration, data, and logs on each platform.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
 
@@ -92,6 +92,53 @@ pub fn daemon_pid_file() -> Result<PathBuf, PathError> {
     Ok(config_dir()?.join("dispatchd.pid"))
 }
 
+/// Resolves `path` into a form a child process can be started in.
+///
+/// `Path::canonicalize` on Windows returns an extended-length path — `\\?\C:\…`
+/// — and plenty of programs will not accept one as a working directory.
+/// `cmd.exe` prints "UNC paths are not supported. Defaulting to Windows
+/// directory." and starts somewhere else entirely, so an agent launched in a
+/// project would run outside it. Every project root goes through here.
+pub fn resolve(path: &Path) -> std::io::Result<PathBuf> {
+    let resolved = path.canonicalize()?;
+
+    match resolved.to_str().and_then(shorten_windows_path) {
+        Some(shortened) => Ok(PathBuf::from(shortened)),
+        None => Ok(resolved),
+    }
+}
+
+/// Longest path a Windows program can be expected to handle unprefixed.
+const MAX_PATH: usize = 260;
+
+/// Removes the extended-length prefix from a Windows path, where it can go.
+///
+/// Returns `None` for a path that has to keep its prefix, and for anything that
+/// never had one — including every Unix path. Not behind a `#[cfg]`, because
+/// the rules are fiddly enough to want testing on the platform the tests
+/// actually run on.
+fn shorten_windows_path(text: &str) -> Option<String> {
+    let shortened = if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+        // `\\?\UNC\server\share` is the verbatim spelling of `\\server\share`.
+        format!(r"\\{share}")
+    } else {
+        let rest = text.strip_prefix(r"\\?\")?;
+
+        // Only a drive path can simply lose the prefix. Anything else — a
+        // device path, say — means something different without it.
+        let mut characters = rest.chars();
+        if !characters.next()?.is_ascii_alphabetic() || characters.next() != Some(':') {
+            return None;
+        }
+
+        rest.to_string()
+    };
+
+    // Past this length the prefix is the only thing making the path usable at
+    // all, so a program that dislikes the spelling is the lesser problem.
+    (shortened.len() < MAX_PATH).then_some(shortened)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +173,44 @@ mod tests {
         ] {
             assert!(path.is_absolute(), "{} is not absolute", path.display());
         }
+    }
+
+    #[test]
+    fn a_windows_drive_path_loses_its_extended_length_prefix() {
+        // The reason this exists: cmd.exe refuses one as a working directory,
+        // and silently starts in the Windows directory instead.
+        assert_eq!(
+            shorten_windows_path(r"\\?\C:\Users\runneradmin\project").as_deref(),
+            Some(r"C:\Users\runneradmin\project")
+        );
+    }
+
+    #[test]
+    fn a_windows_share_is_written_the_way_programs_expect() {
+        assert_eq!(
+            shorten_windows_path(r"\\?\UNC\build\share\project").as_deref(),
+            Some(r"\\build\share\project")
+        );
+    }
+
+    #[test]
+    fn a_path_too_long_to_work_unprefixed_keeps_its_prefix() {
+        // Removing it would turn a usable path into an unusable one, which is
+        // worse than a program that dislikes the spelling.
+        let long = format!(r"\\?\C:\{}", "d".repeat(MAX_PATH));
+        assert_eq!(shorten_windows_path(&long), None);
+    }
+
+    #[test]
+    fn a_verbatim_path_that_is_not_a_drive_keeps_its_prefix() {
+        // `\\?\pipe\name` is not `pipe\name`.
+        assert_eq!(shorten_windows_path(r"\\?\pipe\dispatchd"), None);
+    }
+
+    #[test]
+    fn a_path_with_no_prefix_is_left_alone() {
+        assert_eq!(shorten_windows_path("/Users/someone/project"), None);
+        assert_eq!(shorten_windows_path(r"C:\Users\someone\project"), None);
     }
 
     #[test]

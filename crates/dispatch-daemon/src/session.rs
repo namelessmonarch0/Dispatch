@@ -502,8 +502,10 @@ impl Daemon {
     fn open_project_for(&mut self, client: ClientId, root: PathBuf) {
         // Resolved here rather than on the client: the client may be on another
         // machine, and a relative or symlinked path has to mean the same thing
-        // to every client looking at this project.
-        let resolved = match root.canonicalize() {
+        // to every client looking at this project. `resolve` rather than
+        // `canonicalize` because this becomes a pane's working directory, and
+        // Windows' extended-length spelling is one some programs refuse.
+        let resolved = match dispatch_os::paths::resolve(&root) {
             Ok(resolved) if resolved.is_dir() => resolved,
             Ok(resolved) => {
                 self.send(

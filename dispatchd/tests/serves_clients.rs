@@ -154,6 +154,26 @@ fn wait_for(
     panic!("timed out waiting for {what}; saw {seen:#?}");
 }
 
+/// Lines to type at a pane's shell so that its answer proves the shell ran them.
+///
+/// A terminal echoes what is typed, so a line containing the marker it looks for
+/// would prove nothing. A POSIX shell can compute the marker in one line; a
+/// `cmd.exe` expansion has no arithmetic, so it sets a variable on one line and
+/// expands it on the next — which it can only do having run the first.
+///
+/// Submitted with a carriage return, which is what a key press sends, and what
+/// ConPTY needs.
+fn prove_the_shell_ran(marker: &str) -> Vec<Vec<u8>> {
+    if cfg!(windows) {
+        vec![
+            b"set answer=42\r".to_vec(),
+            format!("echo {marker}-%answer%\r").into_bytes(),
+        ]
+    } else {
+        vec![format!("echo {marker}-$((6*7))\r").into_bytes()]
+    }
+}
+
 /// Connects, says hello, and subscribes, returning the queue and the writer.
 fn attach() -> (Receiver<ServerMessage>, impl std::io::Write) {
     attach_as(dispatch_proto::Role::Interface)
@@ -244,14 +264,10 @@ fn a_second_connection_is_replayed_what_a_pane_printed() {
         })
         .expect("checked by wait_for");
 
-    Frame::write(
-        &mut writer,
-        &ClientMessage::WritePane {
-            pane,
-            bytes: b"echo remembered-$((6*7))\n".to_vec(),
-        },
-    )
-    .expect("writing succeeds");
+    for line in prove_the_shell_ran("remembered") {
+        Frame::write(&mut writer, &ClientMessage::WritePane { pane, bytes: line })
+            .expect("writing succeeds");
+    }
     wait_for(&inbox, "the pane's output", |m| {
         output_of(m, pane).contains("remembered-42")
     });
@@ -343,17 +359,13 @@ fn a_client_drives_a_pane_through_the_socket() {
         })
         .expect("checked by wait_for");
 
-    // The arithmetic is the point: the shell has to have run the line for the
-    // answer to appear, so this proves the whole path rather than an echo of
-    // what was typed.
-    Frame::write(
-        &mut writer,
-        &ClientMessage::WritePane {
-            pane,
-            bytes: b"echo alive-$((6*7))\n".to_vec(),
-        },
-    )
-    .expect("writing succeeds");
+    // The marker is computed, not typed: the shell has to have run the line for
+    // the answer to appear, so this proves the whole path rather than an echo of
+    // what was sent.
+    for line in prove_the_shell_ran("alive") {
+        Frame::write(&mut writer, &ClientMessage::WritePane { pane, bytes: line })
+            .expect("writing succeeds");
+    }
 
     wait_for(&inbox, "the pane's output", |messages| {
         let output: Vec<u8> = messages
@@ -430,7 +442,7 @@ fn a_delegate_caller_and_an_interface_client_share_one_daemon() {
         &mut ui_writer,
         &ClientMessage::WritePane {
             pane: parent,
-            bytes: b"echo history\n".to_vec(),
+            bytes: b"echo history\r".to_vec(),
         },
     )
     .expect("writing succeeds");
@@ -468,7 +480,10 @@ fn a_delegate_caller_and_an_interface_client_share_one_daemon() {
         &ClientMessage::DelegateRequest {
             parent,
             harness: "shell".into(),
-            task: "echo delegated-$((6*7))".into(),
+            // No arithmetic needed here: a one-shot task runs under `-c` or
+            // `/c`, which does not echo the command, so a literal marker in the
+            // tail can only have come from the subagent running.
+            task: "echo delegated-42".into(),
             size: (80, 24),
         },
     )

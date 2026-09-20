@@ -124,8 +124,7 @@ fn main() -> Result<ExitCode> {
     let roots: Vec<PathBuf> = projects
         .iter()
         .map(|project| {
-            project
-                .canonicalize()
+            dispatch_os::paths::resolve(project)
                 .with_context(|| format!("no such directory: {}", project.display()))
         })
         .collect::<Result<_>>()?;
