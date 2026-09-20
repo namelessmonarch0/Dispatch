@@ -7,6 +7,7 @@
 
 use super::*;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use dispatch_os::ipc::Listener;
@@ -105,6 +106,41 @@ impl Heard {
     }
 }
 
+/// A running fake server, which stops listening when it is dropped.
+///
+/// Two of these run in one test, standing in for a daemon that restarted. A
+/// server that stayed bound would make the next `Listener::bind` refuse, and a
+/// listener parked in `accept` cannot be dropped from outside — so the loop is
+/// asked to stand down and then woken by one connection of its own.
+///
+/// Before this existed the second bind only worked where the platform happened
+/// to refuse a connection to the first listener, which macOS does and Linux does
+/// not.
+struct Server {
+    heard: Heard,
+    stopped: Arc<AtomicBool>,
+    endpoint: PathBuf,
+}
+
+impl Server {
+    fn snapshot(&self) -> Vec<ClientMessage> {
+        self.heard.snapshot()
+    }
+
+    fn contains(&self, message: &ClientMessage) -> bool {
+        self.heard.contains(message)
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        // The loop is parked in `accept`; one connection wakes it, and it
+        // checks the flag before serving anyone.
+        let _ = dispatch_os::ipc::Connection::connect_to(&self.endpoint);
+    }
+}
+
 /// Accepts clients, answers each handshake with `answer`, and runs `serve` for
 /// the first one.
 ///
@@ -118,16 +154,27 @@ fn serve_one(
     answer: ServerMessage,
     serve: impl FnOnce(&mut Writer) + Send + 'static,
     after: After,
-) -> Heard {
+) -> Server {
     let listener = Listener::bind().expect("binding succeeds");
+    let endpoint = dispatch_os::ipc::endpoint().expect("the endpoint resolves");
     let heard = Heard::new();
     let recording = heard.clone();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let standing_down = Arc::clone(&stopped);
 
     type Once = Arc<Mutex<Option<Box<dyn FnOnce(&mut Writer) + Send>>>>;
     let serve: Once = Arc::new(Mutex::new(Some(Box::new(serve))));
 
     std::thread::spawn(move || {
-        while let Ok(connection) = listener.accept() {
+        loop {
+            let Ok(connection) = listener.accept() else {
+                break;
+            };
+
+            if standing_down.load(Ordering::Relaxed) {
+                break;
+            }
+
             let recording = recording.clone();
             let answer = answer.clone();
             let serve = Arc::clone(&serve);
@@ -175,13 +222,22 @@ fn serve_one(
                 // The daemon is gone, endpoint included: a test that starts a
                 // second one needs this listener out of the way, or binding
                 // finds this one still answering.
+                //
+                // Released before the handler is waited on, not after: a
+                // handler that never finishes must not hold the endpoint
+                // hostage as well.
+                drop(listener);
                 let _ = handler.join();
                 return;
             }
         }
     });
 
-    heard
+    Server {
+        heard,
+        stopped,
+        endpoint,
+    }
 }
 
 /// Waits for `condition`, returning whether it held before the deadline.
@@ -389,7 +445,7 @@ fn a_daemon_that_comes_back_is_reconnected_to() {
     let _endpoint = Endpoint::new("again");
 
     // The first daemon welcomes the client and hangs up, as a restart would.
-    let _first = serve_one(welcome(), |_| {}, After::HangUp);
+    let first = serve_one(welcome(), |_| {}, After::HangUp);
     let client = Client::attach("test").expect("attaching succeeds");
     client.subscribe();
 
@@ -398,7 +454,9 @@ fn a_daemon_that_comes_back_is_reconnected_to() {
         "the client should notice the daemon going away"
     );
 
-    // A second daemon takes the endpoint, as a restarted one would.
+    // A second daemon takes the endpoint, as a restarted one would. The first
+    // has to let go of it first, and saying so beats relying on it.
+    drop(first);
     let pane = dispatch_core::PaneId::new();
     let heard = serve_one(
         welcome(),
@@ -444,7 +502,7 @@ fn a_handle_taken_before_a_reconnection_still_works_after_one() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _endpoint = Endpoint::new("handle");
 
-    let _first = serve_one(welcome(), |_| {}, After::HangUp);
+    let first = serve_one(welcome(), |_| {}, After::HangUp);
     let client = Client::attach("test").expect("attaching succeeds");
     let handle = client.handle();
 
@@ -454,6 +512,7 @@ fn a_handle_taken_before_a_reconnection_still_works_after_one() {
     );
 
     let pane = dispatch_core::PaneId::new();
+    drop(first);
     let heard = serve_one(welcome(), |_| {}, After::Answer);
 
     assert!(

@@ -265,14 +265,15 @@ mod imp {
     use std::sync::Mutex;
 
     use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+        ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY,
+        ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
     };
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
-        PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
+        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
 
     use super::IpcError;
@@ -442,18 +443,38 @@ mod imp {
 
         let handle = *pending;
 
-        // SAFETY: `handle` is a live pipe instance held by this listener.
-        let connected = unsafe { ConnectNamedPipe(handle as HANDLE, std::ptr::null_mut()) };
+        loop {
+            // SAFETY: `handle` is a live pipe instance held by this listener.
+            let connected = unsafe { ConnectNamedPipe(handle as HANDLE, std::ptr::null_mut()) };
 
-        if connected == 0 {
+            if connected != 0 {
+                break;
+            }
+
             let error = std::io::Error::last_os_error();
-            // A client that connected between creation and this call has
-            // already succeeded; that is not a failure.
-            if error.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
-                return Err(IpcError::io(
-                    format!("accepting on {}", listener.name),
-                    error,
-                ));
+            match error.raw_os_error() {
+                // A client that connected between creation and this call has
+                // already succeeded; that is not a failure.
+                Some(code) if code == ERROR_PIPE_CONNECTED as i32 => break,
+
+                // A client that connected and closed again before this call.
+                // Dispatch does this on purpose: every "is a daemon there?"
+                // probe connects and drops. The instance has to be
+                // disconnected before it will serve anyone else, and then it is
+                // as good as new -- so this is not an error to report, it is
+                // the next client's turn.
+                Some(code) if code == ERROR_NO_DATA as i32 || code == ERROR_BROKEN_PIPE as i32 => {
+                    // SAFETY: as above; the instance is this listener's and is
+                    // being returned to the unconnected state, not closed.
+                    unsafe { DisconnectNamedPipe(handle as HANDLE) };
+                }
+
+                _ => {
+                    return Err(IpcError::io(
+                        format!("accepting on {}", listener.name),
+                        error,
+                    ));
+                }
             }
         }
 
