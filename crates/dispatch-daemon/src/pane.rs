@@ -37,6 +37,12 @@ pub struct DaemonPane {
     pub request: Option<dispatch_core::RequestId>,
     /// Which client is waiting, so its disappearance can end a one-off pane.
     pub caller: Option<u64>,
+    /// When the process was seen to exit, if it has.
+    ///
+    /// The exit and the last of the output are separate events, so a caller
+    /// waiting on this pane's output cannot be answered at the exit. This is how
+    /// long that wait has lasted.
+    pub exited_at: Option<std::time::Instant>,
 }
 
 impl DaemonPane {

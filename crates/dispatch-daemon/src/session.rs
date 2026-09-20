@@ -31,6 +31,15 @@ const TAIL_BYTES: usize = 8 * 1024;
 /// output reaches a client.
 const TICK: Duration = Duration::from_millis(8);
 
+/// How long a subagent's output may go on arriving after its process exited.
+///
+/// A pane's exit and the end of its output are separate events, so a caller
+/// waiting on the output is answered once the pseudoterminal is finished, not
+/// once the process is gone. That can never come — a grandchild holding the
+/// pseudoterminal open keeps it from ever reaching end-of-file — so the caller
+/// is answered anyway after this, with whatever arrived.
+const TAIL_GRACE: Duration = Duration::from_millis(250);
+
 /// Failures starting or running the daemon.
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -593,6 +602,7 @@ impl Daemon {
             durable: true,
             request: None,
             caller: None,
+            exited_at: None,
         };
         // Announced from the pane's own field rather than repeated here: what a
         // client draws has to be what the daemon is holding.
@@ -845,6 +855,7 @@ impl Daemon {
                 durable,
                 request: Some(request),
                 caller: Some(caller),
+                exited_at: None,
             },
         );
 
@@ -1085,6 +1096,7 @@ impl Daemon {
                 && pane.status.is_live()
             {
                 pane.status = PaneStatus::Exited(code);
+                pane.exited_at = Some(Instant::now());
                 exited.push((*id, code));
             }
         }
@@ -1104,12 +1116,26 @@ impl Daemon {
             self.broadcast(message);
         }
 
-        // A subagent's caller is waiting on exactly this.
+        // A subagent's caller is waiting on exactly this. Not answered on the
+        // tick the exit is noticed: the output is still arriving then, and a
+        // tail taken at the exit is the subagent's answer with the answer
+        // missing. Whether that shows depends on the platform, which is the
+        // worst kind of depends -- ConPTY's pipe lags the process object, so on
+        // Windows it is the ordinary case rather than a race seen once.
         let mut answers = Vec::new();
-        for (id, code) in &exited {
-            let Some(pane) = self.panes.get_mut(id) else {
+        for pane in self.panes.values_mut() {
+            let RunState::Exited(code) = pane.session.state() else {
                 continue;
             };
+
+            let waited_long_enough = pane.session.is_finished()
+                || pane
+                    .exited_at
+                    .is_some_and(|exited| exited.elapsed() >= TAIL_GRACE);
+
+            if !waited_long_enough {
+                continue;
+            }
 
             if let (Some(request), Some(caller)) = (pane.request.take(), pane.caller) {
                 let start = pane.history.len().saturating_sub(TAIL_BYTES);
@@ -1117,7 +1143,7 @@ impl Daemon {
                     caller,
                     ServerMessage::DelegateFinished {
                         request,
-                        exit: *code,
+                        exit: code,
                         tail: pane.history[start..].to_vec(),
                     },
                 ));

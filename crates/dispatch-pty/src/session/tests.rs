@@ -320,3 +320,35 @@ fn a_session_stops_asking_for_redraws_once_a_pane_has_exited() {
     );
     assert!(!session.drain(), "and it stays that way");
 }
+
+#[test]
+fn a_pty_is_not_finished_until_its_output_has_been_delivered() {
+    // The exit and the output are separate events. Answering a delegation at
+    // the exit sends a tail with none of the subagent's output in it, which is
+    // what happens on Windows, where ConPTY's pipe lags the process object.
+    let mut pty = Pty::spawn(&shell("echo finished-marker"), &cwd(), Size::new(80, 24))
+        .expect("spawning succeeds");
+
+    let mut output = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+
+    while std::time::Instant::now() < deadline && !pty.is_finished() {
+        output.extend_from_slice(&pty.drain());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        pty.is_finished(),
+        "the pseudoterminal should reach end-of-file once the child is gone"
+    );
+    assert!(
+        matches!(pty.state(), RunState::Exited(0)),
+        "got {:?}",
+        pty.state()
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("finished-marker"),
+        "everything the child printed should have arrived by then, got {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}

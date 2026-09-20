@@ -68,7 +68,7 @@ fn daemon(label: &str) -> (Daemon, ProjectId, TempDir) {
     let registry = harnesses(&dir.0.join("harnesses"));
 
     let mut daemon = Daemon::new(registry, "test-device");
-    let root = dir.0.canonicalize().expect("the temp dir resolves");
+    let root = dispatch_os::paths::resolve(&dir.0).expect("the temp dir resolves");
     let project = daemon.open_project(root);
 
     (daemon, project, dir)
@@ -631,7 +631,7 @@ fn reopening_a_root_keeps_one_project() {
     // Two sidebar entries for one checkout would be a bug the user has to
     // untangle by hand.
     let (mut daemon, project, dir) = daemon("reopen");
-    let root = dir.0.canonicalize().expect("the temp dir resolves");
+    let root = dispatch_os::paths::resolve(&dir.0).expect("the temp dir resolves");
 
     assert_eq!(daemon.open_project(root), project);
     assert_eq!(daemon.projects().len(), 1);
@@ -707,7 +707,7 @@ fn opening_a_project_tells_every_subscriber() {
     assert_eq!(project.name, "nested");
     assert_eq!(
         project.root,
-        nested.canonicalize().expect("the nested dir resolves"),
+        dispatch_os::paths::resolve(&nested).expect("the nested dir resolves"),
         "the daemon resolves the path it was given"
     );
     assert_eq!(daemon.projects().len(), 2);
@@ -922,7 +922,7 @@ fn daemon_with_limits(label: &str, limits: DelegationLimits) -> (Daemon, Project
     let registry = harnesses(&dir.0.join("harnesses"));
 
     let mut daemon = Daemon::with_limits(registry, "test-device", limits);
-    let root = dir.0.canonicalize().expect("the temp dir resolves");
+    let root = dispatch_os::paths::resolve(&dir.0).expect("the temp dir resolves");
     let project = daemon.open_project(root);
 
     (daemon, project, dir)

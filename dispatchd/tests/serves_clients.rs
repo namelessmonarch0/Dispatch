@@ -332,9 +332,7 @@ fn a_client_drives_a_pane_through_the_socket() {
         .expect("checked by wait_for");
     assert_eq!(
         project.root,
-        project_dir
-            .canonicalize()
-            .expect("the project dir resolves")
+        dispatch_os::paths::resolve(&project_dir).expect("the project dir resolves")
     );
 
     Frame::write(

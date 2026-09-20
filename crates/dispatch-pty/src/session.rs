@@ -79,6 +79,8 @@ pub struct Pty {
     /// Process id of the child, used to terminate its whole tree.
     pid: Option<u32>,
     state: RunState,
+    /// Whether everything the child printed has been delivered.
+    finished: bool,
 }
 
 impl std::fmt::Debug for Pty {
@@ -159,6 +161,7 @@ impl Pty {
             size,
             pid,
             state: RunState::Running,
+            finished: false,
         })
     }
 
@@ -172,13 +175,28 @@ impl Pty {
             match self.events.try_recv() {
                 Ok(PtyEvent::Output(bytes)) => output.extend_from_slice(&bytes),
                 Ok(PtyEvent::Exited(code)) => self.state = RunState::Exited(code),
-                // Both senders are gone, which only happens once the child has
-                // exited and its output has been delivered.
-                Err(TryRecvError::Disconnected | TryRecvError::Empty) => break,
+                Err(TryRecvError::Empty) => break,
+                // Both senders are gone, which happens only once the reader has
+                // reached end-of-file and the waiter has reported the exit.
+                Err(TryRecvError::Disconnected) => {
+                    self.finished = true;
+                    break;
+                }
             }
         }
 
         output
+    }
+
+    /// Whether the child exited *and* everything it printed has been delivered.
+    ///
+    /// [`Pty::state`] answers a different question. The reader and the waiter
+    /// are separate threads, so an exit can be reported while output is still in
+    /// flight — on Windows that is the ordinary case, because ConPTY's pipe lags
+    /// the process object. Anything that reads a child's whole output has to
+    /// wait for this, not for the exit.
+    pub fn is_finished(&self) -> bool {
+        self.finished
     }
 
     /// Waits for the child to exit, collecting what it prints.
