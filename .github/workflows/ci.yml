@@ -13,6 +13,10 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # A hung test must cost minutes, not the six-hour default: this suite drives
+    # real processes over a real socket, and one that never answers used to take
+    # the whole job with it.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

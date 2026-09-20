@@ -91,6 +91,12 @@ impl Drop for Config {
     }
 }
 
+/// How long a `dispatch delegate` call gets before a test gives up on it.
+///
+/// Generously more than any of these tests needs, and far less than the shim's
+/// own twenty-four hour backstop, which exists for a human who may be at lunch.
+const SHIM_PATIENCE: Duration = Duration::from_secs(60);
+
 /// A running `dispatchd`, killed when the test ends however it ends.
 struct Daemon(std::process::Child, PathBuf);
 
@@ -314,7 +320,28 @@ fn run_delegate_shim(
         command.arg("--harness").arg(harness);
     }
 
-    let child = command.spawn().expect("the dispatch binary can be started");
+    let mut child = command.spawn().expect("the dispatch binary can be started");
+
+    // Bounded, because the shim's own backstop is twenty-four hours: it is built
+    // to wait for a person, and a person is not coming. An unbounded wait here
+    // turned a Windows transport failure into a CI job that ran for an hour
+    // before anyone noticed, and would have run until the six-hour limit.
+    let deadline = Instant::now() + SHIM_PATIENCE;
+    loop {
+        match child.try_wait().expect("the shim can be waited on") {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let output = child.wait_with_output().expect("the shim can be waited on");
+                panic!(
+                    "the shim never exited within {SHIM_PATIENCE:?}; stderr was {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+
     child.wait_with_output().expect("the shim can be waited on")
 }
 
