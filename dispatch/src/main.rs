@@ -1,10 +1,13 @@
 //! Dispatch: an agent orchestration TUI.
 
 mod app;
+mod approval;
 mod backend;
+mod delegate;
 mod terminal;
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -42,11 +45,61 @@ struct Args {
     /// listening.
     #[arg(long, requires = "attach")]
     no_start: bool,
+
+    /// Subcommands. Absent means run the interface.
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
-fn main() -> Result<()> {
+/// What to do instead of drawing an interface.
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// Ask Dispatch to run one task in a second agent, and wait for it.
+    ///
+    /// Runs inside a Dispatch pane. Prints the subagent's output on stdout and
+    /// progress on stderr, and exits with the subagent's own status: 69 when no
+    /// daemon is listening, 75 when the request timed out or the connection
+    /// dropped or the daemon does not know the asking pane or its subagent was
+    /// killed before it could exit, 77 when it was denied, 78 when it was
+    /// refused.
+    Delegate {
+        /// Which harness to run. Defaults to this pane's own.
+        #[arg(long)]
+        harness: Option<String>,
+
+        /// Size to start the subagent at, as COLSxROWS.
+        #[arg(long, default_value = "80x24", value_parser = parse_size)]
+        size: (u16, u16),
+
+        /// What the subagent should do.
+        task: String,
+    },
+}
+
+/// Parses `COLSxROWS`.
+fn parse_size(text: &str) -> Result<(u16, u16), String> {
+    let (cols, rows) = text
+        .split_once(['x', 'X'])
+        .ok_or_else(|| format!("expected COLSxROWS, got {text:?}"))?;
+
+    Ok((
+        cols.parse().map_err(|_| format!("bad width {cols:?}"))?,
+        rows.parse().map_err(|_| format!("bad height {rows:?}"))?,
+    ))
+}
+
+fn main() -> Result<ExitCode> {
     let args = Args::parse();
     init_logging(args.log_file.clone())?;
+
+    if let Some(Command::Delegate {
+        harness,
+        size,
+        task,
+    }) = args.command
+    {
+        return delegate::run(harness, size, &task);
+    }
 
     // Written on first run and never overwritten, so local edits survive.
     let harness_dir =
@@ -96,7 +149,8 @@ fn main() -> Result<()> {
     install_panic_hook();
     let mut guard = TerminalGuard::acquire()?;
 
-    run(&mut app, &mut guard)
+    run(&mut app, &mut guard)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Attaches to a daemon, starting one if nothing is listening.

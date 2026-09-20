@@ -22,6 +22,9 @@ id = "aaashell"
 display_name = "Test Shell"
 command = "sh"
 args = []
+
+[task]
+args = ["-c", "{task}"]
 "#;
 
 /// A running Dispatch, its screen, and the ability to type at it.
@@ -822,5 +825,64 @@ fn no_start_refuses_rather_than_starting_a_daemon() {
     assert!(
         !fixture.config.path().join("dispatchd.pid").is_file(),
         "and no daemon should have been started"
+    );
+}
+
+#[test]
+fn a_delegation_is_approved_by_hand_and_its_output_comes_back() {
+    // The whole product promise in one test: an agent asks, a person says yes,
+    // a second agent runs, and the first one reads the result.
+    let fixture = Fixture::new("d7");
+    let _daemon = Daemon::start(&fixture);
+    let mut dispatch = Harness::attached(&fixture, Size::new(100, 30));
+
+    assert!(dispatch.wait_for(|lines| contains(lines, "project")));
+    dispatch.spawn_shell();
+    assert!(
+        dispatch.wait_for(|lines| contains(lines, "$")),
+        "the parent shell should be ready"
+    );
+
+    dispatch.send(b"dispatch delegate \"echo delegated-$((6*7))\"\r");
+
+    assert!(
+        dispatch.wait_for(|lines| contains(lines, "wants to delegate")),
+        "the approval prompt should open"
+    );
+    dispatch.send(b"a");
+
+    assert!(
+        dispatch.wait_for(|lines| sidebar_panes(lines) == 2),
+        "the subagent should be listed under its parent"
+    );
+    assert!(
+        dispatch.wait_for(|lines| contains(lines, "delegated-42")),
+        "the parent pane should receive the subagent's output"
+    );
+}
+
+#[test]
+fn a_denied_delegation_runs_nothing_and_says_so() {
+    let fixture = Fixture::new("d8");
+    let _daemon = Daemon::start(&fixture);
+    let mut dispatch = Harness::attached(&fixture, Size::new(100, 30));
+
+    assert!(dispatch.wait_for(|lines| contains(lines, "project")));
+    dispatch.spawn_shell();
+    assert!(dispatch.wait_for(|lines| contains(lines, "$")));
+
+    dispatch.send(b"dispatch delegate \"echo never-run\"\r");
+    assert!(dispatch.wait_for(|lines| contains(lines, "wants to delegate")));
+
+    dispatch.send(b"d");
+
+    assert!(
+        dispatch.wait_for(|lines| contains(lines, "denied")),
+        "the agent should be told, in its own pane"
+    );
+    assert_eq!(
+        sidebar_panes(&dispatch.lines()),
+        1,
+        "and nothing should have been started"
     );
 }

@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dispatch_os::ipc::{Connection, IpcError};
-use dispatch_proto::{ClientMessage, Frame, ProtocolError, ServerMessage};
+use dispatch_proto::{ClientMessage, Frame, ProtocolError, Role, ServerMessage};
 
 /// How long to wait before the first reconnection attempt.
 const FIRST_RETRY: Duration = Duration::from_millis(100);
@@ -112,6 +112,11 @@ struct Wire {
     device: Mutex<String>,
     /// What this client calls itself, for the daemon's log.
     name: String,
+    /// What the connection is for, re-announced on every reconnection so a
+    /// delegate caller that reconnects does not come back as an interface —
+    /// which would start the fleet's output flowing to a call that only waits
+    /// on one request.
+    role: Role,
     /// The endpoint first reached, which every reconnection uses.
     endpoint: PathBuf,
     /// When anything last arrived, for deciding a silent socket is dead.
@@ -218,7 +223,7 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
-    /// Connects and shakes hands.
+    /// Connects and shakes hands as an interface client.
     ///
     /// `name` is what the daemon logs this client as. Attaching does not ask
     /// for pane events; call [`Client::subscribe`] for those.
@@ -226,17 +231,33 @@ impl Client {
     /// Failing here means no daemon answered now. Once attached, a connection
     /// that breaks is reconnected to rather than reported as an error.
     pub fn attach(name: &str) -> Result<Self, ClientError> {
-        Self::attach_with(name, Liveness::default())
+        Self::attach_as(Role::Interface, name)
     }
 
-    /// Connects and shakes hands, with something other than the usual patience
-    /// for silence.
+    /// Connects and shakes hands as an interface client, with something other
+    /// than the usual patience for silence.
     ///
     /// Exists for tests, which cannot wait the tens of seconds a real client
     /// should wait before declaring a quiet daemon dead.
     pub fn attach_with(name: &str, liveness: Liveness) -> Result<Self, ClientError> {
+        Self::attach_with_as(Role::Interface, name, liveness)
+    }
+
+    /// Connects and shakes hands as the given role.
+    ///
+    /// A `dispatch delegate` call attaches as [`Role::Delegate`] so it is
+    /// spared the fleet's output: an interface draws every pane, but a call
+    /// waiting on one request would only have to filter that firehose back
+    /// out.
+    pub fn attach_as(role: Role, name: &str) -> Result<Self, ClientError> {
+        Self::attach_with_as(role, name, Liveness::default())
+    }
+
+    /// Connects and shakes hands as the given role, with something other than
+    /// the usual patience for silence.
+    pub fn attach_with_as(role: Role, name: &str, liveness: Liveness) -> Result<Self, ClientError> {
         let endpoint = dispatch_os::ipc::endpoint()?;
-        let (reader, writer, device) = connect_within(name, &endpoint, HANDSHAKE_TIMEOUT)?;
+        let (reader, writer, device) = connect_within(name, role, &endpoint, HANDSHAKE_TIMEOUT)?;
 
         let wire = Arc::new(Wire {
             writer: Mutex::new(Some(writer)),
@@ -246,6 +267,7 @@ impl Client {
             closed: AtomicBool::new(false),
             device: Mutex::new(device),
             name: name.to_string(),
+            role,
             endpoint,
             last_heard: Mutex::new(Instant::now()),
             last_asked: Mutex::new(Instant::now()),
@@ -338,6 +360,7 @@ type Connected = (Box<dyn Read + Send>, Box<dyn Write + Send>, String);
 /// closes — rather than the client's ability to connect at all.
 fn connect_within(
     name: &str,
+    role: Role,
     endpoint: &Path,
     patience: Duration,
 ) -> Result<Connected, ClientError> {
@@ -346,7 +369,7 @@ fn connect_within(
     let endpoint = endpoint.to_path_buf();
 
     std::thread::spawn(move || {
-        let _ = done.send(connect(&name, &endpoint));
+        let _ = done.send(connect(&name, role, &endpoint));
     });
 
     match answer.recv_timeout(patience) {
@@ -358,7 +381,7 @@ fn connect_within(
 }
 
 /// Connects and shakes hands, returning the two halves and the daemon's name.
-fn connect(name: &str, endpoint: &Path) -> Result<Connected, ClientError> {
+fn connect(name: &str, role: Role, endpoint: &Path) -> Result<Connected, ClientError> {
     let connection = match Connection::connect_to(endpoint) {
         Ok(connection) => connection,
         Err(IpcError::NotRunning(_)) => {
@@ -374,6 +397,7 @@ fn connect(name: &str, endpoint: &Path) -> Result<Connected, ClientError> {
         &ClientMessage::Hello {
             version: dispatch_proto::VERSION,
             client: name.to_string(),
+            role,
         },
     )
     .map_err(|e| ClientError::Handshake(e.to_string()))?;
@@ -455,7 +479,7 @@ fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
             std::thread::sleep(backoff);
             backoff = (backoff * 2).min(MAX_RETRY);
 
-            match connect_within(&wire.name, &wire.endpoint, HANDSHAKE_TIMEOUT) {
+            match connect_within(&wire.name, wire.role, &wire.endpoint, HANDSHAKE_TIMEOUT) {
                 Ok((reader, writer, device)) => {
                     *wire.device.lock().unwrap_or_else(|e| e.into_inner()) = device;
                     *wire.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(writer);
@@ -515,6 +539,55 @@ fn check_liveness(wire: &Wire) {
     wire.write(&ClientMessage::Ping {
         token: u64::try_from(quiet.as_millis()).unwrap_or(u64::MAX),
     });
+}
+
+/// Lets a test drive an interface's message path without a daemon.
+impl Client {
+    /// Creates a client with no socket behind it.
+    ///
+    /// The returned sender delivers what a daemon would have said, and the
+    /// receiver collects what the client would have sent. No thread is started,
+    /// so nothing reconnects and nothing is written anywhere: what is under
+    /// test with one of these is what an interface *does* with the daemon's
+    /// messages, which is otherwise only reachable by standing a real daemon on
+    /// a real socket up around it.
+    ///
+    /// Reported as connected, because a client that says the daemon is gone
+    /// would have every caller drawing a disconnect notice instead.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_test() -> (Self, Sender<ServerMessage>, Receiver<ClientMessage>) {
+        let wire = Arc::new(Wire {
+            writer: Mutex::new(None),
+            connected: AtomicBool::new(true),
+            generation: AtomicU64::new(1),
+            subscribed: AtomicBool::new(false),
+            closed: AtomicBool::new(true),
+            device: Mutex::new("test-device".to_string()),
+            name: "test".to_string(),
+            role: Role::Interface,
+            endpoint: PathBuf::new(),
+            last_heard: Mutex::new(Instant::now()),
+            last_asked: Mutex::new(Instant::now()),
+            liveness: Liveness::default(),
+        });
+
+        let (outbox, outgoing) = channel::<ClientMessage>();
+        let (incoming, inbox) = channel::<ServerMessage>();
+
+        (
+            Self {
+                handle: Handle {
+                    outbox,
+                    wire: Arc::clone(&wire),
+                },
+                inbox,
+                wire,
+            },
+            incoming,
+            outgoing,
+        )
+    }
 }
 
 impl Drop for Client {

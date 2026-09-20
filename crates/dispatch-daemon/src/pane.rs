@@ -29,6 +29,14 @@ pub struct DaemonPane {
     pub history: Vec<u8>,
     /// What the pane is doing, as last reported to clients.
     pub status: PaneStatus,
+    /// The pane that delegated this one's work.
+    pub parent: Option<PaneId>,
+    /// Whether it outlives the caller that asked for it.
+    pub durable: bool,
+    /// The request it answers, while one is waiting.
+    pub request: Option<dispatch_core::RequestId>,
+    /// Which client is waiting, so its disappearance can end a one-off pane.
+    pub caller: Option<u64>,
 }
 
 impl DaemonPane {

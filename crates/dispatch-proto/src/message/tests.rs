@@ -26,6 +26,7 @@ fn every_client_message_round_trips() {
         ClientMessage::Hello {
             version: crate::VERSION,
             client: "test".into(),
+            role: Role::Interface,
         },
         ClientMessage::Subscribe,
         ClientMessage::OpenProject {
@@ -93,6 +94,8 @@ fn every_server_message_round_trips() {
             pane: PaneId::new(),
             project: ProjectId::new(),
             harness: "codex".into(),
+            parent: Some(PaneId::new()),
+            durable: true,
         },
         ServerMessage::PaneClosed {
             pane: PaneId::new(),
@@ -212,6 +215,7 @@ fn a_field_missing_from_an_older_peer_falls_back_to_its_default() {
         ClientMessage::Hello {
             version: crate::VERSION,
             client: String::new(),
+            role: Role::Interface,
         }
     );
 }
@@ -255,4 +259,244 @@ fn an_unknown_failure_can_still_be_explained() {
     // variant for, rather than being reduced to "error".
     let error = ProtocolError::Other("worktree is locked".into());
     assert_eq!(round_trip(&error).to_string(), "worktree is locked");
+}
+
+#[test]
+fn the_delegation_messages_round_trip() {
+    let request = RequestId::new();
+    let messages = vec![
+        ClientMessage::DelegateRequest {
+            parent: PaneId::new(),
+            harness: "claude".into(),
+            task: "write the tests".into(),
+            size: (80, 24),
+        },
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    ];
+    for message in messages {
+        assert_eq!(round_trip(&message), message);
+    }
+
+    let replies = vec![
+        ServerMessage::DelegatePending {
+            request,
+            parent: PaneId::new(),
+            project: ProjectId::new(),
+            harness: "claude".into(),
+            task: "write the tests".into(),
+            depth: 0,
+        },
+        ServerMessage::DelegateResolved {
+            request,
+            outcome: DelegateOutcome::Approved {
+                pane: PaneId::new(),
+            },
+        },
+        ServerMessage::DelegateResolved {
+            request,
+            outcome: DelegateOutcome::Denied,
+        },
+        ServerMessage::DelegateResolved {
+            request,
+            outcome: DelegateOutcome::Refused {
+                reason: "harness \"agy\" has no [task] form".into(),
+            },
+        },
+        ServerMessage::DelegateFinished {
+            request,
+            exit: 0,
+            tail: b"done\r\n".to_vec(),
+        },
+    ];
+    for message in replies {
+        assert_eq!(round_trip(&message), message);
+    }
+}
+
+#[test]
+fn an_older_peer_is_an_interface_client() {
+    // A client built before delegation existed sends no role, and is exactly
+    // what Interface means: it draws panes.
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum OldClientMessage {
+        Hello { version: Version, client: String },
+    }
+
+    let old = OldClientMessage::Hello {
+        version: crate::VERSION,
+        client: "old dispatch".into(),
+    };
+
+    let mut buf = Vec::new();
+    Frame::write(&mut buf, &old).expect("writing succeeds");
+    let read: ClientMessage = Frame::read(&mut buf.as_slice()).expect("reading succeeds");
+
+    assert_eq!(
+        read,
+        ClientMessage::Hello {
+            version: crate::VERSION,
+            client: "old dispatch".into(),
+            role: Role::Interface,
+        }
+    );
+}
+
+#[test]
+fn a_delegate_callers_tail_is_binary_not_a_list_of_numbers() {
+    // Same reason pane output is: this is the bulk of what the message carries.
+    //
+    // The bytes are deliberately above 0x7f. A byte below that encodes as a
+    // one-byte positive fixint, so a sequence of zeroes costs exactly what
+    // binary does and a size assertion over it proves nothing.
+    let message = ServerMessage::DelegateFinished {
+        request: RequestId::new(),
+        exit: 0,
+        tail: vec![200u8; 1024],
+    };
+
+    let mut buf = Vec::new();
+    Frame::write(&mut buf, &message).expect("writing succeeds");
+    assert!(
+        buf.len() < 1200,
+        "1 KiB of output should cost about 1 KiB, not {} bytes — a sequence \
+         encoding would need two bytes for every byte above 0x7f",
+        buf.len()
+    );
+}
+
+#[test]
+fn a_message_from_a_newer_peer_is_skipped_rather_than_fatal() {
+    // A newer daemon may send a message this build has no name for. Failing the
+    // frame would take the whole connection down over something ignorable.
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum FutureServerMessage {
+        SomethingNewEntirely { detail: String },
+    }
+
+    let future = FutureServerMessage::SomethingNewEntirely {
+        detail: "from a later version".into(),
+    };
+
+    let mut buf = Vec::new();
+    Frame::write(&mut buf, &future).expect("writing succeeds");
+    let read: ServerMessage = Frame::read(&mut buf.as_slice()).expect("an unknown message decodes");
+
+    assert_eq!(read, ServerMessage::Unknown);
+}
+
+#[test]
+fn an_unknown_client_message_is_skipped_rather_than_fatal() {
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum FutureClientMessage {
+        AskSomethingNew { detail: String },
+    }
+
+    let mut buf = Vec::new();
+    Frame::write(
+        &mut buf,
+        &FutureClientMessage::AskSomethingNew {
+            detail: "from a later version".into(),
+        },
+    )
+    .expect("writing succeeds");
+    let read: ClientMessage = Frame::read(&mut buf.as_slice()).expect("an unknown message decodes");
+
+    assert_eq!(read, ClientMessage::Unknown);
+}
+
+#[test]
+fn an_unknown_pane_update_is_skipped_rather_than_fatal() {
+    // `PaneUpdate` travels inside `PaneChanged`, so an unrecognised variant
+    // here fails the enclosing frame — and a client that drops its connection
+    // over a frame it cannot read reconnects and fails on the next one. That
+    // loop is what every `Unknown` in this module exists to prevent.
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum FuturePaneUpdate {
+        Cwd { path: String },
+    }
+
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum FutureServerMessage {
+        PaneChanged {
+            pane: PaneId,
+            update: FuturePaneUpdate,
+        },
+    }
+
+    let pane = PaneId::new();
+    let mut buf = Vec::new();
+    Frame::write(
+        &mut buf,
+        &FutureServerMessage::PaneChanged {
+            pane,
+            update: FuturePaneUpdate::Cwd {
+                path: "/somewhere/new".into(),
+            },
+        },
+    )
+    .expect("writing succeeds");
+
+    let read: ServerMessage =
+        Frame::read(&mut buf.as_slice()).expect("an unknown update must not fail the frame");
+
+    assert_eq!(
+        read,
+        ServerMessage::PaneChanged {
+            pane,
+            update: PaneUpdate::Unknown,
+        },
+        "the frame survives, carrying an update this build can ignore"
+    );
+}
+
+#[test]
+fn a_pane_announced_by_an_older_daemon_is_not_durable() {
+    // `durable` decides whether a closed parent keeps its row over this pane,
+    // and an older daemon says nothing about it. Not durable is the safe
+    // fallback: the pane dies with its caller, which is what every delegated
+    // pane did before blanket approval existed.
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum OlderServerMessage {
+        PaneSpawned {
+            pane: PaneId,
+            project: ProjectId,
+            harness: String,
+        },
+    }
+
+    let pane = PaneId::new();
+    let project = ProjectId::new();
+    let mut buf = Vec::new();
+    Frame::write(
+        &mut buf,
+        &OlderServerMessage::PaneSpawned {
+            pane,
+            project,
+            harness: "claude".into(),
+        },
+    )
+    .expect("writing succeeds");
+
+    let read: ServerMessage = Frame::read(&mut buf.as_slice()).expect("reading succeeds");
+
+    assert_eq!(
+        read,
+        ServerMessage::PaneSpawned {
+            pane,
+            project,
+            harness: "claude".into(),
+            parent: None,
+            durable: false,
+        }
+    );
 }

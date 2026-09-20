@@ -35,11 +35,13 @@ impl Endpoint {
         std::fs::create_dir_all(dir.join("harnesses")).expect("temp dir is writable");
 
         // A harness of the test's own, so what a pane runs is a plain shell
-        // rather than whichever agents happen to be installed.
+        // rather than whichever agents happen to be installed. The `[task]`
+        // form is what lets a delegation request against it succeed: without
+        // one, the daemon refuses before ever asking anybody.
         let shell = if cfg!(windows) {
-            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n"
+            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n\n[task]\nargs = [\"/c\", \"{task}\"]\n"
         } else {
-            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"sh\"\n"
+            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"sh\"\n\n[task]\nargs = [\"-c\", \"{task}\"]\n"
         };
         std::fs::write(dir.join("harnesses").join("shell.toml"), shell)
             .expect("temp dir is writable");
@@ -154,6 +156,12 @@ fn wait_for(
 
 /// Connects, says hello, and subscribes, returning the queue and the writer.
 fn attach() -> (Receiver<ServerMessage>, impl std::io::Write) {
+    attach_as(dispatch_proto::Role::Interface)
+}
+
+/// Connects, says hello with the given role, and subscribes, returning the
+/// queue and the writer.
+fn attach_as(role: dispatch_proto::Role) -> (Receiver<ServerMessage>, impl std::io::Write) {
     let (reader, mut writer) = connect().split().expect("splitting succeeds");
     let inbox = read_in_background(reader);
 
@@ -162,6 +170,7 @@ fn attach() -> (Receiver<ServerMessage>, impl std::io::Write) {
         &ClientMessage::Hello {
             version: dispatch_proto::VERSION,
             client: "integration test".into(),
+            role,
         },
     )
     .expect("writing succeeds");
@@ -280,6 +289,7 @@ fn a_client_drives_a_pane_through_the_socket() {
         &ClientMessage::Hello {
             version: dispatch_proto::VERSION,
             client: "integration test".into(),
+            role: dispatch_proto::Role::Interface,
         },
     )
     .expect("writing succeeds");
@@ -363,4 +373,151 @@ fn a_client_drives_a_pane_through_the_socket() {
         m.iter()
             .any(|m| matches!(m, ServerMessage::PaneClosed { .. }))
     });
+}
+
+#[test]
+fn a_delegate_caller_and_an_interface_client_share_one_daemon() {
+    // The shim's path through the real binary: one connection asks, another
+    // approves, and the asker is answered with the subagent's output.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let endpoint = Endpoint::new("delegate");
+
+    let project_dir = endpoint.dir.join("project");
+    std::fs::create_dir_all(&project_dir).expect("temp dir is writable");
+    let _daemon = RunningDaemon::start(&endpoint.dir, &project_dir);
+
+    // The interface client, which will approve.
+    let (ui, mut ui_writer) = attach();
+    let announced = wait_for(&ui, "the project", |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::ProjectOpened { .. }))
+    });
+    let project = announced
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::ProjectOpened { project } => Some(project.id),
+            _ => None,
+        })
+        .expect("checked by wait_for");
+
+    Frame::write(
+        &mut ui_writer,
+        &ClientMessage::SpawnPane {
+            project,
+            harness: "shell".into(),
+            size: (80, 24),
+        },
+    )
+    .expect("writing succeeds");
+    let spawned = wait_for(&ui, "the parent pane", |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. }))
+    });
+    let parent = spawned
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::PaneSpawned { pane, .. } => Some(*pane),
+            _ => None,
+        })
+        .expect("checked by wait_for");
+
+    // The parent has history before the delegate caller ever connects, and the
+    // interface client's own receipt of it is confirmed first. Without this, a
+    // caller that merely happened to subscribe before any output existed would
+    // pass the "spared the fleet's output" assertion below even with no role
+    // filter on `Subscribe`'s catch-up at all.
+    Frame::write(
+        &mut ui_writer,
+        &ClientMessage::WritePane {
+            pane: parent,
+            bytes: b"echo history\n".to_vec(),
+        },
+    )
+    .expect("writing succeeds");
+    wait_for(&ui, "the parent's own history", |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneOutput { pane, .. } if *pane == parent))
+    });
+
+    // The delegate caller. It subscribes, via `attach_as`, exactly like the
+    // interface client above — onto a pane that already has history and an
+    // already-broadcast spawn to catch up on.
+    let (caller, mut caller_writer) = attach_as(dispatch_proto::Role::Delegate);
+
+    // A generous pause for whatever `Subscribe`'s catch-up was going to send —
+    // over a local socket, on the order of milliseconds — followed by taking
+    // whatever arrived. `wait_for` cannot express "nothing more is coming";
+    // only a bounded wait can.
+    std::thread::sleep(Duration::from_millis(500));
+    let caught_up: Vec<ServerMessage> = std::iter::from_fn(|| caller.try_recv().ok()).collect();
+    assert!(
+        !caught_up
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PaneOutput { .. })),
+        "a delegate caller's own Subscribe catch-up must not replay pane history, got {caught_up:#?}"
+    );
+    assert!(
+        !caught_up
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. })),
+        "a delegate caller's own Subscribe catch-up must not announce panes either, got {caught_up:#?}"
+    );
+
+    Frame::write(
+        &mut caller_writer,
+        &ClientMessage::DelegateRequest {
+            parent,
+            harness: "shell".into(),
+            task: "echo delegated-$((6*7))".into(),
+            size: (80, 24),
+        },
+    )
+    .expect("writing succeeds");
+
+    let asked = wait_for(&ui, "the pending request", |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::DelegatePending { .. }))
+    });
+    let request = asked
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::DelegatePending { request, .. } => Some(*request),
+            _ => None,
+        })
+        .expect("checked by wait_for");
+
+    Frame::write(
+        &mut ui_writer,
+        &ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    )
+    .expect("writing succeeds");
+
+    let finished = wait_for(&caller, "the subagent's result", |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { .. }))
+    });
+    let (exit, tail) = finished
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::DelegateFinished { exit, tail, .. } => Some((*exit, tail.clone())),
+            _ => None,
+        })
+        .expect("checked by wait_for");
+
+    assert_eq!(exit, 0);
+    assert!(
+        String::from_utf8_lossy(&tail).contains("delegated-42"),
+        "the arithmetic proves the subagent ran, got {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    assert!(
+        !finished
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PaneOutput { .. })),
+        "a delegate caller is spared the fleet's output"
+    );
 }

@@ -9,15 +9,32 @@ use super::*;
 use std::time::Instant;
 
 /// A harness registry holding a plain shell, so panes run something real.
+///
+/// Carries a `[task]` form so delegation tests have a harness to delegate to;
+/// without one, every delegation request is refused before it is even asked
+/// about.
+///
+/// Also registers `no-task-args`: a harness with a `[task]` section but an
+/// empty `args`, which `HarnessDef::task_launch` treats as no form at all — a
+/// fixture for the difference between `task.is_some()` and
+/// `task_launch(..).is_some()`.
 fn harnesses(dir: &std::path::Path) -> HarnessRegistry {
     let body = if cfg!(windows) {
-        "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n"
+        "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n\n[task]\nargs = [\"/c\", \"{task}\"]\n"
     } else {
-        "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"sh\"\n"
+        "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"sh\"\n\n[task]\nargs = [\"-c\", \"{task}\"]\n"
     };
 
     std::fs::create_dir_all(dir).expect("temp dir is writable");
     std::fs::write(dir.join("shell.toml"), body).expect("temp dir is writable");
+
+    let no_task_args = if cfg!(windows) {
+        "id = \"no-task-args\"\ndisplay_name = \"No task args\"\ncommand = \"cmd.exe\"\n\n[task]\nargs = []\n"
+    } else {
+        "id = \"no-task-args\"\ndisplay_name = \"No task args\"\ncommand = \"sh\"\n\n[task]\nargs = []\n"
+    };
+    std::fs::write(dir.join("no-task-args.toml"), no_task_args).expect("temp dir is writable");
+
     HarnessRegistry::load_from_dir(dir).expect("loading succeeds")
 }
 
@@ -61,6 +78,7 @@ fn hello() -> ClientMessage {
     ClientMessage::Hello {
         version: dispatch_proto::VERSION,
         client: "test".into(),
+        role: dispatch_proto::Role::Interface,
     }
 }
 
@@ -139,6 +157,7 @@ fn an_incompatible_major_version_is_refused_and_the_client_dropped() {
                 minor: 0,
             },
             client: "from the future".into(),
+            role: dispatch_proto::Role::Interface,
         },
     );
 
@@ -894,5 +913,903 @@ fn a_client_attaching_after_a_pane_exited_is_told_it_exited() {
             }
         )),
         "a late client should be told the pane exited, got {messages:#?}"
+    );
+}
+
+/// A daemon with one project and non-default limits.
+fn daemon_with_limits(label: &str, limits: DelegationLimits) -> (Daemon, ProjectId, TempDir) {
+    let dir = TempDir::new(label);
+    let registry = harnesses(&dir.0.join("harnesses"));
+
+    let mut daemon = Daemon::with_limits(registry, "test-device", limits);
+    let root = dir.0.canonicalize().expect("the temp dir resolves");
+    let project = daemon.open_project(root);
+
+    (daemon, project, dir)
+}
+
+/// Spawns a pane the ordinary way and returns its id.
+fn spawn_pane_for_test(
+    daemon: &mut Daemon,
+    inbox: &Receiver<ServerMessage>,
+    project: ProjectId,
+) -> PaneId {
+    daemon.request_for_test(
+        1,
+        ClientMessage::SpawnPane {
+            project,
+            harness: "shell".into(),
+            size: (80, 24),
+        },
+    );
+
+    let seen = wait_for(daemon, inbox, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. }))
+    });
+
+    seen.iter()
+        .find_map(|m| match m {
+            ServerMessage::PaneSpawned { pane, .. } => Some(*pane),
+            _ => None,
+        })
+        .expect("a pane was spawned")
+}
+
+/// Whether a spawn announcement is for a delegated pane.
+fn m_is_child(message: &ServerMessage) -> bool {
+    matches!(
+        message,
+        ServerMessage::PaneSpawned {
+            parent: Some(_),
+            ..
+        }
+    )
+}
+
+/// Attaches a delegate caller and asks for a subagent.
+fn ask(daemon: &mut Daemon, parent: PaneId, task: &str) -> Receiver<ServerMessage> {
+    ask_as(daemon, 9, parent, task)
+}
+
+/// Attaches a delegate caller under a specific client id and asks for a
+/// subagent. Needed over `ask` when a test drives two delegate callers at
+/// once, since `ask` always reuses id 9.
+fn ask_as(daemon: &mut Daemon, id: u64, parent: PaneId, task: &str) -> Receiver<ServerMessage> {
+    let caller = daemon.attach_for_test(id);
+    daemon.request_for_test(
+        id,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(
+        id,
+        ClientMessage::DelegateRequest {
+            parent,
+            harness: "shell".into(),
+            task: task.into(),
+            size: (80, 24),
+        },
+    );
+    caller
+}
+
+/// The first pending request an interface client was told about.
+fn pending(messages: &[ServerMessage]) -> Option<dispatch_core::RequestId> {
+    messages.iter().find_map(|m| match m {
+        ServerMessage::DelegatePending { request, .. } => Some(*request),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_delegation_request_is_put_to_the_user() {
+    let (mut daemon, project, _dir) = daemon("delegate-ask");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let _caller = ask(&mut daemon, parent, "echo delegated");
+
+    let seen = drain(&ui);
+    let request = pending(&seen).expect("the interface is asked");
+    assert!(
+        matches!(
+            seen.iter().find(|m| matches!(m, ServerMessage::DelegatePending { .. })),
+            Some(ServerMessage::DelegatePending { task, .. }) if task == "echo delegated"
+        ),
+        "the whole task travels, got {seen:#?}"
+    );
+    assert_eq!(daemon.pane_count(), 1, "nothing runs before an answer");
+    let _ = request;
+}
+
+#[test]
+fn approving_a_request_starts_a_subagent_under_its_parent() {
+    let (mut daemon, project, _dir) = daemon("delegate-approve");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask(&mut daemon, parent, "echo delegated-42");
+    let request = pending(&drain(&ui)).expect("the interface is asked");
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+
+    let seen = wait_for(&mut daemon, &caller, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { .. }))
+    });
+
+    let finished = seen
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::DelegateFinished { exit, tail, .. } => Some((*exit, tail.clone())),
+            _ => None,
+        })
+        .expect("the caller is answered");
+    assert_eq!(finished.0, 0, "the subagent's own exit code");
+    assert!(
+        String::from_utf8_lossy(&finished.1).contains("delegated-42"),
+        "the tail carries what the subagent printed, got {:?}",
+        String::from_utf8_lossy(&finished.1)
+    );
+    assert_eq!(daemon.pane_count(), 2, "the subagent's pane is kept");
+}
+
+#[test]
+fn denying_a_request_starts_nothing() {
+    let (mut daemon, project, _dir) = daemon("delegate-deny");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask(&mut daemon, parent, "echo never");
+    let request = pending(&drain(&ui)).expect("the interface is asked");
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: false,
+            blanket: false,
+        },
+    );
+
+    let seen = drain(&caller);
+    assert!(
+        seen.iter().any(|m| matches!(
+            m,
+            ServerMessage::DelegateResolved {
+                outcome: dispatch_proto::DelegateOutcome::Denied,
+                ..
+            }
+        )),
+        "the caller is told, got {seen:#?}"
+    );
+    assert_eq!(daemon.pane_count(), 1);
+}
+
+#[test]
+fn a_blanket_approval_stops_the_asking() {
+    let (mut daemon, project, _dir) = daemon("delegate-blanket");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let first = ask(&mut daemon, parent, "echo one");
+    let request = pending(&drain(&ui)).expect("the first is asked about");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: true,
+        },
+    );
+    wait_for(&mut daemon, &first, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { .. }))
+    });
+    let _ = drain(&ui);
+
+    // The second request from the same pane is not put to anyone.
+    let second = ask(&mut daemon, parent, "echo two");
+    wait_for(&mut daemon, &second, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { .. }))
+    });
+
+    assert!(
+        pending(&drain(&ui)).is_none(),
+        "a pane approved with [A] is not asked about again"
+    );
+}
+
+#[test]
+fn a_subagent_dies_with_the_caller_that_asked_for_it() {
+    let (mut daemon, project, _dir) = daemon("delegate-orphan");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _caller = ask(&mut daemon, parent, "sleep 30");
+    let request = pending(&drain(&ui)).expect("the interface is asked");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+    wait_for(&mut daemon, &ui, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. }) && m_is_child(m))
+    });
+
+    // The agent hits Ctrl-C, or its pane is killed: either way the socket goes.
+    daemon.detach_for_test(9);
+    daemon.tick();
+
+    assert_eq!(
+        daemon.pane_count(),
+        1,
+        "a one-off subagent has nobody left to answer"
+    );
+}
+
+#[test]
+fn a_blanket_approved_subagent_survives_its_caller() {
+    let (mut daemon, project, _dir) = daemon("delegate-durable");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _caller = ask(&mut daemon, parent, "sleep 30");
+    let request = pending(&drain(&ui)).expect("the interface is asked");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: true,
+        },
+    );
+    wait_for(&mut daemon, &ui, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. }) && m_is_child(m))
+    });
+
+    daemon.detach_for_test(9);
+    daemon.tick();
+
+    assert_eq!(
+        daemon.pane_count(),
+        2,
+        "[A] is how the user says to let this pane's work run"
+    );
+}
+
+#[test]
+fn a_request_nobody_answers_is_expired_when_its_time_is_up() {
+    let (mut daemon, project, _dir) = daemon_with_limits(
+        "delegate-timeout",
+        DelegationLimits {
+            request_timeout_secs: 0,
+            ..DelegationLimits::default()
+        },
+    );
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask(&mut daemon, parent, "echo never");
+
+    daemon.tick();
+
+    let seen = drain(&caller);
+    assert!(
+        seen.iter().any(|m| matches!(
+            m,
+            ServerMessage::DelegateResolved {
+                outcome: dispatch_proto::DelegateOutcome::Expired { .. },
+                ..
+            }
+        )),
+        "a caller must not wait on an unattended daemon forever, got {seen:#?}"
+    );
+    assert_eq!(daemon.pane_count(), 1, "and a late approval spawns nothing");
+}
+
+#[test]
+fn a_pane_the_daemon_does_not_own_cannot_delegate() {
+    let (mut daemon, _project, _dir) = daemon("delegate-stranger");
+    let caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    let _ = drain(&caller);
+
+    daemon.request_for_test(
+        9,
+        ClientMessage::DelegateRequest {
+            parent: PaneId::new(),
+            harness: "shell".into(),
+            task: "echo hello".into(),
+            size: (80, 24),
+        },
+    );
+
+    assert!(
+        matches!(
+            drain(&caller).first(),
+            Some(ServerMessage::Error {
+                error: ProtocolError::NoSuchPane(_)
+            })
+        ),
+        "an unknown parent is not a pane this daemon can attribute work to"
+    );
+}
+
+#[test]
+fn a_delegate_caller_is_not_sent_pane_output() {
+    // It waits on one request; the fleet's output is a firehose it never reads.
+    // Subscribing here matters: an unsubscribed client is already excluded by
+    // `broadcast`, which would let this pass even if the role filter were
+    // missing. Subscribing puts the assertion on the role check alone.
+    let (mut daemon, project, _dir) = daemon("delegate-quiet");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let caller = ask(&mut daemon, parent, "echo quiet");
+    daemon.request_for_test(9, ClientMessage::Subscribe);
+    let _ = drain(&caller);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane: parent,
+            bytes: b"echo noisy\r".to_vec(),
+        },
+    );
+    wait_for(&mut daemon, &ui, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneOutput { .. }))
+    });
+
+    assert!(
+        !drain(&caller)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PaneOutput { .. })),
+        "a delegate caller hears about its own request only"
+    );
+}
+
+#[test]
+fn a_delegate_callers_subscribe_catch_up_carries_none_of_the_fleet() {
+    // `broadcast` keeps the fleet's ongoing traffic from a delegate caller, but
+    // `Subscribe`'s catch-up is a separate path that replays what already
+    // happened before this client asked — a pane with history already has
+    // something to replay by the time this runs. Building the pane and its
+    // history first, and confirming an interface client actually saw the
+    // output, is what makes this assertion rest on the role filter rather than
+    // on the pane happening to be silent when the delegate caller connects.
+    let (mut daemon, project, _dir) = daemon("delegate-catchup-history");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane: parent,
+            bytes: b"echo history\r".to_vec(),
+        },
+    );
+    wait_for(&mut daemon, &ui, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneOutput { .. }))
+    });
+
+    let caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(9, ClientMessage::Subscribe);
+
+    let seen = drain(&caller);
+    assert!(
+        !seen
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PaneOutput { .. })),
+        "a delegate caller's Subscribe catch-up must not replay pane history, got {seen:#?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. })),
+        "a delegate caller's Subscribe catch-up must not announce panes either, got {seen:#?}"
+    );
+}
+
+#[test]
+fn a_finished_subagent_survives_its_caller_detaching() {
+    // `dispatch delegate` exits the instant it has its answer, so this is the
+    // common case, not an edge case: reaping the pane here would throw away
+    // the very output TAIL_BYTES exists so a person can still read.
+    let (mut daemon, project, _dir) = daemon("delegate-finished-orphan");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask(&mut daemon, parent, "echo done-42");
+    let request = pending(&drain(&ui)).expect("the interface is asked");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+    wait_for(&mut daemon, &caller, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { .. }))
+    });
+
+    // The delegate process is gone by now in real use.
+    daemon.detach_for_test(9);
+    daemon.tick();
+
+    assert_eq!(
+        daemon.pane_count(),
+        2,
+        "a finished subagent is not reaped just because its caller is gone"
+    );
+}
+
+#[test]
+fn closing_the_asking_pane_refuses_its_pending_request() {
+    // Without this, the caller's `Pending` entry is gone the moment the
+    // decision arrives (there is none to time out), and `approve`'s missing-
+    // pane branch used to return silently: the caller would hang until the
+    // daemon itself died.
+    let (mut daemon, project, _dir) = daemon("delegate-parent-closed");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask(&mut daemon, parent, "echo never");
+    let _request = pending(&drain(&ui)).expect("the interface is asked");
+
+    daemon.request_for_test(1, ClientMessage::ClosePane { pane: parent });
+
+    let seen = drain(&caller);
+    assert!(
+        seen.iter().any(|m| matches!(
+            m,
+            ServerMessage::DelegateResolved {
+                outcome: dispatch_proto::DelegateOutcome::Refused { .. },
+                ..
+            }
+        )),
+        "a caller must not hang forever on a pane that closed before answering, got {seen:#?}"
+    );
+}
+
+#[test]
+fn every_interface_client_is_told_when_a_request_is_resolved() {
+    // The next task draws the prompt on every interface client that saw it;
+    // without this, a denied or expired request stays on screen for everyone
+    // but the one who answered it.
+    let (mut daemon, project, _dir) = daemon("delegate-resolved-broadcast");
+    let first = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let second = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &first, project);
+    let _ = drain(&second);
+
+    let caller = ask(&mut daemon, parent, "echo resolved");
+    let request = pending(&drain(&first)).expect("the first client sees the prompt");
+    assert!(
+        pending(&drain(&second)).is_some(),
+        "the second interface client sees the same prompt"
+    );
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: false,
+            blanket: false,
+        },
+    );
+    let _ = drain(&caller);
+
+    let seen = drain(&second);
+    assert!(
+        seen.iter().any(|m| matches!(
+            m,
+            ServerMessage::DelegateResolved {
+                outcome: dispatch_proto::DelegateOutcome::Denied,
+                ..
+            }
+        )),
+        "an interface client that saw the prompt should be told it is resolved, got {seen:#?}"
+    );
+}
+
+#[test]
+fn a_delegate_caller_that_subscribes_is_not_told_about_pending_requests() {
+    // The Subscribe catch-up is for interface clients drawing the fleet; a
+    // delegate caller does not draw prompts, and `broadcast` already excludes
+    // it for the same reason once a request is live.
+    let (mut daemon, project, _dir) = daemon("delegate-catchup");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let caller = ask(&mut daemon, parent, "echo catchup");
+    let _ = drain(&caller);
+
+    daemon.request_for_test(9, ClientMessage::Subscribe);
+
+    assert!(
+        !drain(&caller)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::DelegatePending { .. })),
+        "a delegate caller's own Subscribe catch-up must not include prompts"
+    );
+}
+
+#[test]
+fn closing_a_running_subagents_pane_answers_its_caller() {
+    // The pane is killed rather than allowed to finish, so pump_panes never
+    // sees its exit, and the request was already removed from `pending` when
+    // it was approved -- so without an explicit answer here, nothing would
+    // ever tell the caller anything.
+    let (mut daemon, project, _dir) = daemon("delegate-close-running-subagent");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask(&mut daemon, parent, "sleep 30");
+    let request = pending(&drain(&ui)).expect("the interface is asked");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+
+    let seen = wait_for(&mut daemon, &caller, |m| {
+        m.iter().any(|m| {
+            matches!(
+                m,
+                ServerMessage::DelegateResolved {
+                    outcome: dispatch_proto::DelegateOutcome::Approved { .. },
+                    ..
+                }
+            )
+        })
+    });
+    let subagent = seen
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::DelegateResolved {
+                outcome: dispatch_proto::DelegateOutcome::Approved { pane },
+                ..
+            } => Some(*pane),
+            _ => None,
+        })
+        .expect("the subagent was approved");
+
+    daemon.request_for_test(1, ClientMessage::ClosePane { pane: subagent });
+
+    let seen = drain(&caller);
+    assert!(
+        seen.iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { .. })),
+        "closing a running subagent's own pane must still answer its caller, got {seen:#?}"
+    );
+}
+
+#[test]
+fn an_interface_client_that_delegates_is_not_told_twice() {
+    // Nothing gates DelegateRequest on role, so an interface client can be its
+    // own caller -- an agent delegating from a pane someone happens to be
+    // watching through the same connection. `resolve` answers it directly;
+    // the broadcast half must not repeat that answer.
+    let (mut daemon, project, _dir) = daemon("delegate-self-caller");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _ = drain(&ui);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateRequest {
+            parent,
+            harness: "shell".into(),
+            task: "echo self".into(),
+            size: (80, 24),
+        },
+    );
+    let request = pending(&drain(&ui)).expect("the interface is asked");
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: false,
+            blanket: false,
+        },
+    );
+
+    let seen = drain(&ui);
+    let resolved = seen
+        .iter()
+        .filter(|m| matches!(m, ServerMessage::DelegateResolved { .. }))
+        .count();
+    assert_eq!(
+        resolved, 1,
+        "an interface client that is also the caller should hear its answer once, got {seen:#?}"
+    );
+}
+
+#[test]
+fn a_harness_with_an_empty_task_form_is_refused_without_asking() {
+    // The point of matching approve()'s own predicate: the user is never put
+    // in the position of approving something that will just fail afterward.
+    let (mut daemon, project, _dir) = daemon("delegate-empty-task-args");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _ = drain(&ui);
+
+    let caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    let _ = drain(&caller);
+    daemon.request_for_test(
+        9,
+        ClientMessage::DelegateRequest {
+            parent,
+            harness: "no-task-args".into(),
+            task: "echo never".into(),
+            size: (80, 24),
+        },
+    );
+
+    let seen = drain(&caller);
+    assert!(
+        seen.iter().any(|m| matches!(
+            m,
+            ServerMessage::DelegateResolved {
+                outcome: dispatch_proto::DelegateOutcome::Refused { .. },
+                ..
+            }
+        )),
+        "a harness whose [task] has no runnable args must be refused immediately, got {seen:#?}"
+    );
+    assert!(
+        pending(&drain(&ui)).is_none(),
+        "the user must never be asked about a harness that cannot actually run"
+    );
+}
+
+#[test]
+fn closing_a_pane_drops_its_whole_delegation_subtree() {
+    // A grandchild must go too, not just the direct child: otherwise it is
+    // left with a `parent` pointing at nothing, and depth_of/live_children
+    // silently under-count from then on.
+    let (mut daemon, project, _dir) = daemon_with_limits(
+        "delegate-cascade",
+        DelegationLimits {
+            max_depth: 2,
+            ..DelegationLimits::default()
+        },
+    );
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let root = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let first_caller = ask_as(&mut daemon, 9, root, "sleep 30");
+    let request = pending(&drain(&ui)).expect("the interface is asked about the child");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+    let seen = wait_for(&mut daemon, &first_caller, |m| {
+        m.iter().any(|m| {
+            matches!(
+                m,
+                ServerMessage::DelegateResolved {
+                    outcome: dispatch_proto::DelegateOutcome::Approved { .. },
+                    ..
+                }
+            )
+        })
+    });
+    let child = seen
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::DelegateResolved {
+                outcome: dispatch_proto::DelegateOutcome::Approved { pane },
+                ..
+            } => Some(*pane),
+            _ => None,
+        })
+        .expect("the child was approved");
+    let _ = drain(&ui);
+
+    // A second delegate caller, as if the child's own agent asked for a
+    // subagent of its own.
+    let second_caller = ask_as(&mut daemon, 10, child, "sleep 30");
+    let request = pending(&drain(&ui)).expect("the interface is asked about the grandchild");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+    wait_for(&mut daemon, &second_caller, |m| {
+        m.iter().any(|m| {
+            matches!(
+                m,
+                ServerMessage::DelegateResolved {
+                    outcome: dispatch_proto::DelegateOutcome::Approved { .. },
+                    ..
+                }
+            )
+        })
+    });
+
+    assert_eq!(
+        daemon.pane_count(),
+        3,
+        "root, child, and grandchild all exist"
+    );
+
+    daemon.request_for_test(1, ClientMessage::ClosePane { pane: root });
+
+    assert_eq!(
+        daemon.pane_count(),
+        0,
+        "closing the root must drop the whole subtree, not just its direct child"
+    );
+}
+
+#[test]
+fn a_prompt_whose_caller_has_gone_is_withdrawn_rather_than_left_on_screen() {
+    // Ctrl-C on `dispatch delegate` closes the socket, and the request goes
+    // with it. Dropped in silence, the prompt stayed on every interface client:
+    // the user presses `a`, `DelegateDecision` finds no pending entry, returns,
+    // and nothing whatsoever happens. Every other resolution path broadcasts,
+    // and a withdrawal is exactly what closes a prompt.
+    let (mut daemon, project, _dir) = daemon("delegate-caller-gone");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _caller = ask(&mut daemon, parent, "echo never");
+    let request = pending(&drain(&ui)).expect("the interface is asked");
+
+    daemon.detach_for_test(9);
+
+    let seen = drain(&ui);
+    assert!(
+        seen.iter().any(|m| matches!(
+            m,
+            ServerMessage::DelegateResolved {
+                request: withdrawn,
+                outcome: dispatch_proto::DelegateOutcome::Refused { .. },
+            } if *withdrawn == request
+        )),
+        "the prompt must be withdrawn from the interface, got {seen:#?}"
+    );
+
+    // And answering it afterwards is answering nothing, which is precisely why
+    // it must not still be on screen.
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+    daemon.tick();
+    assert_eq!(
+        daemon.pane_count(),
+        1,
+        "a withdrawn request cannot be approved into a subagent"
+    );
+}
+
+#[test]
+fn a_late_subscriber_is_told_about_pending_requests_oldest_first() {
+    // The client documents its queue as oldest first and shows the front of it;
+    // `HashMap` order would hand a reattaching client the prompts in whatever
+    // order the hasher happened to like, so the request the user has been
+    // waiting on longest need not be the one they are shown.
+    let (mut daemon, project, _dir) = daemon("delegate-catch-up-order");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    // Six, because one hash order in a handful agreeing with insertion order is
+    // luck; six agreeing is not.
+    let mut asked = Vec::new();
+    for (index, id) in (20..26).enumerate() {
+        let _caller = ask_as(&mut daemon, id, parent, &format!("task {index}"));
+        asked.push(
+            pending(&drain(&ui)).unwrap_or_else(|| panic!("the interface is asked about {index}")),
+        );
+    }
+
+    let late = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+
+    let replayed: Vec<dispatch_core::RequestId> = drain(&late)
+        .iter()
+        .filter_map(|m| match m {
+            ServerMessage::DelegatePending { request, .. } => Some(*request),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        replayed, asked,
+        "a late subscriber should be caught up in the order the requests were asked"
     );
 }

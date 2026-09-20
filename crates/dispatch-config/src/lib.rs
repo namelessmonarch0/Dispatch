@@ -1,12 +1,19 @@
 //! Loading Dispatch's configuration and harness definitions.
 
+pub mod config;
 pub mod defaults;
 pub mod harness;
+
+/// Shared by this crate's test modules, so there is one temporary-directory
+/// counter rather than one per module.
+#[cfg(test)]
+mod testing;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub use harness::{HarnessDef, Launch, SettingDef, SettingKind};
+pub use config::{Config, DelegationLimits, LoadedConfig};
+pub use harness::{HarnessDef, Launch, SettingDef, SettingKind, TaskArgs, TaskLaunch};
 
 /// Failures while loading configuration.
 ///

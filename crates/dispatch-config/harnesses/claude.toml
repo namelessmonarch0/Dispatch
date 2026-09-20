@@ -9,6 +9,12 @@ args = []
 command = "cmd.exe"
 args = ["/c", "claude"]
 
+[task]
+args = ["-p", "{task}"]
+
+[task.platform.windows]
+args = ["/c", "claude", "-p", "{task}"]
+
 [[settings]]
 key = "model"
 label = "Model"

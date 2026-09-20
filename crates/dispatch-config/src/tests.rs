@@ -2,40 +2,7 @@
 
 use super::*;
 
-/// A temporary directory that cleans itself up.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(label: &str) -> Self {
-        // Counter keeps parallel tests in the same process from colliding.
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-
-        let path = std::env::temp_dir().join(format!(
-            "dispatch-config-{}-{label}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).expect("temp dir is writable");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-
-    fn write(&self, name: &str, contents: &str) -> PathBuf {
-        let path = self.0.join(name);
-        std::fs::write(&path, contents).expect("temp dir is writable");
-        path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use crate::testing::TempDir;
 
 #[test]
 fn every_built_in_parses() {
@@ -388,4 +355,172 @@ fn which_finds_a_program_that_exists() {
 #[test]
 fn which_does_not_find_a_program_that_does_not_exist() {
     assert!(which("dispatch-definitely-not-installed").is_none());
+}
+
+#[test]
+fn a_harness_can_declare_a_one_shot_task_form() {
+    let def: HarnessDef = toml::from_str(
+        r#"
+id = "claude"
+display_name = "Claude Code"
+command = "claude"
+
+[task]
+args = ["-p", "{task}"]
+"#,
+    )
+    .expect("the definition parses");
+
+    let launch = def
+        .task_launch("write the tests")
+        .expect("the harness declares a task form");
+
+    assert_eq!(launch.command, "claude");
+    assert_eq!(launch.args, vec!["-p", "write the tests"]);
+}
+
+#[test]
+fn a_harness_without_a_task_form_cannot_be_delegated_to() {
+    let def: HarnessDef = toml::from_str(
+        r#"
+id = "agy"
+display_name = "agy"
+command = "agy"
+"#,
+    )
+    .expect("the definition parses");
+
+    assert!(
+        def.task_launch("anything").is_none(),
+        "a harness with no [task] form has no non-interactive shape to run"
+    );
+}
+
+#[test]
+fn a_task_is_one_argument_however_it_is_written() {
+    // Substituted as an argv element, never interpolated into a shell string:
+    // quotes, newlines and command substitution have to arrive as text.
+    let def: HarnessDef = toml::from_str(
+        r#"
+id = "shell"
+display_name = "Shell"
+command = "sh"
+
+[task]
+args = ["-c", "{task}"]
+"#,
+    )
+    .expect("the definition parses");
+
+    let hostile = "say \"hi\"\nthen $(rm -rf /)";
+    let launch = def.task_launch(hostile).expect("a task form exists");
+
+    assert_eq!(launch.args.len(), 2);
+    assert_eq!(launch.args[1], hostile);
+}
+
+#[test]
+fn a_task_placeholder_inside_a_longer_argument_is_substituted() {
+    let def: HarnessDef = toml::from_str(
+        r#"
+id = "codex"
+display_name = "Codex"
+command = "codex"
+
+[task]
+args = ["exec", "--prompt={task}"]
+"#,
+    )
+    .expect("the definition parses");
+
+    let launch = def.task_launch("build it").expect("a task form exists");
+    assert_eq!(launch.args, vec!["exec", "--prompt=build it"]);
+}
+
+#[test]
+fn the_built_in_agents_that_can_be_delegated_to_say_so() {
+    // claude and codex have documented non-interactive forms. agy and opencode
+    // do not ship one: a guess at their flags would run a process with flags
+    // that mean something else.
+    let dir = TempDir::new("built-in-task-forms");
+    write_missing_built_ins(dir.path()).expect("the built-ins are written");
+    let registry = HarnessRegistry::load_from_dir(dir.path()).expect("they load");
+
+    for id in ["claude", "codex"] {
+        assert!(
+            registry
+                .get(id)
+                .expect("the built-in exists")
+                .task_launch("x")
+                .is_some(),
+            "{id} should declare a [task] form"
+        );
+    }
+
+    for id in ["agy", "opencode"] {
+        assert!(
+            registry
+                .get(id)
+                .expect("the built-in exists")
+                .task_launch("x")
+                .is_none(),
+            "{id} should not guess at a [task] form"
+        );
+    }
+}
+
+#[test]
+fn a_windows_wrapper_survives_a_one_shot_run() {
+    // claude installs on Windows as a .cmd shim that has to be run through
+    // cmd.exe. A one-shot run reaches the agent the same way an interactive one
+    // does, or it runs cmd.exe and never the agent.
+    let dir = TempDir::new("windows-task-wrapper");
+    write_missing_built_ins(dir.path()).expect("the built-ins are written");
+    let registry = HarnessRegistry::load_from_dir(dir.path()).expect("they load");
+
+    let claude = registry.get("claude").expect("the built-in exists");
+    let launch = claude
+        .task_launch_for("windows", "write the tests")
+        .expect("claude can be delegated to on Windows");
+
+    assert_eq!(launch.command, "cmd.exe");
+    assert_eq!(
+        launch.args,
+        vec!["/c", "claude", "-p", "write the tests"],
+        "the shim wrapper has to stay in front of the one-shot flags"
+    );
+}
+
+#[test]
+fn a_platform_without_its_own_form_uses_the_default_one() {
+    let dir = TempDir::new("platform-fallback");
+    write_missing_built_ins(dir.path()).expect("the built-ins are written");
+    let registry = HarnessRegistry::load_from_dir(dir.path()).expect("they load");
+
+    let launch = registry
+        .get("claude")
+        .expect("the built-in exists")
+        .task_launch_for("linux", "write the tests")
+        .expect("claude can be delegated to on Linux");
+
+    assert_eq!(launch.command, "claude");
+    assert_eq!(launch.args, vec!["-p", "write the tests"]);
+}
+
+#[test]
+fn a_task_form_with_no_arguments_is_no_task_form() {
+    // Nothing to carry the task in, so there is nothing to run.
+    let def: HarnessDef = toml::from_str(
+        r#"
+id = "empty"
+display_name = "Empty"
+command = "empty"
+
+[task]
+args = []
+"#,
+    )
+    .expect("the definition parses");
+
+    assert!(def.task_launch("anything").is_none());
 }

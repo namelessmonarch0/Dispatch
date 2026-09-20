@@ -54,8 +54,10 @@ impl PaneStatus {
 
 /// How a pane participates in orchestration.
 ///
-/// Slice 1 only ever constructs [`PaneRole::Worker`]. [`PaneRole::Orchestrator`]
-/// is reserved so the dispatch slice does not have to reshape this type.
+/// A pane starts as a [`PaneRole::Worker`] and becomes an
+/// [`PaneRole::Orchestrator`] when its first child is approved — see
+/// [`crate::AppState::adopt_pane`]. Nothing asks the user to declare a pane an
+/// orchestrator: there is no mode to learn and no way to set it wrongly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PaneRole {
     /// An ordinary agent pane.
@@ -80,6 +82,18 @@ pub struct Pane {
     pub status: PaneStatus,
     /// How the pane participates in orchestration.
     pub role: PaneRole,
+    /// The pane that delegated this one's work, when it was delegated.
+    #[serde(default)]
+    pub parent: Option<PaneId>,
+    /// Whether this pane outlives the caller that asked for it.
+    ///
+    /// Set when the user approved it for the whole parent pane rather than
+    /// once: that is how they say "let this pane's work run".
+    #[serde(default)]
+    pub durable: bool,
+    /// Whether this pane is closed but kept as a row for live children.
+    #[serde(default)]
+    pub closed: bool,
 }
 
 impl Pane {
@@ -94,6 +108,9 @@ impl Pane {
             title,
             status: PaneStatus::Starting,
             role: PaneRole::Worker,
+            parent: None,
+            durable: false,
+            closed: false,
         }
     }
 }
@@ -122,5 +139,14 @@ mod tests {
         assert!(PaneStatus::Idle.is_live());
         assert!(!PaneStatus::Exited(0).is_live());
         assert!(!PaneStatus::Exited(1).is_live());
+    }
+
+    #[test]
+    fn a_new_pane_has_no_parent_and_is_not_a_tombstone() {
+        let pane = Pane::new(ProjectId::new(), HarnessId::new("claude"));
+
+        assert_eq!(pane.parent, None);
+        assert!(!pane.durable);
+        assert!(!pane.closed);
     }
 }

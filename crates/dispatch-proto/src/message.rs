@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use dispatch_core::{PaneId, PaneStatus, Project, ProjectId};
+use dispatch_core::{PaneId, PaneStatus, Project, ProjectId, RequestId};
 use serde::{Deserialize, Serialize};
 
 /// A protocol version.
@@ -38,6 +38,13 @@ impl std::fmt::Display for Version {
 }
 
 /// Why a connection was refused or ended.
+///
+/// Externally tagged — the variants carry data of their own and no `tag`
+/// attribute is set — so `#[serde(other)]` does not apply here: serde allows it
+/// only on an internally or adjacently tagged enum. [`ProtocolError::Other`] is
+/// this type's hatch instead: a variant added here would fail an older peer's
+/// whole frame, so a new reason travels as prose in `Other` rather than as a
+/// variant that peer has no name for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum ProtocolError {
     /// The peer speaks a major version this build cannot understand.
@@ -65,6 +72,63 @@ pub enum ProtocolError {
     Other(String),
 }
 
+/// What a connection is for.
+///
+/// The two audiences want different traffic. An interface draws panes and wants
+/// every byte they produce; a delegate caller wants the fate of its own request
+/// and nothing else, so sending it pane output would be a firehose it never
+/// reads — and would slow the call down on a busy fleet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// A client that draws the fleet. The default, because a peer built before
+    /// roles existed is one of these.
+    #[default]
+    Interface,
+    /// A `dispatch delegate` call waiting on one request.
+    Delegate,
+}
+
+/// How a delegation request ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DelegateOutcome {
+    /// The user approved it, and this pane is running the task.
+    Approved {
+        /// The subagent's pane.
+        pane: PaneId,
+    },
+    /// The user denied it.
+    Denied,
+    /// The daemon refused it without asking: a cap or a missing task form.
+    ///
+    /// Distinct from [`Expired`] because the two call for opposite responses: a
+    /// refusal will not change if the caller asks again, while a request that
+    /// timed out may well be answered next time.
+    Refused {
+        /// Why, in words, because an agent reads this and should be able to act
+        /// on it.
+        reason: String,
+    },
+    /// Nobody answered before the deadline.
+    ///
+    /// Distinct from [`Refused`] because the two call for opposite responses: a
+    /// refusal will not change if the caller asks again, while a request that
+    /// timed out may well be answered next time.
+    Expired {
+        /// How long it waited, so the caller can say so.
+        after_secs: u64,
+    },
+    /// A message this build does not know.
+    ///
+    /// The protocol's promise is that an older peer skips what it does not
+    /// understand rather than misreading it, and that promise needs somewhere
+    /// for the unknown to land: without this, one unrecognised variant fails
+    /// the whole frame and takes the connection with it.
+    #[serde(other)]
+    Unknown,
+}
+
 /// Something a client asks of the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -76,6 +140,9 @@ pub enum ClientMessage {
         /// Human-readable client description, for the daemon's log.
         #[serde(default)]
         client: String,
+        /// What the connection is for.
+        #[serde(default)]
+        role: Role,
     },
 
     /// Asks for the current state of everything.
@@ -133,6 +200,42 @@ pub enum ClientMessage {
         #[serde(default)]
         token: u64,
     },
+
+    /// Asks for a subagent to be started on a task.
+    ///
+    /// Sent by `dispatch delegate` from inside a pane. The daemon decides
+    /// whether it is allowed, and the user whether it happens.
+    DelegateRequest {
+        /// The pane asking, from `DISPATCH_PANE` in its environment.
+        parent: PaneId,
+        /// Which harness should run the task.
+        harness: String,
+        /// What to do, verbatim.
+        task: String,
+        /// Initial size in cells.
+        size: (u16, u16),
+    },
+
+    /// Answers a [`ServerMessage::DelegatePending`].
+    DelegateDecision {
+        /// Which request.
+        request: RequestId,
+        /// Whether it may run.
+        approve: bool,
+        /// Whether every later request from the same pane is approved too, for
+        /// as long as this daemon runs.
+        #[serde(default)]
+        blanket: bool,
+    },
+
+    /// A message this build does not know.
+    ///
+    /// The protocol's promise is that an older peer skips what it does not
+    /// understand rather than misreading it, and that promise needs somewhere
+    /// for the unknown to land: without this, one unrecognised `type` tag fails
+    /// the whole frame and takes the connection with it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Something the daemon tells a client.
@@ -192,6 +295,19 @@ pub enum ServerMessage {
         project: ProjectId,
         /// Which harness is running.
         harness: String,
+        /// The pane that delegated this one's work, when it was delegated.
+        #[serde(default)]
+        parent: Option<PaneId>,
+        /// Whether this pane outlives the caller that asked for it, because the
+        /// user approved its parent with `A` rather than approving once.
+        ///
+        /// On the wire rather than derived by whoever pressed the key: every
+        /// client has to draw the same tree, and only the deciding client could
+        /// know otherwise. It is what a closed parent's survivor rule turns on.
+        /// A top-level pane has no caller to outlive, so the field says nothing
+        /// useful about one.
+        #[serde(default)]
+        durable: bool,
     },
 
     /// A pane is gone.
@@ -206,6 +322,54 @@ pub enum ServerMessage {
         #[serde(default)]
         token: u64,
     },
+
+    /// A pane is asking to delegate, and a user has to decide.
+    ///
+    /// Sent to subscribed interface clients only.
+    DelegatePending {
+        /// Which request.
+        request: RequestId,
+        /// The pane asking.
+        parent: PaneId,
+        /// Its project.
+        project: ProjectId,
+        /// Which harness would run.
+        harness: String,
+        /// What it would be asked to do, in full: approving something you
+        /// cannot read is not approval.
+        task: String,
+        /// How deep the parent already is, for display.
+        #[serde(default)]
+        depth: u8,
+    },
+
+    /// A request will not be asked about again.
+    DelegateResolved {
+        /// Which request.
+        request: RequestId,
+        /// What happened.
+        outcome: DelegateOutcome,
+    },
+
+    /// A subagent has exited, and its caller can stop waiting.
+    DelegateFinished {
+        /// Which request.
+        request: RequestId,
+        /// The subagent's exit code.
+        exit: i32,
+        /// The tail of what it printed, for the caller to hand to its agent.
+        #[serde(with = "serde_bytes_compat")]
+        tail: Vec<u8>,
+    },
+
+    /// A message this build does not know.
+    ///
+    /// The protocol's promise is that an older peer skips what it does not
+    /// understand rather than misreading it, and that promise needs somewhere
+    /// for the unknown to land: without this, one unrecognised `type` tag fails
+    /// the whole frame and takes the connection with it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A change to a pane other than output.
@@ -222,6 +386,15 @@ pub enum PaneUpdate {
         /// The new title.
         title: String,
     },
+    /// A change this build does not know.
+    ///
+    /// This enum travels inside [`ServerMessage::PaneChanged`], so without
+    /// somewhere for the unknown to land a newer daemon's extra variant fails
+    /// the whole frame rather than one update — and a client that drops its
+    /// connection over a frame it cannot read reconnects and fails on the next
+    /// one. That loop is what every `Unknown` in this module exists to prevent.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Encodes a byte vector compactly.
