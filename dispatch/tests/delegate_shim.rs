@@ -68,8 +68,12 @@ impl Config {
 
     fn with_delegation_config(label: &str, request_timeout_secs: u64) -> Self {
         let cfg = Self::new(label);
-        let delegation_config = format!("[delegation]\nrequest_timeout_secs = {}\n", request_timeout_secs);
-        std::fs::write(cfg.dir.join("config.toml"), delegation_config).expect("temp dir is writable");
+        let delegation_config = format!(
+            "[delegation]\nrequest_timeout_secs = {}\n",
+            request_timeout_secs
+        );
+        std::fs::write(cfg.dir.join("config.toml"), delegation_config)
+            .expect("temp dir is writable");
         cfg
     }
 
