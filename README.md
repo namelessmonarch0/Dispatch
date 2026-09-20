@@ -97,8 +97,10 @@ An agent in a pane can ask for a second agent to work on something:
 dispatch delegate "write the tests for the http client"
 ```
 
-Dispatch asks you first, every time. The subagent runs as a pane under the one
-that asked, and the caller gets its output and exit code when it finishes.
+Dispatch asks you first, every time — unless you have approved that pane
+wholesale with `A`, which lasts until the daemon stops. The subagent runs as a
+pane under the one that asked, and the caller gets its output and exit code when
+it finishes.
 
 Delegation needs two things. The daemon must own the panes (`--attach`), because
 it is what starts the subagent; and the harness must declare a non-interactive
@@ -124,7 +126,7 @@ request_timeout_secs = 600
 ```
 
 The approval prompt takes `a` to approve, `d` to deny, `A` to approve everything
-from that pane for the daemon's lifetime, and `Esc` to defer. The status line
+from that pane for this daemon's lifetime, and `Esc` to defer. The status line
 reports how many are waiting and which key reopens them — that key is `^a a`.
 
 There are also keyboard bindings to open and close a subagent pane: `^a s` expands
@@ -140,7 +142,10 @@ dispatch delegate "write the docs"  > docs.md  &
 wait
 ```
 
-Exit codes follow `sysexits(3)` so an agent can branch without parsing prose:
+Exit codes follow `sysexits(3)` so an agent can branch without parsing prose.
+Dispatch's own codes (69, 75, 77, 78) sit inside the same 0–125 band a subagent's
+own exit code comes from, so a subagent that exits 78 is indistinguishable from a
+refusal. An agent branching on exit codes should keep that in mind.
 
 | Code | Meaning |
 |---|---|

@@ -58,9 +58,9 @@ enum Command {
     ///
     /// Runs inside a Dispatch pane. Prints the subagent's output on stdout and
     /// progress on stderr, and exits with the subagent's own status: 69 when no
-    /// daemon is listening, 75 when the request went unanswered (or its
-    /// subagent was killed before it could exit), 77 when it was denied, 78
-    /// when it was refused.
+    /// daemon is listening, 75 when the request timed out or the connection
+    /// dropped or its subagent was killed before it could exit, 77 when it was
+    /// denied, 78 when it was refused.
     Delegate {
         /// Which harness to run. Defaults to this pane's own.
         #[arg(long)]

@@ -1204,7 +1204,7 @@ fn a_blanket_approved_subagent_survives_its_caller() {
 }
 
 #[test]
-fn a_request_nobody_answers_is_refused_when_its_time_is_up() {
+fn a_request_nobody_answers_is_expired_when_its_time_is_up() {
     let (mut daemon, project, _dir) = daemon_with_limits(
         "delegate-timeout",
         DelegationLimits {
@@ -1225,7 +1225,7 @@ fn a_request_nobody_answers_is_refused_when_its_time_is_up() {
         seen.iter().any(|m| matches!(
             m,
             ServerMessage::DelegateResolved {
-                outcome: dispatch_proto::DelegateOutcome::Refused { .. },
+                outcome: dispatch_proto::DelegateOutcome::Expired { .. },
                 ..
             }
         )),

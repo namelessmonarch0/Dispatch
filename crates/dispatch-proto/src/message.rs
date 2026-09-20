@@ -93,13 +93,33 @@ pub enum DelegateOutcome {
     },
     /// The user denied it.
     Denied,
-    /// The daemon refused it without asking: a cap, a missing task form, or a
-    /// deadline that passed.
+    /// The daemon refused it without asking: a cap or a missing task form.
+    ///
+    /// Distinct from [`Expired`] because the two call for opposite responses: a
+    /// refusal will not change if the caller asks again, while a request that
+    /// timed out may well be answered next time.
     Refused {
         /// Why, in words, because an agent reads this and should be able to act
         /// on it.
         reason: String,
     },
+    /// Nobody answered before the deadline.
+    ///
+    /// Distinct from [`Refused`] because the two call for opposite responses: a
+    /// refusal will not change if the caller asks again, while a request that
+    /// timed out may well be answered next time.
+    Expired {
+        /// How long it waited, so the caller can say so.
+        after_secs: u64,
+    },
+    /// A message this build does not know.
+    ///
+    /// The protocol's promise is that an older peer skips what it does not
+    /// understand rather than misreading it, and that promise needs somewhere
+    /// for the unknown to land: without this, one unrecognised variant fails
+    /// the whole frame and takes the connection with it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Something a client asks of the daemon.

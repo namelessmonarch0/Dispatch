@@ -77,8 +77,16 @@ pub fn run(harness: Option<String>, size: (u16, u16), task: &str) -> Result<Exit
                         eprintln!("[dispatch] denied");
                         return Ok(ExitCode::from(exit::NOPERM));
                     }
+                    DelegateOutcome::Expired { after_secs } => {
+                        eprintln!("[dispatch] nobody answered within {after_secs} seconds");
+                        return Ok(ExitCode::from(exit::TEMPFAIL));
+                    }
                     DelegateOutcome::Refused { reason } => {
                         eprintln!("[dispatch] refused: {reason}");
+                        return Ok(ExitCode::from(exit::CONFIG));
+                    }
+                    DelegateOutcome::Unknown => {
+                        eprintln!("[dispatch] unexpected outcome from daemon");
                         return Ok(ExitCode::from(exit::CONFIG));
                     }
                 },

@@ -269,12 +269,13 @@ Exit codes follow `sysexits(3)` so an agent can branch without parsing prose:
 |---|---|
 | 0–125 | the subagent's own exit code |
 | 69 | no daemon is listening |
-| 75 | timed out waiting for approval |
+| 75 | timed out, or the connection dropped, or the subagent was stopped before it finished |
 | 77 | denied by the user |
 | 78 | refused: caps, or the harness has no `[task]` form |
 
-These are documented in `--help`, which an agent reads far more often than a
-README.
+Dispatch's own codes sit inside the same band a subagent's own exit code comes
+from, so a subagent that exits 78 is indistinguishable from a refusal. These are
+documented in `--help`, which an agent reads far more often than a README.
 
 ## Testing
 

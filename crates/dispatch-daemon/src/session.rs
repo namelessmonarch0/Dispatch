@@ -1019,11 +1019,8 @@ impl Daemon {
             self.resolve(
                 request,
                 waiting.caller,
-                DelegateOutcome::Refused {
-                    reason: format!(
-                        "nobody answered within {} seconds",
-                        self.limits.request_timeout_secs
-                    ),
+                DelegateOutcome::Expired {
+                    after_secs: self.limits.request_timeout_secs,
                 },
             );
         }
