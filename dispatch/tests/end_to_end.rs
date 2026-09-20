@@ -31,6 +31,8 @@ args = ["-c", "{task}"]
 struct Harness {
     session: PtySession,
     reader: ScreenReader,
+    /// Where this Dispatch's logs are, for a failing test to hand over.
+    config_dir: std::path::PathBuf,
     /// Kept alive for as long as the Dispatch under test, when the test did not
     /// bring its own.
     _config: Option<tempdir::TempDir>,
@@ -175,7 +177,34 @@ impl Daemon {
             .spawn()
             .expect("the dispatchd binary can be started");
 
-        Self(child)
+        let daemon = Self(child);
+        daemon.wait_until_listening(fixture);
+        daemon
+    }
+
+    /// Blocks until the daemon accepts a connection, or explains why it never
+    /// did.
+    ///
+    /// Without this a test that starts a daemon and then watches a client blames
+    /// the client for a daemon that never came up — which is exactly how a CI
+    /// failure read before this existed, while the daemon's own log was deleted
+    /// with the fixture.
+    fn wait_until_listening(&self, fixture: &Fixture) {
+        let endpoint = fixture.config.path().join("dispatchd.sock");
+        let deadline = Instant::now() + SETTLE;
+
+        while Instant::now() < deadline {
+            if dispatch_os::ipc::Connection::connect_to(&endpoint).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        panic!(
+            "the daemon never listened on {}; its log says:\n{}",
+            endpoint.display(),
+            log_tail(&fixture.config.path().join("dispatchd.log"))
+        );
     }
 }
 
@@ -253,6 +282,7 @@ impl Harness {
         Self {
             session,
             reader: ScreenReader::new().expect("a reader can be created"),
+            config_dir: fixture.config.path().to_path_buf(),
             _config: None,
         }
     }
@@ -324,6 +354,36 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         self.session.terminate();
+
+        // A screen dump says what the interface looked like; the logs say why.
+        // Printed only when the test is already failing, and only on the way
+        // out, because the fixture directory goes with it.
+        if std::thread::panicking() {
+            let dir = &self.config_dir;
+            eprintln!(
+                "--- dispatch.log ---\n{}",
+                log_tail(&dir.join("dispatch.log"))
+            );
+            eprintln!(
+                "--- dispatchd.log ---\n{}",
+                log_tail(&dir.join("dispatchd.log"))
+            );
+        }
+    }
+}
+
+/// The last lines of a log, or a note saying why there are none.
+///
+/// These tests drive whole processes, so a failure's explanation is usually in a
+/// file that the fixture is about to delete.
+fn log_tail(path: &std::path::Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let lines: Vec<&str> = text.lines().collect();
+            let start = lines.len().saturating_sub(40);
+            lines[start..].join("\n")
+        }
+        Err(error) => format!("({}: {error})", path.display()),
     }
 }
 
@@ -561,6 +621,12 @@ fn a_picker_takes_the_keyboard_while_it_is_open() {
     app.send(b"jjj");
     app.send(b"\x1b");
     assert!(app.wait_for(|lines| !contains(lines, "New pane")));
+
+    // A gap after Esc, deliberately: a terminal tells a bare Esc from the start
+    // of an escape sequence by timing, so Esc followed immediately by `e` can be
+    // read as Alt-e and swallow both. Real typing has this gap; a test writing
+    // two buffers back to back does not.
+    std::thread::sleep(Duration::from_millis(150));
 
     // Those keys went to the picker, so the shell never saw them.
     app.send(b"echo after-picker\r");
