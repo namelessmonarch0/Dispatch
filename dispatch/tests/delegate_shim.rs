@@ -92,7 +92,7 @@ impl Drop for Config {
 }
 
 /// A running `dispatchd`, killed when the test ends however it ends.
-struct Daemon(std::process::Child);
+struct Daemon(std::process::Child, PathBuf);
 
 impl Daemon {
     fn start(config: &Config, project: &std::path::Path) -> Self {
@@ -123,7 +123,7 @@ impl Daemon {
             .spawn()
             .expect("the dispatchd binary can be started");
 
-        Self(child)
+        Self(child, config.dir.clone())
     }
 }
 
@@ -131,6 +131,30 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+
+        // Only when the test is already failing, and only here, because the
+        // fixture directory is about to go. A client that connects and then
+        // waits for a handshake that never comes cannot say whether the daemon
+        // bound, accepted, or answered — the daemon's log can.
+        if std::thread::panicking() {
+            eprintln!(
+                "--- dispatchd.log ({}) ---\n{}",
+                self.1.display(),
+                log_tail(&self.1.join("dispatchd.log"))
+            );
+        }
+    }
+}
+
+/// The last lines of a log, or a note saying why there are none.
+fn log_tail(path: &std::path::Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let lines: Vec<&str> = text.lines().collect();
+            let start = lines.len().saturating_sub(60);
+            lines[start..].join("\n")
+        }
+        Err(error) => format!("({}: {error})", path.display()),
     }
 }
 
