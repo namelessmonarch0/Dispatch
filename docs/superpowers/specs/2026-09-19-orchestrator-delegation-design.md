@@ -162,8 +162,10 @@ against its caller, not against the daemon that owns it.
 
 ## Interface
 
-The sidebar gains one level of nesting: children indented under their parent with
-an outcome marker — `⋯` running, `✓` clean exit, `!` non-zero, `⊘` tombstone. A
+The sidebar gains one level of nesting — which is the whole tree at the default
+`max_depth` of 1, and a documented limit above it: a subagent's own subagent is
+tracked, focusable and safe from deletion, but has no row. Children are indented
+under their parent with an outcome marker — `⋯` running, `✓` clean exit, `!` non-zero, `⊘` tombstone. A
 child's first title is the opening words of its task, which the title scanner
 replaces as soon as the agent names itself.
 

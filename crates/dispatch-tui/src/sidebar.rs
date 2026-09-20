@@ -125,6 +125,15 @@ impl Widget for Sidebar<'_> {
 
                 y = self.render_pane(buf, area, y, pane, focused, 2);
 
+                // One level, deliberately: at the default `max_depth` of 1 a
+                // subagent cannot delegate, so one level is the whole tree.
+                //
+                // Raise that cap and a subagent's own subagent is tracked in
+                // state — the daemon owns it, `^a s` can focus it, and closing
+                // its ancestors will not delete it — but it has no row here.
+                // Drawing an arbitrary depth in a 28-column column needs a
+                // shape nobody has designed yet, so the honest thing is to say
+                // where the drawing stops rather than imply it does not.
                 for child in self.state.children_of(pane.id) {
                     if y >= area.y + area.height {
                         return;
