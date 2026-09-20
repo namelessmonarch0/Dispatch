@@ -34,10 +34,13 @@ const TICK: Duration = Duration::from_millis(8);
 /// How long a subagent's output may go on arriving after its process exited.
 ///
 /// A pane's exit and the end of its output are separate events, so a caller
-/// waiting on the output is answered once the pseudoterminal is finished, not
-/// once the process is gone. That can never come — a grandchild holding the
-/// pseudoterminal open keeps it from ever reaching end-of-file — so the caller
-/// is answered anyway after this, with whatever arrived.
+/// waiting on the output is answered once the pseudoterminal is finished rather
+/// than once the process is gone. Finished may never come, and not only in the
+/// awkward case of a grandchild holding the pseudoterminal open: on Windows it
+/// never comes at all, because `Pty` keeps the pseudoconsole alive on purpose
+/// and the master therefore never reaches end-of-file. So this is the ordinary
+/// path there, not a fallback, and it has to be long enough for ConPTY's pipe to
+/// catch up with the process object.
 const TAIL_GRACE: Duration = Duration::from_millis(250);
 
 /// Failures starting or running the daemon.
@@ -608,6 +611,11 @@ impl Daemon {
         // client draws has to be what the daemon is holding.
         let durable = pane.durable;
         self.panes.insert(id, pane);
+
+        // At INFO because a pane appearing and a pane surviving a client are the
+        // two things a report about the daemon is usually about, and without
+        // this the log says a project opened and then nothing.
+        tracing::info!(pane = %id, %harness, project = %project, "pane spawned");
 
         // Every client hears about it, not just the one that asked, because
         // they are all looking at the same fleet.

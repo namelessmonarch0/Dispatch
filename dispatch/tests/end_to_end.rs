@@ -321,14 +321,14 @@ impl Harness {
 
         self.send(b"\r");
         assert!(
-            self.wait_for(move |lines| sidebar_panes(lines) > before),
+            self.wait_for(move |lines| panes_shown(lines) > before),
             "a pane should be listed after choosing a harness"
         );
     }
 
     /// How many panes the sidebar lists.
     fn shell_panes(&mut self) -> usize {
-        sidebar_panes(&self.lines())
+        panes_shown(&self.lines())
     }
 
     /// Waits until the screen satisfies `predicate`, returning whether it did.
@@ -387,15 +387,24 @@ fn log_tail(path: &std::path::Path) -> String {
     }
 }
 
-/// How many panes the sidebar lists.
+/// How many pane rows the sidebar shows.
 ///
-/// The last row is the status line, which names a harness too: attached, it says
-/// which one is starting, and a pane that is merely starting has no screen to
-/// type at yet. Counting it would have a test type into nothing.
-fn sidebar_panes(lines: &[String]) -> usize {
+/// Counted by a row's indent, not by its label. A pane is named by whatever its
+/// agent calls itself, and the shell this harness starts on Windows announces a
+/// title the moment it is ready — so the harness's display name is on the screen
+/// for a moment and gone, and counting it measured the shell rather than the
+/// fleet. Project rows start at the left edge; every pane is indented under one.
+///
+/// The last row is the status line, which is not part of the sidebar.
+fn panes_shown(lines: &[String]) -> usize {
+    let width = dispatch_tui::sidebar::WIDTH as usize;
     let sidebar = lines.split_last().map_or(lines, |(_status, rest)| rest);
 
-    sidebar.iter().filter(|l| l.contains("Test Shell")).count()
+    sidebar
+        .iter()
+        .map(|line| line.chars().take(width).collect::<String>())
+        .filter(|column| column.starts_with(' ') && !column.trim().is_empty())
+        .count()
 }
 
 /// Whether the sidebar — not a pane — shows `needle`.
@@ -728,14 +737,14 @@ fn agents_survive_the_client_exiting() {
     // Quit the client. The pane belongs to the daemon, so nothing is killed.
     first.send(b"\x01q");
     assert!(
-        first.wait_for(|lines| sidebar_panes(lines) == 0),
+        first.wait_for(|lines| panes_shown(lines) == 0),
         "the client should quit"
     );
     drop(first);
 
     let mut second = Harness::attached(&fixture, Size::new(100, 30));
     assert!(
-        second.wait_for(|lines| sidebar_panes(lines) == 1),
+        second.wait_for(|lines| panes_shown(lines) == 1),
         "a new client should be told about the pane that is still running"
     );
 
@@ -783,7 +792,7 @@ fn a_client_waits_for_a_daemon_that_is_restarted() {
     // The panes went with the old daemon; the project comes back, and the
     // interface still works.
     assert!(
-        dispatch.wait_for(|lines| sidebar_panes(lines) == 0 && contains(lines, "project")),
+        dispatch.wait_for(|lines| panes_shown(lines) == 0 && contains(lines, "project")),
         "the view should be rebuilt from what the new daemon says"
     );
     dispatch.spawn_shell();
@@ -865,7 +874,7 @@ fn attaching_starts_a_daemon_when_none_is_listening() {
     // And it outlives the client that started it: a second client finds it.
     drop(dispatch);
     let mut second = Harness::attached_only(&fixture, Size::new(100, 30));
-    let found = second.wait_for(|lines| sidebar_panes(lines) == 1);
+    let found = second.wait_for(|lines| panes_shown(lines) == 1);
 
     stop_recorded_daemon(&fixture);
     assert!(
@@ -918,7 +927,7 @@ fn a_delegation_is_approved_by_hand_and_its_output_comes_back() {
     dispatch.send(b"a");
 
     assert!(
-        dispatch.wait_for(|lines| sidebar_panes(lines) == 2),
+        dispatch.wait_for(|lines| panes_shown(lines) == 2),
         "the subagent should be listed under its parent"
     );
     assert!(
@@ -947,7 +956,7 @@ fn a_denied_delegation_runs_nothing_and_says_so() {
         "the agent should be told, in its own pane"
     );
     assert_eq!(
-        sidebar_panes(&dispatch.lines()),
+        panes_shown(&dispatch.lines()),
         1,
         "and nothing should have been started"
     );

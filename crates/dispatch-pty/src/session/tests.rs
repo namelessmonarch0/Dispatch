@@ -322,11 +322,61 @@ fn a_session_stops_asking_for_redraws_once_a_pane_has_exited() {
 }
 
 #[test]
-fn a_pty_is_not_finished_until_its_output_has_been_delivered() {
-    // The exit and the output are separate events. Answering a delegation at
-    // the exit sends a tail with none of the subagent's output in it, which is
-    // what happens on Windows, where ConPTY's pipe lags the process object.
+fn a_pty_delivers_what_a_child_printed_after_reporting_its_exit() {
+    // The exit and the end of the output are separate events. Anything that
+    // reads a child's whole output -- a delegation's tail, say -- has to keep
+    // draining after the exit, or it reports the answer with the answer
+    // missing.
     let mut pty = Pty::spawn(&shell("echo finished-marker"), &cwd(), Size::new(80, 24))
+        .expect("spawning succeeds");
+
+    let mut output = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut exited = None;
+
+    while std::time::Instant::now() < deadline {
+        output.extend_from_slice(&pty.drain());
+
+        if pty.is_finished() {
+            break;
+        }
+
+        // Past the exit, keep draining for a moment: this is the daemon's rule,
+        // and the only one available where end-of-file never comes.
+        match (exited, pty.state()) {
+            (None, RunState::Exited(_)) => exited = Some(std::time::Instant::now()),
+            (Some(at), _) if at.elapsed() >= Duration::from_millis(250) => break,
+            _ => {}
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        matches!(pty.state(), RunState::Exited(0)),
+        "got {:?}",
+        pty.state()
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("finished-marker"),
+        "everything the child printed should have arrived by then, got {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "the pseudoconsole is held open on purpose, so the master never reaches end-of-file"
+)]
+fn a_finished_pty_is_one_whose_output_is_complete() {
+    // `is_finished` is the honest signal: both senders gone means the reader
+    // reached end-of-file and the waiter reported the exit. Windows cannot give
+    // it -- `Pty` holds the slave so the pseudoconsole stays alive, which is what
+    // keeps a child from writing into a dead console -- so there the daemon's
+    // grace period is the only rule, and the test above is the one that covers
+    // it.
+    let mut pty = Pty::spawn(&shell("echo complete-marker"), &cwd(), Size::new(80, 24))
         .expect("spawning succeeds");
 
     let mut output = Vec::new();
@@ -337,18 +387,10 @@ fn a_pty_is_not_finished_until_its_output_has_been_delivered() {
         std::thread::sleep(Duration::from_millis(10));
     }
 
+    assert!(pty.is_finished(), "the reader should reach end-of-file");
     assert!(
-        pty.is_finished(),
-        "the pseudoterminal should reach end-of-file once the child is gone"
-    );
-    assert!(
-        matches!(pty.state(), RunState::Exited(0)),
-        "got {:?}",
-        pty.state()
-    );
-    assert!(
-        String::from_utf8_lossy(&output).contains("finished-marker"),
-        "everything the child printed should have arrived by then, got {:?}",
+        String::from_utf8_lossy(&output).contains("complete-marker"),
+        "a finished pseudoterminal has delivered everything, got {:?}",
         String::from_utf8_lossy(&output)
     );
 }
