@@ -316,6 +316,16 @@ plumbing.
 Manual, because it needs credentials and a model: one real `claude -p` subagent,
 approved, read back by its parent.
 
+### Manual check, performed once per release
+
+With a real `claude` harness and credentials:
+
+1. `dispatchd <project>` and `dispatch --attach`.
+2. Spawn a `claude` pane. Ask it to run `dispatch delegate "summarise this repo"`.
+3. The prompt appears; approve with `a`.
+4. The subagent appears nested, runs, and exits; its summary arrives in the
+   parent pane, and the parent agent can quote it back.
+
 ## Out of scope
 
 - An MCP front-end onto the same messages.
