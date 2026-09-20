@@ -133,7 +133,7 @@ fn serve_one(
             let serve = Arc::clone(&serve);
 
             let handler = std::thread::spawn(move || {
-                let (mut reader, writer) = connection.split().expect("splitting succeeds");
+                let (mut reader, writer) = connection.split();
                 let mut writer: Writer = Box::new(writer);
 
                 let Ok(hello) = Frame::read::<_, ClientMessage>(&mut reader) else {

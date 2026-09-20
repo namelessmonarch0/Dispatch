@@ -6,6 +6,9 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::Mutex;
+
+mod pairing;
 
 /// Failures opening or accepting a connection.
 #[derive(Debug, thiserror::Error)]
@@ -52,9 +55,13 @@ pub fn endpoint() -> Result<PathBuf, IpcError> {
 
 /// A connected client or server end.
 ///
-/// Both directions of one connection; the protocol layer reads and writes
-/// frames over it.
-pub struct Connection(imp::Stream);
+/// Two transport connections, one per direction, paired by [`pairing`]. They
+/// are separate so that a thread parked reading cannot hold up a thread
+/// writing -- which one connection cannot promise on Windows.
+pub struct Connection {
+    reader: imp::Stream,
+    writer: imp::Stream,
+}
 
 impl std::fmt::Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -74,36 +81,41 @@ impl Connection {
     /// a configuration change mid-session cannot silently move it to a different
     /// daemon than the one its panes are on.
     pub fn connect_to(endpoint: &std::path::Path) -> Result<Self, IpcError> {
-        imp::connect(endpoint).map(Self)
+        let (reader, writer) = pairing::dial(|| imp::connect(endpoint))?;
+        Ok(Self { reader, writer })
     }
 
     /// Splits into a reader and a writer.
     ///
     /// The loop reads on one thread and writes from another, so neither
     /// blocks the other.
-    pub fn split(self) -> Result<(impl Read + Send, impl Write + Send), IpcError> {
-        imp::split(self.0)
+    pub fn split(self) -> (impl Read + Send, impl Write + Send) {
+        (self.reader, self.writer)
     }
 }
 
 impl Read for Connection {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf)
+        self.reader.read(buf)
     }
 }
 
 impl Write for Connection {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
+        self.writer.write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
+        self.writer.flush()
     }
 }
 
 /// Accepts client connections.
-pub struct Listener(imp::Listener);
+pub struct Listener {
+    inner: imp::Listener,
+    /// Connections whose partner has not arrived yet.
+    halves: Mutex<pairing::Halves<imp::Stream>>,
+}
 
 impl std::fmt::Debug for Listener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -121,18 +133,57 @@ impl Listener {
                 .map_err(|e| IpcError::io(format!("creating {}", parent.display()), e))?;
         }
 
-        imp::bind(&path).map(Self)
+        Ok(Self {
+            inner: imp::bind(&path)?,
+            halves: Mutex::new(pairing::Halves::new()),
+        })
     }
 
-    /// Waits for the next client.
+    /// Waits for the next client, meaning both halves of one.
+    ///
+    /// Connections arrive one at a time and a client sends two, so this
+    /// accepts until some client's pair is complete. The preamble is read here
+    /// rather than on a thread of its own: a client that connects and then
+    /// neither writes nor exits would hold up this loop, but it is a process of
+    /// the same user -- the transport admits no one else -- and the simplicity
+    /// is worth more than a defence against the user's own wedged build. A
+    /// client that dies mid-handshake closes its connection instead, which
+    /// fails the read at once. Unix bounds the wait as well; a synchronous
+    /// named pipe read cannot be given a timeout.
+    ///
+    /// A client that dies *between* its two connections leaves the half it did
+    /// announce waiting for a partner that will never come, and nothing reaps
+    /// it. The window is the microseconds between two connects, so this costs
+    /// one idle entry per client that died inside it -- not a budget worth a
+    /// reaper on a local, single-user daemon.
     pub fn accept(&self) -> Result<Connection, IpcError> {
-        imp::accept(&self.0).map(Connection)
+        loop {
+            let mut stream = imp::accept(&self.inner)?;
+
+            imp::bound_preamble_wait(&stream);
+            let half = pairing::listen_for(&mut stream);
+            imp::unbounded_reads(&stream);
+
+            // A client that vanished, stalled, or was speaking to something
+            // else. Nothing is owed to it, and the next client is still owed a
+            // listener.
+            let Ok((token, role)) = half else { continue };
+
+            let paired = self
+                .halves
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .offer(token, role, stream);
+
+            if let Some((reader, writer)) = paired {
+                return Ok(Connection { reader, writer });
+            }
+        }
     }
 }
 
 #[cfg(unix)]
 mod imp {
-    use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::Path;
 
@@ -191,11 +242,18 @@ mod imp {
             .map_err(|e| IpcError::io("accepting a connection", e))
     }
 
-    pub(super) fn split(stream: Stream) -> Result<(impl Read + Send, impl Write + Send), IpcError> {
-        let writer = stream
-            .try_clone()
-            .map_err(|e| IpcError::io("splitting the connection", e))?;
-        Ok((stream, writer))
+    /// Bounds how long a client may take over its preamble.
+    ///
+    /// The accept loop reads the preamble itself, so an indefinite wait here
+    /// would be a wait every other client shares. A failure to set the timeout
+    /// only loses that bound, which is why it is ignored.
+    pub(super) fn bound_preamble_wait(stream: &Stream) {
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    }
+
+    /// Restores the blocking reads the frame loop expects.
+    pub(super) fn unbounded_reads(stream: &Stream) {
+        let _ = stream.set_read_timeout(None);
     }
 }
 
@@ -318,23 +376,46 @@ mod imp {
         Ok(handle as isize)
     }
 
+    /// How long a client waits for a busy pipe before giving up.
+    ///
+    /// Matches the client's own handshake timeout: past it the caller has
+    /// stopped waiting anyway.
+    const BUSY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+
     pub(super) fn connect(path: &Path) -> Result<Stream, IpcError> {
         let name = pipe_name(path);
+        let deadline = std::time::Instant::now() + BUSY_PATIENCE;
 
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&name)
-            .map(Stream)
-            .map_err(|e| match e.raw_os_error() {
-                // Every instance is busy serving someone, which still means a
-                // daemon is there.
-                Some(code) if code == ERROR_PIPE_BUSY as i32 => {
-                    IpcError::io(format!("connecting to {name}"), e)
+        loop {
+            let opened = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&name)
+                .map(Stream);
+
+            let error = match opened {
+                Ok(stream) => return Ok(stream),
+                Err(error) => error,
+            };
+
+            // Every instance is already serving someone. A listener holds one
+            // unconnected instance and opens the next only once a client has
+            // taken it, so two clients -- or one client's two connections --
+            // will land in that gap. A busy pipe means the daemon is there;
+            // waiting is the only correct answer.
+            if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) {
+                if std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
                 }
-                _ if e.kind() == std::io::ErrorKind::NotFound => IpcError::NotRunning(name.clone()),
-                _ => IpcError::io(format!("connecting to {name}"), e),
-            })
+                return Err(IpcError::io(format!("connecting to {name}"), error));
+            }
+
+            return Err(match error.kind() {
+                std::io::ErrorKind::NotFound => IpcError::NotRunning(name),
+                _ => IpcError::io(format!("connecting to {name}"), error),
+            });
+        }
     }
 
     pub(super) fn bind(path: &Path) -> Result<Listener, IpcError> {
@@ -388,13 +469,12 @@ mod imp {
         }))
     }
 
-    pub(super) fn split(stream: Stream) -> Result<(impl Read + Send, impl Write + Send), IpcError> {
-        let writer = stream
-            .0
-            .try_clone()
-            .map_err(|e| IpcError::io("splitting the connection", e))?;
-        Ok((stream, Stream(writer)))
-    }
+    /// A synchronous named pipe read cannot be given a timeout, so there is no
+    /// bound to set. The accept loop's comment says what that costs.
+    pub(super) fn bound_preamble_wait(_stream: &Stream) {}
+
+    /// Nothing was bounded, so nothing is restored.
+    pub(super) fn unbounded_reads(_stream: &Stream) {}
 }
 
 #[cfg(test)]
@@ -403,8 +483,8 @@ mod tests {
 
     /// Points the endpoint at a directory of this test's own.
     ///
-    /// The variable is process-wide, so these tests run one at a time; they
-    /// are marked accordingly and kept few.
+    /// The variable is process-wide, so every test that touches it holds
+    /// `crate::env_lock()` for as long as its redirection lasts.
     struct Endpoint {
         dir: PathBuf,
         previous: Option<std::ffi::OsString>,
@@ -439,12 +519,9 @@ mod tests {
         }
     }
 
-    /// Serialises the tests that move the process-wide endpoint.
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn a_client_and_server_exchange_bytes() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::env_lock();
         let _endpoint = Endpoint::new("exchange");
 
         let listener = Listener::bind().expect("binding succeeds");
@@ -472,11 +549,187 @@ mod tests {
         assert_eq!(&reply, b"world");
     }
 
+    /// Reads four bytes on a thread of its own and reports them back.
+    ///
+    /// A deadlock is the failure these tests look for, so nothing waits on a
+    /// thread without a bound: a hung `join` would burn a CI job's whole
+    /// timeout instead of failing.
+    fn reading(mut reader: impl Read + Send + 'static) -> std::sync::mpsc::Receiver<[u8; 4]> {
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4];
+            if reader.read_exact(&mut buf).is_ok() {
+                let _ = sent.send(buf);
+            }
+        });
+        received
+    }
+
+    /// How long a test waits before calling something deadlocked.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    #[test]
+    fn a_parked_reader_does_not_hold_up_a_writer() {
+        // The defect this transport exists to fix. Both ends park a reader
+        // thread and then write from another -- which is what every Dispatch
+        // connection does -- and on Windows a single connection's duplicated
+        // handles serialise those operations into a deadlock.
+        //
+        // It passes on Unix either way: a socket's cloned descriptors were
+        // never the problem. It is here so the transport carries its own
+        // regression test on the platform that needs one.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("parked");
+
+        let listener = Listener::bind().expect("binding succeeds");
+
+        let (served, from_server) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (reader, mut writer) = listener.accept().expect("accepting succeeds").split();
+            let heard = reading(reader);
+            writer.write_all(b"pong").expect("writing succeeds");
+            writer.flush().expect("flushing succeeds");
+            let _ = served.send(heard.recv_timeout(PATIENCE));
+        });
+
+        let (reader, mut writer) = Connection::connect().expect("connecting succeeds").split();
+        let heard = reading(reader);
+        writer.write_all(b"ping").expect("writing succeeds");
+        writer.flush().expect("flushing succeeds");
+
+        assert_eq!(
+            heard.recv_timeout(PATIENCE),
+            Ok(*b"pong"),
+            "the client's parked reader never saw the daemon's write"
+        );
+        assert_eq!(
+            from_server.recv_timeout(PATIENCE),
+            Ok(Ok(*b"ping")),
+            "the daemon's parked reader never saw the client's write"
+        );
+    }
+
+    #[test]
+    fn two_clients_racing_get_their_own_connections() {
+        // Four connections race into one listener. Pairing them by arrival
+        // order would hand each client half of the other's.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("concurrent");
+
+        let listener = Listener::bind().expect("binding succeeds");
+
+        let (echoed, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (reader, mut writer) = listener.accept().expect("accepting succeeds").split();
+                let heard = reading(reader)
+                    .recv_timeout(PATIENCE)
+                    .expect("a client wrote");
+                // Echo what this client said back down its own half. A crossed
+                // pair sends it to the other client.
+                writer.write_all(&heard).expect("writing succeeds");
+                writer.flush().expect("flushing succeeds");
+                let _ = echoed.send(heard);
+            }
+        });
+
+        let clients: Vec<_> = [*b"aaaa", *b"bbbb"]
+            .into_iter()
+            .map(|name| {
+                std::thread::spawn(move || {
+                    let (reader, mut writer) =
+                        Connection::connect().expect("connecting succeeds").split();
+                    writer.write_all(&name).expect("writing succeeds");
+                    writer.flush().expect("flushing succeeds");
+                    (name, reading(reader).recv_timeout(PATIENCE))
+                })
+            })
+            .collect();
+
+        for client in clients {
+            let (name, heard) = client.join().expect("the client thread finishes");
+            assert_eq!(
+                heard,
+                Ok(name),
+                "a client was handed the other client's connection"
+            );
+        }
+
+        let mut served = [
+            done.recv_timeout(PATIENCE)
+                .expect("the first client is served"),
+            done.recv_timeout(PATIENCE)
+                .expect("the second client is served"),
+        ];
+        served.sort_unstable();
+        assert_eq!(served, [*b"aaaa", *b"bbbb"]);
+    }
+
+    #[test]
+    fn a_client_whose_partner_never_comes_does_not_shut_out_the_next_one() {
+        // One connection with a valid preamble and no partner behind it. It
+        // waits in the table forever; the listener owes the next client a
+        // connection regardless.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("orphan");
+
+        let listener = Listener::bind().expect("binding succeeds");
+        let path = endpoint().expect("resolves");
+
+        let (served, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (reader, _writer) = listener.accept().expect("accepting succeeds").split();
+            let _ = served.send(reading(reader).recv_timeout(PATIENCE));
+        });
+
+        let mut orphan = imp::connect(&path).expect("connecting succeeds");
+        pairing::half_for_test(&mut orphan).expect("announcing succeeds");
+
+        let (_reader, mut writer) = Connection::connect().expect("connecting succeeds").split();
+        writer.write_all(b"real").expect("writing succeeds");
+        writer.flush().expect("flushing succeeds");
+
+        assert_eq!(
+            done.recv_timeout(PATIENCE),
+            Ok(Ok(*b"real")),
+            "a half-connected client must not cost the next one its connection"
+        );
+    }
+
+    #[test]
+    fn a_client_that_died_mid_handshake_is_forgotten() {
+        // Connected, then gone before saying anything. The read fails at once
+        // and the listener carries on.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("vanished");
+
+        let listener = Listener::bind().expect("binding succeeds");
+        let path = endpoint().expect("resolves");
+
+        let (served, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (reader, _writer) = listener.accept().expect("accepting succeeds").split();
+            let _ = served.send(reading(reader).recv_timeout(PATIENCE));
+        });
+
+        drop(imp::connect(&path).expect("connecting succeeds"));
+
+        let (_reader, mut writer) = Connection::connect().expect("connecting succeeds").split();
+        writer.write_all(b"real").expect("writing succeeds");
+        writer.flush().expect("flushing succeeds");
+
+        assert_eq!(
+            done.recv_timeout(PATIENCE),
+            Ok(Ok(*b"real")),
+            "a client that vanished must not cost the next one its connection"
+        );
+    }
+
     #[test]
     fn connecting_with_no_daemon_says_so() {
         // The message a user sees when they start a client first, so it must
         // name the situation rather than an errno.
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::env_lock();
         let _endpoint = Endpoint::new("absent");
 
         let error = Connection::connect().expect_err("nothing is listening");
@@ -489,7 +742,7 @@ mod tests {
     #[test]
     fn a_second_daemon_refuses_to_start() {
         // Two daemons on one endpoint would each own half the panes.
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::env_lock();
         let _endpoint = Endpoint::new("double");
 
         let _first = Listener::bind().expect("the first binds");
@@ -506,7 +759,7 @@ mod tests {
     fn a_socket_left_by_a_dead_daemon_is_replaced() {
         // A socket file outlives the process that made it, so a crash would
         // otherwise block every future start.
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::env_lock();
         let _endpoint = Endpoint::new("stale");
 
         let path = endpoint().expect("resolves");
@@ -524,7 +777,7 @@ mod tests {
         // boundary that keeps another account off it.
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::env_lock();
         let _endpoint = Endpoint::new("permissions");
 
         let _listener = Listener::bind().expect("binding succeeds");
@@ -541,7 +794,7 @@ mod tests {
     #[test]
     fn the_endpoint_follows_the_configuration_directory() {
         // Two configurations must not share one daemon.
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::env_lock();
         let endpoint_guard = Endpoint::new("scoped");
 
         let path = endpoint().expect("resolves");

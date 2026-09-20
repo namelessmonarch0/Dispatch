@@ -98,6 +98,7 @@ mod tests {
 
     #[test]
     fn config_paths_nest_under_the_config_directory() {
+        let _guard = crate::env_lock();
         let dir = config_dir().expect("a home directory exists in the test environment");
 
         assert!(
@@ -114,6 +115,7 @@ mod tests {
 
     #[test]
     fn paths_are_absolute() {
+        let _guard = crate::env_lock();
         for path in [
             config_dir().expect("config_dir resolves"),
             config_file().expect("config_file resolves"),
@@ -135,6 +137,7 @@ mod tests {
 
     #[test]
     fn the_client_and_the_daemon_log_to_different_files() {
+        let _guard = crate::env_lock();
         // Two processes appending to one file interleave their lines.
         let client = log_file().expect("log_file resolves");
         let daemon = daemon_log_file().expect("daemon_log_file resolves");
@@ -143,6 +146,7 @@ mod tests {
 
     #[test]
     fn config_and_log_are_distinct_locations() {
+        let _guard = crate::env_lock();
         let config = config_file().expect("config_file resolves");
         let log = log_file().expect("log_file resolves");
         assert_ne!(config, log);

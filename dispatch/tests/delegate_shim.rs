@@ -231,7 +231,7 @@ fn wait_for(
 
 /// Connects, says hello as an interface, and subscribes.
 fn attach(config: &Config) -> (Receiver<ServerMessage>, impl std::io::Write) {
-    let (reader, mut writer) = connect(config).split().expect("splitting succeeds");
+    let (reader, mut writer) = connect(config).split();
     let inbox = read_in_background(reader);
 
     Frame::write(

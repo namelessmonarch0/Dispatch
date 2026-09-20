@@ -162,7 +162,7 @@ fn attach() -> (Receiver<ServerMessage>, impl std::io::Write) {
 /// Connects, says hello with the given role, and subscribes, returning the
 /// queue and the writer.
 fn attach_as(role: dispatch_proto::Role) -> (Receiver<ServerMessage>, impl std::io::Write) {
-    let (reader, mut writer) = connect().split().expect("splitting succeeds");
+    let (reader, mut writer) = connect().split();
     let inbox = read_in_background(reader);
 
     Frame::write(
@@ -281,7 +281,7 @@ fn a_client_drives_a_pane_through_the_socket() {
     std::fs::create_dir_all(&project_dir).expect("temp dir is writable");
     let _daemon = RunningDaemon::start(&endpoint.dir, &project_dir);
 
-    let (reader, mut writer) = connect().split().expect("splitting succeeds");
+    let (reader, mut writer) = connect().split();
     let inbox = read_in_background(reader);
 
     Frame::write(

@@ -390,7 +390,7 @@ fn connect(name: &str, role: Role, endpoint: &Path) -> Result<Connected, ClientE
         Err(error) => return Err(error.into()),
     };
 
-    let (mut reader, mut writer) = connection.split()?;
+    let (mut reader, mut writer) = connection.split();
 
     Frame::write(
         &mut writer,

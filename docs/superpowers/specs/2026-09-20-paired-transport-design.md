@@ -45,18 +45,20 @@ and it is the one CI can only test slowly.
 
 A client that wants a connection:
 
-1. Opens a transport connection and writes a 17-byte preamble: one role byte
-   followed by a 16-byte token.
+1. Opens a transport connection and writes a 13-byte preamble: one role byte
+   followed by a 12-byte token.
 2. Opens a second transport connection and writes the same token with the other
    role byte.
 3. Returns a `Connection` carrying both, reading on the one it marked
    `TO_CLIENT` and writing on the one it marked `TO_SERVER`.
 
-The token is 16 random bytes, and it identifies which two connections belong
-together. It is not a credential: the transport's own access control — mode
-`0600` on the Unix socket, the default owner-only DACL on the named pipe — is
-what keeps other users out, exactly as before. Pairing has to survive two
-clients connecting at the same instant, and that is all the token is for.
+The token identifies which two connections belong together. It is a process
+identifier and a counter, not random bytes: it only has to distinguish
+connections being paired at the same moment on one machine, and a counter
+guarantees that where randomness merely makes a collision unlikely. It is not a
+credential — the transport's own access control, mode `0600` on the Unix socket
+and the default owner-only DACL on the named pipe, is what keeps other users
+out, exactly as before.
 
 The role byte is named from the client's point of view, so the two ends agree
 without either having to invert anything implicitly:
@@ -68,18 +70,26 @@ without either having to invert anything implicitly:
 
 A listener accepting connections:
 
-1. Accepts a raw connection.
-2. Reads its preamble **on a short-lived thread**, then sends the
-   `(token, role, stream)` to the listener over a channel.
-3. Holds half-pairs in a table keyed by token, and returns a `Connection` as
-   soon as a token has both roles.
+1. Accepts a raw connection and reads its preamble.
+2. Holds half-pairs in a table keyed by token, returning a `Connection` as soon
+   as a token has both roles.
+3. Drops any connection whose preamble could not be read, and keeps accepting.
 
-The preamble read happens off the accept loop deliberately. A client that
-connects and then neither writes nor exits would otherwise wedge the daemon's
-accept loop for every future client. Neither platform can put a timeout on a
-blocking read of a named pipe without overlapped I/O, so the bound comes from
-the thread being disposable instead. A client that dies mid-handshake closes
-its connection, the read fails at once, and the half-pair is dropped.
+The preamble is read in the accept loop, not on a thread of its own. A client
+that connects and then neither writes nor exits therefore holds up the loop for
+every future client. That is accepted rather than defended against: the peer
+can only be a process of the same user, since the transport admits no one else,
+and a client that *dies* mid-handshake closes its connection instead, which
+fails the read at once. Unix bounds the wait further with a two-second read
+timeout on the preamble, cleared before the frame loop sees the connection. A
+synchronous named pipe read cannot be given a timeout, so Windows has only the
+first bound.
+
+A thread per arriving connection was the alternative. It was rejected because
+waking a thread parked in `accept` on listener drop needs a platform-specific
+poke on both platforms, and without one the threads outlive the listener still
+holding its endpoint open — trading a documented stall for a leak in every
+test that binds.
 
 Two preambles that disagree — a duplicate role for one token — are both
 dropped. That is a client bug, not a state to reconcile.
@@ -92,9 +102,11 @@ is no compatibility story to tell, because a client and a daemon that disagree
 about pairing cannot complete a handshake and so never exchange a frame to
 misread. `VERSION` stays at 1.0.
 
-`Connection` keeps its public shape — `connect`, `connect_to`, `split`, and its
-`Read`/`Write` impls — so all six existing `split()` call sites, both liveness
-probes, and every test compile unchanged.
+`Connection` keeps `connect`, `connect_to`, `split` and its `Read`/`Write`
+impls, so both liveness probes keep working. `split` loses its `Result`: with
+the two connections already open there is nothing left in it that can fail, and
+an always-`Ok` return is a lie the six call sites would have to keep
+handling.
 
 ## Windows: a busy pipe must be waited for, not refused
 
@@ -128,6 +140,13 @@ Windows tests too.
   assert it is served.
 - **A client killed mid-handshake is forgotten.** As above, but drop the raw
   connection without writing anything.
+- **One shared lock for the tests that redirect the configuration directory.**
+  `DISPATCH_CONFIG_DIR` belongs to the process, so a test that redirects it
+  changes what every other test resolves — including between two calls inside
+  one assertion. The transport tests already serialised among themselves; the
+  four new ones widened the window enough that `dispatch-os`'s path tests began
+  failing, so every test that sets or reads the variable now takes one
+  crate-wide lock.
 - **The existing suites are the integration test.** `dispatch-client`,
   `dispatchd`, `delegate_shim`, and `end_to_end` all cross the transport; they
   must stay green on Unix and are the evidence that Windows is fixed when CI
