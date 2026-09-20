@@ -345,6 +345,7 @@ impl Daemon {
                         project: pane.project,
                         harness: pane.harness.clone(),
                         parent: pane.parent,
+                        durable: pane.durable,
                     });
 
                     // What the pane has printed, so a client that reattaches
@@ -571,21 +572,22 @@ impl Daemon {
             }
         };
 
-        self.panes.insert(
+        let pane = DaemonPane {
             id,
-            DaemonPane {
-                id,
-                session,
-                harness: harness.to_string(),
-                project,
-                history: Vec::new(),
-                status: PaneStatus::Starting,
-                parent: None,
-                durable: true,
-                request: None,
-                caller: None,
-            },
-        );
+            session,
+            harness: harness.to_string(),
+            project,
+            history: Vec::new(),
+            status: PaneStatus::Starting,
+            parent: None,
+            durable: true,
+            request: None,
+            caller: None,
+        };
+        // Announced from the pane's own field rather than repeated here: what a
+        // client draws has to be what the daemon is holding.
+        let durable = pane.durable;
+        self.panes.insert(id, pane);
 
         // Every client hears about it, not just the one that asked, because
         // they are all looking at the same fleet.
@@ -594,6 +596,7 @@ impl Daemon {
             project,
             harness: harness.to_string(),
             parent: None,
+            durable,
         });
     }
 
@@ -842,6 +845,7 @@ impl Daemon {
             project,
             harness: harness.to_string(),
             parent: Some(parent),
+            durable,
         });
     }
 

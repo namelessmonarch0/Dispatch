@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 
 use crate::id::{PaneId, ProjectId};
-use crate::pane::{HarnessId, Pane, PaneStatus};
+use crate::pane::{HarnessId, Pane, PaneRole, PaneStatus};
 use crate::project::Project;
 
 /// Rejected state transitions.
@@ -153,6 +153,11 @@ impl AppState {
     /// The daemon names the panes it owns, so a client attaching to one takes
     /// the ids it is given rather than minting its own: two clients looking at
     /// the same fleet have to agree on what each pane is called.
+    ///
+    /// A pane named as this one's parent becomes an
+    /// [`PaneRole::Orchestrator`]: that is the whole rule, and this is the one
+    /// moment it can be applied, because a pane's first approved child is
+    /// exactly what arrives here.
     pub fn adopt_pane(&mut self, pane: Pane) -> Result<PaneId, StateError> {
         let project = pane.project;
         if !self.projects.iter().any(|p| p.id == project) {
@@ -162,6 +167,12 @@ impl AppState {
         let id = pane.id;
         if self.panes.iter().any(|p| p.id == id) {
             return Ok(id);
+        }
+
+        if let Some(parent) = pane.parent
+            && let Some(delegating) = self.panes.iter_mut().find(|p| p.id == parent)
+        {
+            delegating.role = PaneRole::Orchestrator;
         }
 
         self.panes.push(pane);
@@ -187,7 +198,9 @@ impl AppState {
     /// That same rule applies all the way down: a doomed child can itself have
     /// live durable children (reachable once `max_depth` allows a delegated
     /// pane to delegate again), so cleaning it up asks the same survivor
-    /// question rather than deleting it outright.
+    /// question rather than deleting it outright — and a child that survives
+    /// that question *as a tombstone* keeps this pane's row open too, since a
+    /// row whose parent is missing is drawn nowhere at all.
     pub fn close_pane(&mut self, id: PaneId) -> Result<(), StateError> {
         if !self.panes.iter().any(|p| p.id == id) {
             return Err(StateError::NoSuchPane(id));
@@ -210,17 +223,10 @@ impl AppState {
             return;
         }
 
-        let survivors: Vec<PaneId> = self
-            .children_of(id)
-            .iter()
-            .filter(|p| p.durable && p.status.is_live())
-            .map(|p| p.id)
-            .collect();
-
         let doomed: Vec<PaneId> = self
             .children_of(id)
             .iter()
-            .filter(|p| !survivors.contains(&p.id))
+            .filter(|p| !(p.durable && p.status.is_live()))
             .map(|p| p.id)
             .collect();
 
@@ -228,7 +234,14 @@ impl AppState {
             self.close_or_tombstone(child, judged);
         }
 
-        if survivors.is_empty() {
+        // Counted after the recursion, not before it: a doomed child with live
+        // durable work of its own has just become a tombstone rather than being
+        // removed, and it is still here naming this pane as its parent. Removing
+        // this pane anyway would leave that tombstone's `parent` pointing at
+        // nothing, and the sidebar draws neither a row whose parent is absent
+        // nor anything below it — so a *running* subagent would go invisible
+        // and unreachable.
+        if self.children_of(id).is_empty() {
             // Read before the pane is removed: once it is gone, its parent
             // link goes with it.
             let tombstone = self.parent_tombstone(id);
@@ -238,14 +251,17 @@ impl AppState {
             // takes the row with it — and may do the same to the tombstone
             // above that, so the collapse has to walk, not just look once.
             self.collapse_tombstones(tombstone);
-        } else if let Some(pane) = self.panes.iter_mut().find(|p| p.id == id) {
+            return;
+        }
+
+        if let Some(pane) = self.panes.iter_mut().find(|p| p.id == id) {
             pane.closed = true;
-            if self.focused_pane == Some(id) {
-                self.focused_pane = None;
-            }
-            if self.zoomed_pane == Some(id) {
-                self.zoomed_pane = None;
-            }
+        }
+        if self.focused_pane == Some(id) {
+            self.focused_pane = None;
+        }
+        if self.zoomed_pane == Some(id) {
+            self.zoomed_pane = None;
         }
     }
 
@@ -286,7 +302,29 @@ impl AppState {
             // in `close_or_tombstone`: its parent link goes with it.
             let next = self.parent_tombstone(id);
             self.remove_pane(id);
+            // A tombstone can hold more than the one child whose ending
+            // collapsed it — a sibling that exited earlier is still a row under
+            // it — and those go with the row they were reachable through rather
+            // than being left naming a parent that no longer exists.
+            self.remove_descendants(id, &mut visited);
             current = next;
+        }
+    }
+
+    /// Removes everything still naming `parent`, and everything under that.
+    ///
+    /// `removed` guards the walk the way `close_or_tombstone`'s `judged` does:
+    /// each pane is removed at most once, so a corrupt cycle in `parent` links
+    /// ends the walk rather than recursing forever.
+    fn remove_descendants(&mut self, parent: PaneId, removed: &mut HashSet<PaneId>) {
+        let children: Vec<PaneId> = self.children_of(parent).iter().map(|p| p.id).collect();
+
+        for child in children {
+            if !removed.insert(child) {
+                continue;
+            }
+            self.remove_descendants(child, removed);
+            self.remove_pane(child);
         }
     }
 
@@ -923,7 +961,6 @@ mod tests {
 
         state.close_pane(parent).expect("the pane exists");
 
-        assert!(state.pane(parent).is_none());
         assert!(
             state.pane(child_id).is_some_and(|p| p.closed),
             "a doomed child with live durable work of its own becomes a tombstone"
@@ -931,6 +968,130 @@ mod tests {
         assert!(
             state.pane(grandchild_id).is_some(),
             "and its work continues"
+        );
+        assert!(
+            state.pane(parent).is_some_and(|p| p.closed),
+            "so the pane above it stays as a tombstone too: a row whose parent \
+             is gone is drawn nowhere, and the grandchild is still running"
+        );
+    }
+
+    #[test]
+    fn every_row_of_a_surviving_chain_can_be_found_from_the_top() {
+        // What the orphan above actually costs: the sidebar walks down from
+        // top-level panes, so a chain with a link missing is not merely untidy
+        // — every row below the gap is invisible and unreachable, including the
+        // running subagent the whole tombstone machinery exists to keep.
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let parent = state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+
+        let mut child = Pane::new(project, HarnessId::new("claude"));
+        child.parent = Some(parent);
+        let child_id = child.id;
+        state.adopt_pane(child).expect("the project exists");
+
+        let mut grandchild = Pane::new(project, HarnessId::new("claude"));
+        grandchild.parent = Some(child_id);
+        grandchild.durable = true;
+        let grandchild_id = grandchild.id;
+        state.adopt_pane(grandchild).expect("the project exists");
+
+        state.close_pane(parent).expect("the pane exists");
+
+        for pane in state.panes_for(project) {
+            if let Some(above) = pane.parent {
+                assert!(
+                    state.pane(above).is_some(),
+                    "every row that names a parent must have one to be drawn under"
+                );
+            }
+        }
+        assert!(
+            state
+                .children_of(child_id)
+                .iter()
+                .any(|p| p.id == grandchild_id),
+            "and the running subagent is still reachable from the row above it"
+        );
+    }
+
+    #[test]
+    fn a_collapsing_tombstone_takes_its_finished_children_with_it() {
+        // A tombstone holding one live child and one that has already exited:
+        // reachable at the default max_depth of 1 with two `A`-approved
+        // subagents, the second of which finished first. Collapsing the row
+        // when the live one ends must take the finished sibling too — left
+        // behind, it names a parent that no longer exists and is drawn nowhere
+        // for the rest of the session.
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let parent = state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+
+        let mut first = Pane::new(project, HarnessId::new("claude"));
+        first.parent = Some(parent);
+        first.durable = true;
+        let first_id = first.id;
+        state.adopt_pane(first).expect("the project exists");
+
+        let mut second = Pane::new(project, HarnessId::new("claude"));
+        second.parent = Some(parent);
+        second.durable = true;
+        let second_id = second.id;
+        state.adopt_pane(second).expect("the project exists");
+
+        // Both are live when the parent closes, so both survive it.
+        state.close_pane(parent).expect("the pane exists");
+        assert!(
+            state.pane(parent).expect("the row stays").closed,
+            "set up: the parent is a tombstone over two live children"
+        );
+
+        // Then one finishes, and the user closes the other.
+        state
+            .set_pane_status(second_id, PaneStatus::Exited(0))
+            .expect("the pane exists");
+        state.close_pane(first_id).expect("the pane exists");
+
+        assert!(state.pane(first_id).is_none(), "the closed child is gone");
+        assert!(
+            state.pane(parent).is_none(),
+            "nothing live is left to hold the tombstone open"
+        );
+        assert!(
+            state.pane(second_id).is_none(),
+            "and the finished sibling goes with the row it was drawn under, \
+             rather than being orphaned under a parent that no longer exists"
+        );
+    }
+
+    #[test]
+    fn a_pane_becomes_an_orchestrator_when_its_first_child_is_adopted() {
+        // The role nothing ever constructed. Nobody declares a pane an
+        // orchestrator: having a subagent approved under it is what makes it
+        // one.
+        let (mut state, parent, _child) = parent_and_child(false);
+
+        assert_eq!(
+            state.pane(parent).map(|p| p.role),
+            Some(PaneRole::Orchestrator),
+            "the pane that was delegated from is an orchestrator"
+        );
+
+        let plain = state
+            .spawn_pane(
+                state.selected_project().expect("a project is selected"),
+                HarnessId::new("codex"),
+            )
+            .expect("the project exists");
+        assert_eq!(
+            state.pane(plain).map(|p| p.role),
+            Some(PaneRole::Worker),
+            "a pane with no children of its own is still a worker"
         );
     }
 

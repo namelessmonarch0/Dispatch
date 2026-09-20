@@ -541,6 +541,55 @@ fn check_liveness(wire: &Wire) {
     });
 }
 
+/// Lets a test drive an interface's message path without a daemon.
+impl Client {
+    /// Creates a client with no socket behind it.
+    ///
+    /// The returned sender delivers what a daemon would have said, and the
+    /// receiver collects what the client would have sent. No thread is started,
+    /// so nothing reconnects and nothing is written anywhere: what is under
+    /// test with one of these is what an interface *does* with the daemon's
+    /// messages, which is otherwise only reachable by standing a real daemon on
+    /// a real socket up around it.
+    ///
+    /// Reported as connected, because a client that says the daemon is gone
+    /// would have every caller drawing a disconnect notice instead.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_test() -> (Self, Sender<ServerMessage>, Receiver<ClientMessage>) {
+        let wire = Arc::new(Wire {
+            writer: Mutex::new(None),
+            connected: AtomicBool::new(true),
+            generation: AtomicU64::new(1),
+            subscribed: AtomicBool::new(false),
+            closed: AtomicBool::new(true),
+            device: Mutex::new("test-device".to_string()),
+            name: "test".to_string(),
+            role: Role::Interface,
+            endpoint: PathBuf::new(),
+            last_heard: Mutex::new(Instant::now()),
+            last_asked: Mutex::new(Instant::now()),
+            liveness: Liveness::default(),
+        });
+
+        let (outbox, outgoing) = channel::<ClientMessage>();
+        let (incoming, inbox) = channel::<ServerMessage>();
+
+        (
+            Self {
+                handle: Handle {
+                    outbox,
+                    wire: Arc::clone(&wire),
+                },
+                inbox,
+                wire,
+            },
+            incoming,
+            outgoing,
+        )
+    }
+}
+
 impl Drop for Client {
     fn drop(&mut self) {
         // Otherwise the supervisor would keep reconnecting to a daemon nobody

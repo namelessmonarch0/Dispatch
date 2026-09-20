@@ -94,7 +94,8 @@ fn every_server_message_round_trips() {
             pane: PaneId::new(),
             project: ProjectId::new(),
             harness: "codex".into(),
-            parent: None,
+            parent: Some(PaneId::new()),
+            durable: true,
         },
         ServerMessage::PaneClosed {
             pane: PaneId::new(),
@@ -408,4 +409,47 @@ fn an_unknown_client_message_is_skipped_rather_than_fatal() {
     let read: ClientMessage = Frame::read(&mut buf.as_slice()).expect("an unknown message decodes");
 
     assert_eq!(read, ClientMessage::Unknown);
+}
+
+#[test]
+fn a_pane_announced_by_an_older_daemon_is_not_durable() {
+    // `durable` decides whether a closed parent keeps its row over this pane,
+    // and an older daemon says nothing about it. Not durable is the safe
+    // fallback: the pane dies with its caller, which is what every delegated
+    // pane did before blanket approval existed.
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum OlderServerMessage {
+        PaneSpawned {
+            pane: PaneId,
+            project: ProjectId,
+            harness: String,
+        },
+    }
+
+    let pane = PaneId::new();
+    let project = ProjectId::new();
+    let mut buf = Vec::new();
+    Frame::write(
+        &mut buf,
+        &OlderServerMessage::PaneSpawned {
+            pane,
+            project,
+            harness: "claude".into(),
+        },
+    )
+    .expect("writing succeeds");
+
+    let read: ServerMessage = Frame::read(&mut buf.as_slice()).expect("reading succeeds");
+
+    assert_eq!(
+        read,
+        ServerMessage::PaneSpawned {
+            pane,
+            project,
+            harness: "claude".into(),
+            parent: None,
+            durable: false,
+        }
+    );
 }

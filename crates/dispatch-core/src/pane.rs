@@ -54,8 +54,10 @@ impl PaneStatus {
 
 /// How a pane participates in orchestration.
 ///
-/// Slice 1 only ever constructs [`PaneRole::Worker`]. [`PaneRole::Orchestrator`]
-/// is reserved so the dispatch slice does not have to reshape this type.
+/// A pane starts as a [`PaneRole::Worker`] and becomes an
+/// [`PaneRole::Orchestrator`] when its first child is approved — see
+/// [`crate::AppState::adopt_pane`]. Nothing asks the user to declare a pane an
+/// orchestrator: there is no mode to learn and no way to set it wrongly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PaneRole {
     /// An ordinary agent pane.

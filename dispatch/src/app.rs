@@ -12,7 +12,7 @@ use dispatch_core::{
     RequestId,
 };
 use dispatch_layout::{tile, tile_zoomed};
-use dispatch_proto::{ClientMessage, PaneUpdate, ServerMessage};
+use dispatch_proto::{ClientMessage, DelegateOutcome, PaneUpdate, ServerMessage};
 use dispatch_pty::{
     KeyEncoder, MouseEncoder, MouseInput, PtySession, RunState, Screen, ScreenReader, ScrollTo,
     Size, TitleScanner,
@@ -63,6 +63,49 @@ struct PendingRequest {
 /// Frame budget. A chatty agent can produce output faster than any terminal
 /// can draw it, so redraws are coalesced rather than done per byte.
 const FRAME: Duration = Duration::from_millis(16);
+
+/// How much of a task's opening words becomes a subagent's first title.
+///
+/// The sidebar is [`sidebar::WIDTH`] columns wide and a child row is indented
+/// four into it, so anything much longer than this could not be read there in
+/// full anyway.
+const TITLE_BUDGET: usize = 22;
+
+/// The opening words of a task, for the row of the subagent running it.
+///
+/// Whole words wherever they fit, because a title cut mid-word reads as damage
+/// rather than as brevity; a first word longer than the whole budget is cut, as
+/// there is nothing else to fall back on. `None` for a task with no words at
+/// all, which is the one case where the harness name is the better title.
+///
+/// This is a first title only: the title scanner replaces it the moment the
+/// agent names itself.
+fn task_title(task: &str) -> Option<String> {
+    let mut title = String::new();
+
+    for word in task.split_whitespace() {
+        let taken = title.chars().count();
+
+        if taken == 0 {
+            if word.chars().count() > TITLE_BUDGET {
+                let kept: String = word.chars().take(TITLE_BUDGET.saturating_sub(1)).collect();
+                return Some(format!("{kept}…"));
+            }
+            title.push_str(word);
+            continue;
+        }
+
+        if taken + 1 + word.chars().count() > TITLE_BUDGET {
+            title.push('…');
+            break;
+        }
+
+        title.push(' ');
+        title.push_str(word);
+    }
+
+    (!title.is_empty()).then_some(title)
+}
 
 /// Centres a box for the approval prompt inside `area`.
 ///
@@ -187,6 +230,20 @@ pub struct App {
     expanded: HashSet<PaneId>,
     /// Delegation requests waiting on a decision, oldest first.
     pending: VecDeque<PendingRequest>,
+    /// Tasks of requests this client itself approved, until the daemon says
+    /// what became of them.
+    ///
+    /// `decide` pops a request out of `pending` under the keystroke that
+    /// answers it, before the daemon's `DelegateResolved` can arrive, so this
+    /// is the only place its task would still be when the subagent's pane is
+    /// named.
+    answered: HashMap<RequestId, String>,
+    /// First titles for subagent panes the daemon has approved but not yet
+    /// announced, taken from what each was asked to do.
+    ///
+    /// The daemon resolves a request before it announces the pane, so the
+    /// title is known one message before there is a row to put it on.
+    child_titles: HashMap<PaneId, String>,
     status: String,
     quit: bool,
     /// Every `ClientMessage` a decision would have sent, kept only so tests
@@ -226,6 +283,8 @@ impl App {
             approval_area: Rect::default(),
             expanded: HashSet::new(),
             pending: VecDeque::new(),
+            answered: HashMap::new(),
+            child_titles: HashMap::new(),
             status: String::new(),
             quit: false,
             #[cfg(test)]
@@ -417,6 +476,11 @@ impl App {
         // catch-up replays whatever is still actually outstanding.
         self.overlay = None;
         self.pending.clear();
+        // Both are about requests that belonged to the connection that ended:
+        // the new one names its panes afresh, and a title kept for a pane id
+        // that will never be announced again is just a leak.
+        self.answered.clear();
+        self.child_titles.clear();
     }
 
     /// Applies one message from the daemon. Returns whether to redraw.
@@ -431,8 +495,9 @@ impl App {
                 pane,
                 project,
                 harness,
-                parent: _,
-            } => self.adopt_remote(pane, project, &harness),
+                parent,
+                durable,
+            } => self.adopt_remote(pane, project, &harness, parent, durable),
 
             ServerMessage::PaneOutput { pane, bytes } => {
                 let Some(target) = self.panes.get_mut(&pane) else {
@@ -518,7 +583,21 @@ impl App {
                 true
             }
 
-            ServerMessage::DelegateResolved { request, .. } => {
+            ServerMessage::DelegateResolved { request, outcome } => {
+                // The subagent's row is titled with the opening words of its
+                // task, not with the harness: four children of one pane all
+                // reading "Claude Code" say nothing about which is which.
+                // Recorded here rather than looked up on arrival because this
+                // is the last moment the task and the new pane's id are both
+                // in hand — and it always comes first, since the daemon
+                // resolves a request before it announces the pane.
+                if let DelegateOutcome::Approved { pane } = outcome
+                    && let Some(task) = self.task_of(request)
+                    && let Some(title) = task_title(&task)
+                {
+                    self.child_titles.insert(pane, title);
+                }
+
                 // Whether this client's own decision resolved it (already
                 // popped out of `pending` — see `decide`), another client's
                 // did, or the daemon's own deadline did, the queue has no
@@ -557,7 +636,20 @@ impl App {
     }
 
     /// Takes on a pane the daemon has started.
-    fn adopt_remote(&mut self, id: PaneId, project: ProjectId, harness: &str) -> bool {
+    ///
+    /// `parent` and `durable` come from the announcement rather than from
+    /// anything this client decided: a subagent is drawn under the pane that
+    /// asked for it, and whether it outlives that pane is what the tombstone
+    /// rule in [`AppState::close_pane`] turns on. A client that dropped either
+    /// would draw every subagent as a top-level pane and tile them all.
+    fn adopt_remote(
+        &mut self,
+        id: PaneId,
+        project: ProjectId,
+        harness: &str,
+        parent: Option<PaneId>,
+        durable: bool,
+    ) -> bool {
         if self.panes.contains_key(&id) {
             return false;
         }
@@ -569,6 +661,8 @@ impl App {
 
         let mut pane = CorePane::new(project, HarnessId::new(harness));
         pane.id = id;
+        pane.parent = parent;
+        pane.durable = durable;
         if self.state.adopt_pane(pane).is_err() {
             // A pane in a project this client has not been told about: the
             // announcement is on its way, and the pane arrives with the next
@@ -587,12 +681,18 @@ impl App {
             }
         };
 
-        let display_name = self
-            .harnesses
-            .get(harness)
-            .map_or_else(|| harness.to_string(), |def| def.display_name.clone());
+        // A subagent is named by what it was asked to do; every other pane by
+        // the harness running in it. Either way the title scanner replaces this
+        // as soon as the agent names itself. A child whose task never reached
+        // this client — a reattach replaying panes that were spawned before it
+        // was listening — falls back to the harness rather than to nothing.
+        let title = self.child_titles.remove(&id).unwrap_or_else(|| {
+            self.harnesses
+                .get(harness)
+                .map_or_else(|| harness.to_string(), |def| def.display_name.clone())
+        });
 
-        if let Err(error) = self.adopt(id, backend, &display_name) {
+        if let Err(error) = self.adopt(id, backend, &title) {
             tracing::warn!(%error, "failed to adopt a pane");
             return false;
         }
@@ -890,6 +990,13 @@ impl App {
             return;
         };
 
+        // Kept so the subagent's row can be named after the task: this request
+        // leaves the queue here, one round trip before the daemon says whether
+        // a pane came of it.
+        if approve {
+            self.answered.insert(waiting.request, waiting.task.clone());
+        }
+
         let message = ClientMessage::DelegateDecision {
             request: waiting.request,
             approve,
@@ -904,6 +1011,23 @@ impl App {
         }
 
         self.open_next_approval();
+    }
+
+    /// What a request asked for, wherever this client last had it.
+    ///
+    /// A request this client answered itself left `pending` under the user's own
+    /// keystroke, so `answered` is where its task is; one settled by another
+    /// client or by the daemon's deadline is still queued, where the `retain`
+    /// below is about to drop it.
+    fn task_of(&mut self, request: RequestId) -> Option<String> {
+        if let Some(task) = self.answered.remove(&request) {
+            return Some(task);
+        }
+
+        self.pending
+            .iter()
+            .find(|waiting| waiting.request == request)
+            .map(|waiting| waiting.task.clone())
     }
 
     /// Records a scroll of the task text of the request currently shown.
@@ -1473,8 +1597,257 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dispatch_core::{Project, ProjectSource};
-    use dispatch_proto::DelegateOutcome;
+    use std::sync::mpsc::{Receiver, Sender};
+
+    use dispatch_core::{PaneRole, Project, ProjectSource};
+
+    /// An `App` attached to a daemon that says only what a test tells it to,
+    /// with one project already announced.
+    ///
+    /// Messages go in through the same queue a real daemon's arrive on and are
+    /// picked up by `poll_daemon`, so what these tests drive is the client's own
+    /// message path rather than an `AppState` built by hand — which is how a
+    /// `PaneSpawned` field the client threw away passed every test there was.
+    /// The outbox `Receiver` comes back rather than being dropped because a
+    /// client whose outbox has no reader reports itself disconnected on the
+    /// first send.
+    fn attached_app() -> (
+        App,
+        ProjectId,
+        Sender<ServerMessage>,
+        Receiver<ClientMessage>,
+    ) {
+        let (client, daemon, sent) = Client::for_test();
+        let mut app = App::attached(HarnessRegistry::default(), client);
+
+        let project = Project::new("/tmp/attached", ProjectSource::LocalDir);
+        let id = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        (app, id, daemon, sent)
+    }
+
+    /// The announcement of a pane the daemon has started.
+    fn spawned(
+        pane: PaneId,
+        project: ProjectId,
+        harness: &str,
+        parent: Option<PaneId>,
+        durable: bool,
+    ) -> ServerMessage {
+        ServerMessage::PaneSpawned {
+            pane,
+            project,
+            harness: harness.to_string(),
+            parent,
+            durable,
+        }
+    }
+
+    /// The column a row's title starts in, for comparing one row's indentation
+    /// against another's.
+    ///
+    /// Counted in characters rather than bytes: the status dot and the focus
+    /// marker are three bytes each, so a byte offset would make a focused row
+    /// look indented further than an unfocused one at the same depth.
+    fn column_of(line: &str, needle: &str) -> usize {
+        let byte = line
+            .find(needle)
+            .unwrap_or_else(|| panic!("expected {needle:?} in {line:?}"));
+        line[..byte].chars().count()
+    }
+
+    #[test]
+    fn a_daemons_subagent_is_nested_kept_out_of_the_grid_and_outlives_its_parent() {
+        // The one test whose absence let the client throw `parent` away and
+        // never learn `durable` at all: everything else about nesting was
+        // proved against an `AppState` assembled in the test itself, which no
+        // amount of dropping on the wire could break.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (mut app, project, daemon, _sent) = attached_app();
+        let parent = PaneId::new();
+        let child = PaneId::new();
+
+        for message in [
+            spawned(parent, project, "claude", None, true),
+            spawned(child, project, "codex", Some(parent), true),
+        ] {
+            daemon.send(message).expect("the app is listening");
+        }
+        app.poll_daemon();
+
+        let adopted = app.state.pane(child).expect("the child was adopted");
+        assert_eq!(adopted.parent, Some(parent), "the parent link survives");
+        assert!(adopted.durable, "and so does the blanket approval");
+        assert_eq!(
+            app.state.pane(parent).map(|pane| pane.role),
+            Some(PaneRole::Orchestrator),
+            "a pane whose child was approved is an orchestrator"
+        );
+
+        // Nested in the sidebar: one row below its parent, indented past it.
+        let mut terminal =
+            Terminal::new(TestBackend::new(100, 30)).expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("drawing succeeds");
+        let drawn = rendered_text(&terminal);
+        let lines: Vec<&str> = drawn.lines().collect();
+
+        let parent_row = lines
+            .iter()
+            .position(|line| line.contains("claude"))
+            .expect("the parent has a row");
+        let child_row = lines
+            .iter()
+            .position(|line| line.contains("codex"))
+            .expect("the child has a row");
+        assert_eq!(
+            child_row,
+            parent_row + 1,
+            "the child belongs under its parent:\n{drawn}"
+        );
+        assert_eq!(
+            column_of(lines[child_row], "codex"),
+            column_of(lines[parent_row], "claude") + 2,
+            "and indented one level in from it:\n{drawn}"
+        );
+
+        // Not tiled until the user opens it: ten subagents must not shrink the
+        // grid to nothing.
+        assert_eq!(
+            app.tileable(),
+            vec![parent],
+            "a subagent stays out of the grid until it is opened"
+        );
+        app.focus_pane(child);
+        assert_eq!(
+            app.tileable(),
+            vec![parent, child],
+            "opening it brings it in"
+        );
+
+        // And the tombstone rule, which can only fire because `durable`
+        // travelled: closing the parent keeps its row over a live child.
+        daemon
+            .send(ServerMessage::PaneClosed { pane: parent })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        assert!(
+            app.state.pane(parent).is_some_and(|pane| pane.closed),
+            "the parent stays as a tombstone over live blanket-approved work"
+        );
+        assert!(
+            app.state.pane(child).is_some(),
+            "and the subagent keeps running"
+        );
+    }
+
+    #[test]
+    fn a_subagents_row_is_titled_with_its_task_not_its_harness() {
+        // Four children of one pane all reading "Claude Code" say nothing about
+        // which is which. The client has the task in hand from the prompt it
+        // showed, and the daemon resolves a request before announcing the pane.
+        let (mut app, project, daemon, _sent) = attached_app();
+        let parent = PaneId::new();
+        let child = PaneId::new();
+        let request = RequestId::new();
+
+        daemon
+            .send(spawned(parent, project, "claude", None, true))
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        app.pending.push_back(PendingRequest {
+            request,
+            parent,
+            project,
+            harness: "claude".into(),
+            task: "write the tests for the http client".into(),
+            depth: 0,
+        });
+
+        for message in [
+            ServerMessage::DelegateResolved {
+                request,
+                outcome: DelegateOutcome::Approved { pane: child },
+            },
+            spawned(child, project, "claude", Some(parent), false),
+        ] {
+            daemon.send(message).expect("the app is listening");
+        }
+        app.poll_daemon();
+
+        let title = app
+            .state
+            .pane(child)
+            .map(|pane| pane.title.clone())
+            .expect("the child was adopted");
+        assert!(
+            title.starts_with("write the tests"),
+            "the row should open with the task's own words, got {title:?}"
+        );
+
+        // The title scanner still owns the name from here on.
+        app.apply(ServerMessage::PaneChanged {
+            pane: child,
+            update: PaneUpdate::Title {
+                title: "pytest".into(),
+            },
+        });
+        assert_eq!(
+            app.state.pane(child).map(|pane| pane.title.as_str()),
+            Some("pytest"),
+            "what the agent calls itself replaces the task"
+        );
+    }
+
+    #[test]
+    fn a_pane_the_daemon_did_not_delegate_is_titled_with_its_harness() {
+        // The task title is for subagents. A top-level pane is still named
+        // after what is running in it.
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = PaneId::new();
+
+        daemon
+            .send(spawned(pane, project, "codex", None, true))
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        assert_eq!(
+            app.state.pane(pane).map(|pane| pane.title.as_str()),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn a_task_title_keeps_whole_words_and_says_when_it_cut() {
+        assert_eq!(
+            task_title("write the tests"),
+            Some("write the tests".into())
+        );
+        assert_eq!(
+            task_title("write the tests for the http client"),
+            Some("write the tests for…".into()),
+            "a long task is cut between words, and says so"
+        );
+        assert_eq!(
+            task_title(&"x".repeat(80)),
+            Some(format!("{}…", "x".repeat(TITLE_BUDGET - 1))),
+            "a first word with nowhere to break is cut anyway"
+        );
+        assert_eq!(
+            task_title("   \n  "),
+            None,
+            "a task with no words at all has no title to give"
+        );
+    }
 
     /// An `App` with one project, one parent pane, and one queued delegation
     /// request from it, with the approval prompt already open.

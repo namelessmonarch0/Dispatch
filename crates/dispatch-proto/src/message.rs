@@ -291,6 +291,16 @@ pub enum ServerMessage {
         /// The pane that delegated this one's work, when it was delegated.
         #[serde(default)]
         parent: Option<PaneId>,
+        /// Whether this pane outlives the caller that asked for it, because the
+        /// user approved its parent with `A` rather than approving once.
+        ///
+        /// On the wire rather than derived by whoever pressed the key: every
+        /// client has to draw the same tree, and only the deciding client could
+        /// know otherwise. It is what a closed parent's survivor rule turns on.
+        /// A top-level pane has no caller to outlive, so the field says nothing
+        /// useful about one.
+        #[serde(default)]
+        durable: bool,
     },
 
     /// A pane is gone.
