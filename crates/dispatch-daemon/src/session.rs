@@ -1201,7 +1201,7 @@ fn spawn_client(
     connection: Connection,
     events: &Sender<Event>,
 ) -> Result<(), dispatch_os::ipc::IpcError> {
-    let (mut reader, mut writer) = connection.split()?;
+    let (mut reader, mut writer) = connection.split();
     let (outbox, outgoing) = channel::<ServerMessage>();
 
     if events.send(Event::Attached(id, outbox)).is_err() {
