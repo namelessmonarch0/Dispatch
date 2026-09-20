@@ -63,4 +63,11 @@ jobs:
         # binary: a Windows failure in one integration suite hid the results of
         # every other suite on that platform, including the ones that would say
         # whether the transport works at all.
+        env:
+          # The client and the daemon log to files inside each test's temporary
+          # directory, and a failing test prints them. Debug detail therefore
+          # costs nothing on a green run and is the difference between "the
+          # handshake never arrived" and knowing which side dropped it — which
+          # matters most on the platform that cannot be reproduced locally.
+          RUST_LOG: debug
         run: cargo test --workspace --no-fail-fast --target ${{ matrix.target }}

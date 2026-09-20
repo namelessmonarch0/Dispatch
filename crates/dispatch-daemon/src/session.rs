@@ -1230,7 +1230,13 @@ fn spawn_client(
 
     std::thread::spawn(move || {
         while let Ok(message) = outgoing.recv() {
-            if Frame::write(&mut writer, &message).is_err() {
+            // Logged rather than swallowed: a write that fails here is how a
+            // client ends up waiting for an answer the daemon believes it sent,
+            // and a silent `break` leaves nothing to read afterwards. Debug
+            // rather than warn, because an ordinary disconnect arrives this way
+            // too — the point is that it can be seen at all.
+            if let Err(error) = Frame::write(&mut writer, &message) {
+                tracing::debug!(client = id, %error, "failed to write to a client");
                 break;
             }
         }
