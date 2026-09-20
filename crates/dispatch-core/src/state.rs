@@ -266,7 +266,16 @@ impl AppState {
     }
 
     /// The closed parent of `child`, when that parent is only still present to
-    /// hold children and this was its last live one.
+    /// hold children and losing `child`'s branch leaves it holding nothing that
+    /// is still running.
+    ///
+    /// The question is asked over the whole subtree rather than one level down.
+    /// A direct child that has finished can still have a blanket-approved
+    /// subagent of its own running beneath it — reachable as soon as
+    /// `max_depth >= 2` — and a tombstone judged spent is collapsed by
+    /// [`Self::collapse_tombstones`], which sweeps everything below it. Counting
+    /// only direct children would call that row spent and delete a pane whose
+    /// process the daemon still owns and whose closing nobody ever announced.
     fn parent_tombstone(&self, child: PaneId) -> Option<PaneId> {
         let parent = self
             .panes
@@ -279,7 +288,35 @@ impl AppState {
             return None;
         }
 
-        (self.live_children(parent) <= 1).then_some(parent)
+        (!self.has_live_work(parent, child)).then_some(parent)
+    }
+
+    /// Whether anything under `parent` is still running, ignoring the branch
+    /// rooted at `skip` — the pane on its way out, which takes everything below
+    /// it along.
+    ///
+    /// A tombstone is not work: it has no process behind it, and its `status` is
+    /// only whatever it was when the row was kept.
+    ///
+    /// Walks with a visited set for the reason the removal walks do: a corrupt
+    /// cycle in `parent` links must end the search rather than recurse forever.
+    fn has_live_work(&self, parent: PaneId, skip: PaneId) -> bool {
+        let mut visited = HashSet::from([parent, skip]);
+        let mut pending = vec![parent];
+
+        while let Some(id) = pending.pop() {
+            for child in self.children_of(id) {
+                if !visited.insert(child.id) {
+                    continue;
+                }
+                if !child.closed && child.status.is_live() {
+                    return true;
+                }
+                pending.push(child.id);
+            }
+        }
+
+        false
     }
 
     /// Walks a chain of tombstones upward, removing each one that the removal
@@ -312,6 +349,11 @@ impl AppState {
     }
 
     /// Removes everything still naming `parent`, and everything under that.
+    ///
+    /// Unconditional, so it may only be called where [`Self::parent_tombstone`]
+    /// has already established that nothing in that subtree is running: it does
+    /// not ask the survivor question itself, and a live pane swept from here
+    /// would vanish from the tree while its process ran on in the daemon.
     ///
     /// `removed` guards the walk the way `close_or_tombstone`'s `judged` does:
     /// each pane is removed at most once, so a corrupt cycle in `parent` links
@@ -1126,6 +1168,150 @@ mod tests {
         assert!(
             state.pane(parent).is_none(),
             "and so does the one above that"
+        );
+    }
+
+    /// Adopts a delegated pane under `parent`, returning its id.
+    fn delegated(state: &mut AppState, parent: PaneId, durable: bool) -> PaneId {
+        let project = state.pane(parent).expect("the parent exists").project;
+        let mut pane = Pane::new(project, HarnessId::new("claude"));
+        pane.parent = Some(parent);
+        pane.durable = durable;
+        let id = pane.id;
+        state.adopt_pane(pane).expect("the project exists");
+        id
+    }
+
+    /// A tombstone over a live durable child and a finished durable one that
+    /// still has a live durable child of its own — the deepest shape
+    /// `max_depth >= 2` allows, and the one the collapse used to sweep away.
+    fn tombstone_over_deep_work() -> (AppState, PaneId, PaneId, PaneId, PaneId) {
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let top = state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+
+        let live = delegated(&mut state, top, true);
+        let middle = delegated(&mut state, top, true);
+        let deep = delegated(&mut state, middle, true);
+
+        // Both children are live when the top pane closes, so both survive it
+        // and the row above them is kept as a tombstone.
+        state.close_pane(top).expect("the pane exists");
+        assert!(
+            state.pane(top).expect("the row stays").closed,
+            "set up: a tombstone over two live children"
+        );
+
+        // Then the middle one finishes while its own subagent keeps working.
+        state
+            .set_pane_status(middle, PaneStatus::Exited(0))
+            .expect("the pane exists");
+
+        (state, top, live, middle, deep)
+    }
+
+    #[test]
+    fn a_collapsing_tombstone_keeps_live_work_below_its_children() {
+        // The collapse gate used to count only direct children, so the finished
+        // middle row made the tombstone look spent — and the sweep that followed
+        // deleted a blanket-approved subagent whose process the daemon still
+        // owns and for which no PaneClosed was ever broadcast. The client's tree
+        // lost a running pane until the next reattach.
+        let (mut state, top, live, middle, deep) = tombstone_over_deep_work();
+
+        state.close_pane(live).expect("the pane exists");
+
+        assert!(state.pane(live).is_none(), "the closed child is gone");
+        assert!(
+            state.pane(deep).is_some(),
+            "the running subagent two levels down is still here"
+        );
+        assert!(
+            state.pane(middle).is_some(),
+            "so is the row it is drawn under"
+        );
+        assert!(
+            state.pane(top).is_some_and(|p| p.closed),
+            "and the tombstone above that, since a row whose parent is missing \
+             is drawn nowhere at all"
+        );
+
+        // What the sweep actually cost: reachability from the top of the tree.
+        for pane in state.panes_for(state.selected_project().expect("a project")) {
+            if let Some(above) = pane.parent {
+                assert!(
+                    state.pane(above).is_some(),
+                    "every row that names a parent must have one to be drawn under"
+                );
+            }
+        }
+        assert!(
+            state.children_of(middle).iter().any(|p| p.id == deep),
+            "the running subagent is reachable from the row above it"
+        );
+    }
+
+    #[test]
+    fn a_tombstone_over_a_wholly_finished_subtree_still_collapses() {
+        // The other half of the rule: widening the gate must not keep rows for
+        // work that is over. Nothing below this tombstone is running, so closing
+        // its last live child takes the whole subtree with it.
+        let (mut state, top, live, middle, deep) = tombstone_over_deep_work();
+        state
+            .set_pane_status(deep, PaneStatus::Exited(0))
+            .expect("the pane exists");
+
+        state.close_pane(live).expect("the pane exists");
+
+        assert!(state.pane(live).is_none(), "the closed child is gone");
+        assert!(
+            state.pane(top).is_none(),
+            "nothing live is left to hold the tombstone open"
+        );
+        assert!(
+            state.pane(middle).is_none(),
+            "the finished child goes with the row it was drawn under"
+        );
+        assert!(
+            state.pane(deep).is_none(),
+            "and so does the finished work below it"
+        );
+    }
+
+    #[test]
+    fn a_cycle_in_parent_links_ends_the_close_walk() {
+        // Nothing should be able to build this, which is exactly why the walks
+        // must not trust it: two tombstones naming each other as parent would
+        // otherwise spin the collapse forever or overflow its stack. The claim
+        // under test is termination, not any particular surviving shape.
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+
+        let mut first = Pane::new(project, HarnessId::new("claude"));
+        let first_id = first.id;
+        let mut second = Pane::new(project, HarnessId::new("claude"));
+        let second_id = second.id;
+
+        first.parent = Some(second_id);
+        first.closed = true;
+        first.durable = true;
+        second.parent = Some(first_id);
+        second.closed = true;
+        second.durable = true;
+        state.adopt_pane(first).expect("the project exists");
+        state.adopt_pane(second).expect("the project exists");
+
+        // A leaf under the cycle, so closing it asks the collapse question and
+        // the answer has to walk the ring.
+        let leaf = delegated(&mut state, first_id, true);
+
+        state.close_pane(leaf).expect("the pane exists");
+
+        assert!(
+            state.pane(leaf).is_none(),
+            "the walk finished and the leaf went"
         );
     }
 }
