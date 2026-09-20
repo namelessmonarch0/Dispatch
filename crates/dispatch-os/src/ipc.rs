@@ -150,6 +150,12 @@ impl Listener {
     /// client that dies mid-handshake closes its connection instead, which
     /// fails the read at once. Unix bounds the wait as well; a synchronous
     /// named pipe read cannot be given a timeout.
+    ///
+    /// A client that dies *between* its two connections leaves the half it did
+    /// announce waiting for a partner that will never come, and nothing reaps
+    /// it. The window is the microseconds between two connects, so this costs
+    /// one idle entry per client that died inside it -- not a budget worth a
+    /// reaper on a local, single-user daemon.
     pub fn accept(&self) -> Result<Connection, IpcError> {
         loop {
             let mut stream = imp::accept(&self.inner)?;
@@ -604,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn two_clients_connecting_at_once_are_not_crossed() {
+    fn two_clients_racing_get_their_own_connections() {
         // Four connections race into one listener. Pairing them by arrival
         // order would hand each client half of the other's.
         let _guard = crate::env_lock();
