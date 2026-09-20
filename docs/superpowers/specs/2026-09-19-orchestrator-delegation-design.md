@@ -269,7 +269,7 @@ Exit codes follow `sysexits(3)` so an agent can branch without parsing prose:
 |---|---|
 | 0–125 | the subagent's own exit code |
 | 69 | no daemon is listening |
-| 75 | timed out, or the connection dropped, or the subagent was stopped before it finished |
+| 75 | timed out, or the connection dropped, or the daemon does not know the asking pane, or the subagent was stopped before it finished |
 | 77 | denied by the user |
 | 78 | refused: caps, or the harness has no `[task]` form |
 

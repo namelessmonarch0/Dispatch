@@ -122,8 +122,12 @@ than prompt:
 [delegation]
 max_depth = 1              # a subagent cannot delegate
 max_live_per_parent = 4
-request_timeout_secs = 600
+request_timeout_secs = 600 # no value disables this; 0 refuses on the next tick
 ```
+
+There is deliberately no way to turn the deadline off: an agent on an unattended
+daemon would otherwise wait for a person who is not there. To wait longer, raise
+the number.
 
 The approval prompt takes `a` to approve, `d` to deny, `A` to approve everything
 from that pane for this daemon's lifetime, and `Esc` to defer. The status line
@@ -151,7 +155,7 @@ refusal. An agent branching on exit codes should keep that in mind.
 |---|---|
 | 0–125 | the subagent's own exit code |
 | 69 | no daemon is listening |
-| 75 | timed out, or the connection dropped, or the subagent was stopped before it finished |
+| 75 | timed out, or the connection dropped, or the daemon does not know the asking pane, or the subagent was stopped before it finished |
 | 77 | denied by the user |
 | 78 | refused: caps, or the harness has no `[task]` form |
 

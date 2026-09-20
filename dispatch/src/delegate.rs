@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use dispatch_client::{Client, ClientError};
 use dispatch_core::PaneId;
-use dispatch_proto::{ClientMessage, DelegateOutcome, Role, ServerMessage};
+use dispatch_proto::{ClientMessage, DelegateOutcome, ProtocolError, Role, ServerMessage};
 
 /// Exit codes, following `sysexits(3)` so an agent can branch without parsing
 /// prose. Documented in `--help` because an agent reads that far more often
@@ -22,8 +22,10 @@ use dispatch_proto::{ClientMessage, DelegateOutcome, Role, ServerMessage};
 mod exit {
     /// No daemon is listening.
     pub const UNAVAILABLE: u8 = 69;
-    /// The request was never answered, or the subagent's pane was closed under
-    /// it rather than allowed to exit. Both mean the work has no verdict.
+    /// The request was never answered, the subagent's pane was closed under it
+    /// rather than allowed to exit, or the daemon does not know the pane that
+    /// asked. All three mean the work has no verdict and asking again may well
+    /// get one.
     pub const TEMPFAIL: u8 = 75;
     /// The user said no.
     pub const NOPERM: u8 = 77;
@@ -114,6 +116,21 @@ pub fn run(harness: Option<String>, size: (u16, u16), task: &str) -> Result<Exit
 
                     eprintln!("[dispatch] subagent exited {code}");
                     return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
+                }
+
+                // A pane the daemon does not own is the one error here that says
+                // "try again" rather than "something is wrong with how this is
+                // set up": `DISPATCH_PANE` goes stale the moment the daemon is
+                // restarted, and the pane the agent is typing in is a new one
+                // with a new id. Telling an agent its configuration is at fault
+                // would send it looking for a problem that does not exist —
+                // the same argument that gave a timed-out request 75 rather
+                // than 78.
+                ServerMessage::Error {
+                    error: ProtocolError::NoSuchPane(pane),
+                } => {
+                    eprintln!("[dispatch] the daemon does not know pane {pane}");
+                    return Ok(ExitCode::from(exit::TEMPFAIL));
                 }
 
                 ServerMessage::Error { error } => {

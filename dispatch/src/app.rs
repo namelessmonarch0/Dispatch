@@ -219,9 +219,6 @@ pub struct App {
     /// way to pick one of its rows out of the list — this is what a click is
     /// matched against.
     sidebar_area: Rect,
-    /// Where the approval prompt was last drawn, so its scroll can be
-    /// clamped against the box's actual size at draw time.
-    approval_area: Rect,
     /// Subagents the user has opened, so they join the tiled grid.
     ///
     /// Which rows are open is a per-client choice, not a property of the
@@ -280,7 +277,6 @@ impl App {
             router: InputRouter::new(),
             layout: Vec::new(),
             sidebar_area: Rect::default(),
-            approval_area: Rect::default(),
             expanded: HashSet::new(),
             pending: VecDeque::new(),
             answered: HashMap::new(),
@@ -1041,8 +1037,8 @@ impl App {
     /// height, so `draw_overlay` is what clamps this against
     /// [`Approval::total_rows`] before rendering, and persists the clamped
     /// value back here. Clamping on the keystroke instead would drop a `↓`
-    /// that arrives before the prompt has ever been drawn (`approval_area`
-    /// would still be a zero rect) and would leave a stale, too-large offset
+    /// that arrives before the prompt has ever been drawn — there is no box to
+    /// measure against yet — and would leave a stale, too-large offset
     /// rendering blank after a resize to a wider box, until the next `↓`
     /// happened to nudge it back into range.
     fn scroll_approval(&mut self, down: bool) {
@@ -1410,7 +1406,6 @@ impl App {
         let scroll = *scroll;
 
         let rect = centred_approval(panes_area);
-        self.approval_area = rect;
 
         // The queue can only be empty here for one frame, between the last
         // request being answered and `open_next_approval` closing the

@@ -408,3 +408,39 @@ fn an_unanswered_delegate_call_exits_75_when_the_deadline_passes() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+#[test]
+fn a_stale_dispatch_pane_exits_75_rather_than_blaming_the_configuration() {
+    // `DISPATCH_PANE` goes stale the moment the daemon restarts: the agent is
+    // typing in a new pane with a new id, and the value it was given names
+    // nothing. That is "try again", not "your configuration is wrong", which is
+    // what 78 tells an agent — it would go looking for a problem that is not
+    // there. Same argument as a timed-out request, same code.
+    // A short label deliberately: the daemon's endpoint lives inside this
+    // directory, and a Unix socket address is limited to about a hundred bytes.
+    let config = Config::new("stale");
+    let project = config.dir.join("project");
+    std::fs::create_dir_all(&project).expect("temp dir is writable");
+    let _daemon = Daemon::start(&config, &project);
+
+    // A pane id no daemon ever owned stands in for one whose daemon was
+    // restarted under it.
+    let output = run_delegate_shim(
+        &config,
+        dispatch_core::PaneId::new(),
+        "shell",
+        "echo should-not-run",
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(75),
+        "a pane the daemon does not know exits TEMPFAIL; stderr was {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "nothing ran, so stdout must be empty, got {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

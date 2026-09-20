@@ -27,6 +27,12 @@ pub struct DelegationLimits {
     /// How many subagents one pane may have running at once.
     pub max_live_per_parent: usize,
     /// How long a request waits for an answer before it is refused.
+    ///
+    /// There is no value that means "no deadline", and `0` is not it: a request
+    /// is then already out of time when the daemon's next pass comes round, so
+    /// `0` refuses everything nobody was quick enough to approve. Deferral has a
+    /// floor by design — an agent on an unattended daemon must not wait for a
+    /// person who is not there — so the way to wait longer is a larger number.
     pub request_timeout_secs: u64,
 }
 
