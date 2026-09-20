@@ -423,6 +423,11 @@ fn a_stale_dispatch_pane_exits_75_rather_than_blaming_the_configuration() {
     std::fs::create_dir_all(&project).expect("temp dir is writable");
     let _daemon = Daemon::start(&config, &project);
 
+    // Wait for the endpoint before running the shim. Without this the shim can
+    // reach the socket first and exit 69 for a daemon that is merely still
+    // starting — which is what CI saw while this machine won the race.
+    drop(connect(&config));
+
     // A pane id no daemon ever owned stands in for one whose daemon was
     // restarted under it.
     let output = run_delegate_shim(

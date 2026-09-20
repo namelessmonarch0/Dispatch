@@ -265,6 +265,8 @@ mod imp {
     // SAFETY: the handle is owned exclusively by this listener and is only
     // touched under the mutex.
     unsafe impl Send for Listener {}
+    // SAFETY: as above — every access to the handle goes through the mutex, so
+    // sharing the listener between threads cannot race on it.
     unsafe impl Sync for Listener {}
 
     impl Drop for Listener {
