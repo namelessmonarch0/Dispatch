@@ -55,4 +55,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
 
       - name: Test
-        run: cargo test --workspace --target ${{ matrix.target }}
+        # --no-fail-fast because cargo otherwise stops at the first failing test
+        # binary: a Windows failure in one integration suite hid the results of
+        # every other suite on that platform, including the ones that would say
+        # whether the transport works at all.
+        run: cargo test --workspace --no-fail-fast --target ${{ matrix.target }}
