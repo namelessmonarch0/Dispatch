@@ -66,6 +66,13 @@ impl Config {
         Self { dir }
     }
 
+    fn with_delegation_config(label: &str, request_timeout_secs: u64) -> Self {
+        let cfg = Self::new(label);
+        let delegation_config = format!("[delegation]\nrequest_timeout_secs = {}\n", request_timeout_secs);
+        std::fs::write(cfg.dir.join("config.toml"), delegation_config).expect("temp dir is writable");
+        cfg
+    }
+
     fn env(&self) -> (&'static str, String) {
         (
             dispatch_os::paths::CONFIG_DIR_ENV,
@@ -364,6 +371,36 @@ fn a_refused_delegate_call_exits_78_with_nothing_on_stdout() {
     assert!(
         output.stdout.is_empty(),
         "a refused request never runs anything, so stdout must be empty, got {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn an_unanswered_delegate_call_exits_75_when_the_deadline_passes() {
+    // Expired when nobody answers: the daemon is asked but no interface client
+    // approves or denies before the deadline. The shim asks with no interface
+    // client listening, so the request times out.
+    let config = Config::with_delegation_config("expired", 0);
+    let project = config.dir.join("project");
+    std::fs::create_dir_all(&project).expect("temp dir is writable");
+    let _daemon = Daemon::start(&config, &project);
+
+    let (ui, mut ui_writer) = attach(&config);
+    let parent = spawn_parent_pane(&ui, &mut ui_writer);
+
+    // Run the shim without answering the pending request. The daemon will ask
+    // on the interface connection we hold, but we do not answer it.
+    let output = run_delegate_shim(&config, parent, "", "echo should-not-run");
+
+    assert_eq!(
+        output.status.code(),
+        Some(75),
+        "an unanswered request exits TEMPFAIL; stderr was {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "an unanswered request never runs anything, so stdout must be empty, got {:?}",
         String::from_utf8_lossy(&output.stdout)
     );
 }
