@@ -29,14 +29,8 @@ macro_rules! id_type {
         }
 
         impl Default for $name {
-            /// The nil id, not a fresh random one.
-            ///
-            /// A field that is `#[serde(skip)]` gets this value back on every
-            /// decode, so if `default()` minted a random id here, the same
-            /// message would stop equaling itself the moment it crossed the
-            /// wire. Call [`Self::new`] for an actual new identity.
             fn default() -> Self {
-                Self(Uuid::nil())
+                Self::new()
             }
         }
 
@@ -63,6 +57,19 @@ id_type! {
     /// knows nothing of the other machines a client is holding, so identity
     /// across a fleet is the client's to assign.
     DeviceId
+}
+
+impl DeviceId {
+    /// The nil id, used only as the companion default for a field that is
+    /// `#[serde(skip)]`.
+    ///
+    /// A skipped field is rebuilt from this on every decode, so it has to be
+    /// the same value every time [`Self::new`] is not — otherwise an
+    /// encoded-then-decoded message stops equaling itself.
+    #[must_use]
+    pub fn nil() -> Self {
+        Self(Uuid::nil())
+    }
 }
 
 id_type! {

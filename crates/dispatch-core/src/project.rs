@@ -31,8 +31,11 @@ pub struct Project {
     /// Skipped on the wire: the daemon sends this very type in
     /// `ServerMessage::ProjectOpened` and knows nothing about the other
     /// machines a client is holding, so the client stamps the device on as it
-    /// adopts the project. Default until it does.
-    #[serde(skip)]
+    /// adopts the project. Rebuilt from [`DeviceId::nil`] on every decode
+    /// until it does — a skipped field's companion default has to be the same
+    /// value every time, or an encoded-then-decoded project stops equaling
+    /// itself.
+    #[serde(skip, default = "DeviceId::nil")]
     pub device: DeviceId,
     /// Display name, shown in the sidebar.
     pub name: String,
@@ -57,7 +60,7 @@ impl Project {
 
         Self {
             id: ProjectId::new(),
-            device: DeviceId::default(),
+            device: DeviceId::nil(),
             name,
             root,
             source,
