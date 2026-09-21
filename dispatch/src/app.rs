@@ -977,6 +977,7 @@ impl App {
                 sidebar::hit_test(&self.state, self.sidebar_area, mouse.column, mouse.row)
         {
             match hit {
+                sidebar::Hit::Device(id) => self.state.toggle_device_collapsed(id),
                 // A heading carries no pane, so the whole row is the
                 // project's: a click both moves the view there and folds the
                 // panes away.

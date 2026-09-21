@@ -6,7 +6,7 @@
 
 use dispatch_config::HarnessRegistry;
 use dispatch_config::harness::DEFAULT_ICON;
-use dispatch_core::{AppState, Pane, PaneId, PaneStatus, ProjectId, ProjectSource};
+use dispatch_core::{AppState, DeviceId, Pane, PaneId, PaneStatus, ProjectId, ProjectSource};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -70,6 +70,12 @@ pub const OPEN_FOLDER: &str = "\u{f115}";
 
 /// A project whose panes are folded away, or which has none.
 pub const SHUT_FOLDER: &str = "\u{f07b}";
+
+/// The mark on a machine's row.
+pub const MACHINE: &str = "\u{f109}";
+
+/// What a machine's row says when its connection is down.
+const UNREACHABLE: &str = "unreachable";
 
 /// How far a row's text sits from the start of that row.
 ///
@@ -217,8 +223,10 @@ fn state_glyph(pane: &Pane) -> (&'static str, Style) {
 /// One line of the sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
-    /// A project heading.
-    Project(ProjectId),
+    /// A machine, when there is more than one.
+    Device(DeviceId),
+    /// A project heading, drawn `indent` columns in from the list's edge.
+    Project(ProjectId, u16),
     /// A pane, drawn `indent` columns in from the list's edge.
     Pane(PaneId, u16),
 }
@@ -243,27 +251,52 @@ enum Row {
 fn rows(state: &AppState) -> Vec<Row> {
     let mut rows = Vec::new();
 
-    for project in state.projects() {
-        rows.push(Row::Project(project.id));
+    // One machine draws no machine row: it would say what the user already
+    // knows and indent everything under it to say it.
+    let federated = state.devices().len() > 1;
+    let step = if federated { 2 } else { 0 };
 
-        if state.is_project_collapsed(project.id) {
-            continue;
+    let devices: Vec<Option<DeviceId>> = if federated {
+        state.devices().iter().map(|d| Some(d.id)).collect()
+    } else {
+        vec![None]
+    };
+
+    for device in devices {
+        if let Some(device) = device {
+            rows.push(Row::Device(device));
+
+            if state.is_device_collapsed(device) {
+                continue;
+            }
         }
 
-        for pane in state.panes_for(project.id) {
-            if pane.parent.is_some() {
-                // Drawn under its parent, below, not in its own right.
+        for project in state.projects() {
+            if device.is_some_and(|device| project.device != device) {
                 continue;
             }
 
-            rows.push(Row::Pane(pane.id, 2));
+            rows.push(Row::Project(project.id, step));
 
-            if state.is_pane_collapsed(pane.id) {
+            if state.is_project_collapsed(project.id) {
                 continue;
             }
 
-            for child in state.children_of(pane.id) {
-                rows.push(Row::Pane(child.id, 4));
+            for pane in state.panes_for(project.id) {
+                if pane.parent.is_some() {
+                    // Drawn under its parent, below, not in its own right.
+                    continue;
+                }
+
+                rows.push(Row::Pane(pane.id, step + 2));
+
+                if state.is_pane_collapsed(pane.id) {
+                    continue;
+                }
+
+                for child in state.children_of(pane.id) {
+                    rows.push(Row::Pane(child.id, step + 4));
+                }
             }
         }
     }
@@ -296,7 +329,8 @@ impl Widget for Sidebar<'_> {
             }
 
             match row {
-                Row::Project(id) => self.render_project(buf, area, y, id, selected),
+                Row::Device(id) => self.render_device(buf, area, y, id),
+                Row::Project(id, indent) => self.render_project(buf, area, y, id, indent, selected),
                 Row::Pane(id, indent) => {
                     let pane = self
                         .state
@@ -312,6 +346,8 @@ impl Widget for Sidebar<'_> {
 /// What sits under a click on the sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
+    /// A machine's row. Folding is all there is to do on one.
+    Device(DeviceId),
     /// A project heading. The whole row is its control: there is no pane on it
     /// to focus, so a click both selects the project and folds its panes.
     Project(ProjectId),
@@ -339,7 +375,8 @@ pub fn hit_test(state: &AppState, area: Rect, x: u16, y: u16) -> Option<Hit> {
     let index = usize::from(y - area.y);
 
     match *rows(state).get(index)? {
-        Row::Project(id) => Some(Hit::Project(id)),
+        Row::Device(id) => Some(Hit::Device(id)),
+        Row::Project(id, _) => Some(Hit::Project(id)),
         Row::Pane(id, indent) => {
             let pane = state.pane(id)?;
 
@@ -355,13 +392,18 @@ pub fn hit_test(state: &AppState, area: Rect, x: u16, y: u16) -> Option<Hit> {
 }
 
 impl Sidebar<'_> {
-    /// Draws one project row.
+    /// Draws one project row `indent` columns in from the sidebar's edge.
+    ///
+    /// The indent is nonzero only under a machine row, which is what pushes a
+    /// project's own columns — its twisty, its git mark, its folder, its name
+    /// — in to sit under that machine rather than under the frame.
     fn render_project(
         &self,
         buf: &mut Buffer,
         area: Rect,
         y: u16,
         id: ProjectId,
+        indent: u16,
         selected: Option<ProjectId>,
     ) {
         let project = self
@@ -386,10 +428,13 @@ impl Sidebar<'_> {
 
         // The bar runs the full width of the list rather than the width of the
         // name: a highlight that stops where a short name does reads as part
-        // of the name instead of as the row being selected.
+        // of the name instead of as the row being selected. It starts at the
+        // row's own indent, not the frame's edge, so a selected project under
+        // a machine does not paint over that machine's row.
         if is_selected {
-            let blanks = " ".repeat(area.width as usize);
-            write(buf, area, area.x, y, &blanks, style);
+            let width = (area.width.saturating_sub(indent)) as usize;
+            let blanks = " ".repeat(width);
+            write(buf, area, area.x + indent, y, &blanks, style);
         }
 
         // Open only when there is something inside to be looking at: a folder
@@ -397,20 +442,68 @@ impl Sidebar<'_> {
         let collapsed = self.state.is_project_collapsed(id);
         let open = has_panes && !collapsed;
 
-        write(buf, area, area.x, y, twisty(has_panes, collapsed), style);
         write(
             buf,
             area,
-            area.x + 1,
+            area.x + indent,
+            y,
+            twisty(has_panes, collapsed),
+            style,
+        );
+        write(
+            buf,
+            area,
+            area.x + indent + 1,
             y,
             source_icon(&project.source),
             style,
         );
-        write(buf, area, area.x + 2, y, folder_icon(open), style);
+        write(buf, area, area.x + indent + 2, y, folder_icon(open), style);
 
-        let name_x = area.x + NAME;
+        let name_x = area.x + indent + NAME;
         let room = (area.x + area.width).saturating_sub(name_x) as usize;
         write(buf, area, name_x, y, &truncate(&project.name, room), style);
+    }
+
+    /// Draws one machine's row.
+    ///
+    /// Dim and labelled when its connection is down: its agents are still
+    /// running, so the row stays, but a row that looks live while nothing can
+    /// reach it is worse than no row.
+    fn render_device(&self, buf: &mut Buffer, area: Rect, y: u16, id: DeviceId) {
+        let Some(device) = self.state.device(id) else {
+            return;
+        };
+
+        let style = if device.reachable {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        let has_projects = self
+            .state
+            .projects()
+            .iter()
+            .any(|project| project.device == id);
+
+        write(
+            buf,
+            area,
+            area.x,
+            y,
+            twisty(has_projects, self.state.is_device_collapsed(id)),
+            style,
+        );
+        write(buf, area, area.x + 1, y, MACHINE, style);
+
+        let name = if device.reachable {
+            device.name.clone()
+        } else {
+            format!("{} — {UNREACHABLE}", device.name)
+        };
+        let room = (area.x + area.width).saturating_sub(area.x + NAME) as usize;
+        write(buf, area, area.x + NAME, y, &truncate(&name, room), style);
     }
 
     /// Draws one pane row `indent` columns in from the sidebar's edge.

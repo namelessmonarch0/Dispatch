@@ -2,7 +2,7 @@
 
 use super::*;
 
-use dispatch_core::{HarnessId, Pane, PaneId, Project, ProjectSource};
+use dispatch_core::{Device, DeviceId, HarnessId, Pane, PaneId, Project, ProjectSource};
 
 /// State with two projects; the first is selected.
 fn state() -> (AppState, ProjectId, ProjectId) {
@@ -795,6 +795,100 @@ fn a_repository_carries_a_git_mark_beside_its_folder() {
         REPOSITORY,
         "and a repository does"
     );
+}
+
+/// State with two devices, each holding one project.
+fn fleet() -> (AppState, DeviceId, DeviceId) {
+    let mut state = AppState::new();
+    let laptop = state.add_device(Device::new("laptop"));
+    let tower = state.add_device(Device::new("tower"));
+
+    state.add_project(Project::new("/tmp/alpha", ProjectSource::LocalDir).with_device(laptop));
+    state.add_project(Project::new("/tmp/beta", ProjectSource::LocalDir).with_device(tower));
+
+    (state, laptop, tower)
+}
+
+#[test]
+fn one_machine_draws_no_device_row() {
+    // The ordinary case. A lone row naming this machine costs a line and
+    // indents everything under it to say what the user already knows.
+    let mut state = AppState::new();
+    let laptop = state.add_device(Device::new("laptop"));
+    state.add_project(Project::new("/tmp/alpha", ProjectSource::LocalDir).with_device(laptop));
+
+    let lines = render_lines(&state, WIDTH, 8);
+
+    assert!(
+        lines[TOP as usize].contains("alpha"),
+        "the project is the first row: {lines:#?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("laptop")),
+        "and the machine is not drawn at all: {lines:#?}"
+    );
+}
+
+#[test]
+fn several_machines_each_get_a_row_above_their_projects() {
+    let (state, _, _) = fleet();
+    let lines = render_lines(&state, WIDTH, 10);
+
+    let laptop = lines
+        .iter()
+        .position(|line| line.contains("laptop"))
+        .expect("the first machine has a row");
+    let alpha = lines
+        .iter()
+        .position(|line| line.contains("alpha"))
+        .expect("its project is listed");
+    let tower = lines
+        .iter()
+        .position(|line| line.contains("tower"))
+        .expect("the second machine has a row");
+
+    assert!(laptop < alpha && alpha < tower, "{lines:#?}");
+    assert!(
+        column_of(&lines[alpha], "alpha") > column_of(&lines[laptop], "laptop"),
+        "a project is indented under its machine: {lines:#?}"
+    );
+}
+
+#[test]
+fn a_collapsed_device_hides_its_projects() {
+    let (mut state, laptop, _) = fleet();
+
+    state.toggle_device_collapsed(laptop);
+    let text = render_lines(&state, WIDTH, 10).join("\n");
+
+    assert!(!text.contains("alpha"), "{text}");
+    assert!(text.contains("laptop"), "the machine stays: {text}");
+    assert!(
+        text.contains("beta"),
+        "the other machine is unaffected: {text}"
+    );
+}
+
+#[test]
+fn an_unreachable_device_says_so() {
+    let (mut state, _, tower) = fleet();
+
+    state.set_device_reachable(tower, false);
+    let lines = render_lines(&state, WIDTH, 10);
+    let row = lines
+        .iter()
+        .find(|line| line.contains("tower"))
+        .expect("the machine has a row");
+
+    assert!(row.contains("unreachable"), "{row:?}");
+}
+
+#[test]
+fn a_click_on_a_device_row_finds_the_device() {
+    let (state, laptop, _) = fleet();
+    let area = Rect::new(0, 0, WIDTH, 10);
+
+    assert_eq!(hit_test(&state, area, LEFT, TOP), Some(Hit::Device(laptop)));
 }
 
 #[test]
