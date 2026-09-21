@@ -79,19 +79,26 @@ fn status_style(status: PaneStatus) -> Style {
 
 /// What a pane's outcome looks like in one glyph, drawn at the end of its row.
 ///
-/// The status dot says what a live pane is doing; this says how a subagent's
-/// run turned out, which is the question a parent pane's row exists to
-/// answer once its children have started finishing.
-fn outcome(pane: &Pane) -> (&'static str, Style) {
+/// Only delegated work gets one. The status dot already says what a pane is
+/// doing, so a glyph beside it on an ordinary pane is the same fact twice —
+/// and a column of `⋯` against every shell was noise that made the one row
+/// actually reporting an outcome harder to find. A subagent is the case the
+/// glyph exists for: its parent is waiting on how the run turned out.
+///
+/// A tombstone keeps its glyph whatever it is: a closed row with live work
+/// beneath it has to look different from a row that is merely idle.
+fn outcome(pane: &Pane) -> Option<(&'static str, Style)> {
     if pane.closed {
-        return ("⊘", Style::default().fg(Color::DarkGray));
+        return Some(("⊘", Style::default().fg(Color::DarkGray)));
     }
 
-    match pane.status {
+    pane.parent?;
+
+    Some(match pane.status {
         PaneStatus::Exited(0) => ("✓", Style::default().fg(Color::Green)),
         PaneStatus::Exited(_) => ("!", Style::default().fg(Color::Red)),
         _ => ("⋯", Style::default().fg(Color::DarkGray)),
-    }
+    })
 }
 
 impl Widget for Sidebar<'_> {
@@ -273,13 +280,22 @@ impl Sidebar<'_> {
         let x = write(buf, area, area.x + indent, y, marker, style);
         let x = write(buf, area, x + 1, y, DOT, dot_style);
 
-        // The outcome glyph lives in the row's last column, so a long title
-        // is cut short before it rather than drawn under it.
-        let (glyph, glyph_style) = outcome(pane);
+        // The outcome glyph lives in the row's last column, so a long title is
+        // cut short before it rather than drawn under it. A row with no glyph
+        // gives that column back to the title.
+        let glyph = outcome(pane);
         let right = (area.x + area.width).saturating_sub(2);
-        let room = right.saturating_sub(x + 2) as usize;
+        let room = if glyph.is_some() {
+            right.saturating_sub(x + 2) as usize
+        } else {
+            (area.x + area.width).saturating_sub(x + 2) as usize
+        };
+
         write(buf, area, x + 2, y, &truncate(&pane.title, room), style);
-        write(buf, area, right + 1, y, glyph, glyph_style);
+
+        if let Some((glyph, glyph_style)) = glyph {
+            write(buf, area, right + 1, y, glyph, glyph_style);
+        }
 
         y + 1
     }

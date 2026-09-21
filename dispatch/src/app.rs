@@ -1540,13 +1540,54 @@ impl App {
     /// spread into its place. It stays in the sidebar, where selecting it shows
     /// what it printed — the output is worth keeping, the floor space is not.
     fn tileable(&self) -> Vec<PaneId> {
-        self.state
-            .visible_panes()
-            .iter()
-            .filter(|pane| pane.status.is_live())
-            .filter(|pane| pane.parent.is_none() || self.expanded.contains(&pane.id))
-            .map(|pane| pane.id)
-            .collect()
+        let mut ordered = Vec::new();
+
+        // A tree walk rather than the order panes were created in. An opened
+        // subagent has to sit next to the pane that asked for it — that is what
+        // `^a s` is for — and with a grid that holds four, creation order can
+        // put a parent on one tab and its child on the next.
+        for pane in self.state.visible_panes() {
+            if pane.parent.is_some() || !pane.status.is_live() {
+                continue;
+            }
+
+            ordered.push(pane.id);
+            self.push_opened_children(pane.id, &mut ordered);
+        }
+
+        // A subagent whose parent is a tombstone — closed, but kept because
+        // this work outlived it — has no parent row to follow and would drop
+        // out of the grid entirely.
+        for pane in self.state.visible_panes() {
+            if pane.parent.is_some()
+                && pane.status.is_live()
+                && self.expanded.contains(&pane.id)
+                && !ordered.contains(&pane.id)
+            {
+                ordered.push(pane.id);
+            }
+        }
+
+        ordered
+    }
+
+    /// Appends `parent`'s opened, still-running descendants, deepest last.
+    ///
+    /// Guards against a pane reachable from itself: the tree comes from the
+    /// daemon, and a cycle there would hang the interface rather than show a
+    /// wrong pane.
+    fn push_opened_children(&self, parent: PaneId, ordered: &mut Vec<PaneId>) {
+        for child in self.state.children_of(parent) {
+            if !child.status.is_live() || !self.expanded.contains(&child.id) {
+                continue;
+            }
+            if ordered.contains(&child.id) {
+                continue;
+            }
+
+            ordered.push(child.id);
+            self.push_opened_children(child.id, ordered);
+        }
     }
 
     /// How many tabs the tileable panes fill.
@@ -1885,6 +1926,62 @@ mod tests {
         app.poll_daemon();
 
         ids
+    }
+
+    #[test]
+    fn an_opened_subagent_is_tiled_beside_the_pane_that_asked_for_it() {
+        // `^a s` exists to put a subagent next to its parent. Creation order
+        // would put it after every other pane, which with a grid of four means
+        // a different tab — the one place it must never be.
+        let (mut app, project, daemon, _outbox) = attached_app();
+        let parents = spawn_several(&mut app, &daemon, project, 4);
+
+        let child = PaneId::new();
+        daemon
+            .send(spawned(child, project, "claude", Some(parents[0]), true))
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        app.expanded.insert(child);
+
+        assert_eq!(
+            app.tileable(),
+            vec![parents[0], child, parents[1], parents[2], parents[3]],
+            "the child follows its parent rather than the last pane"
+        );
+        assert!(
+            app.panes_on_tab().contains(&child),
+            "so the two share a tab: {:?}",
+            app.panes_on_tab()
+        );
+        assert!(
+            app.panes_on_tab().contains(&parents[0]),
+            "and the parent is on it too"
+        );
+    }
+
+    #[test]
+    fn a_subagent_that_outlived_its_parent_is_still_tiled() {
+        // A blanket-approved subagent survives the pane that asked for it, and
+        // the parent becomes a tombstone. Walking the tree from live parents
+        // alone would drop the survivor out of the grid.
+        let (mut app, project, daemon, _outbox) = attached_app();
+        let parent = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        let child = PaneId::new();
+        daemon
+            .send(spawned(child, project, "claude", Some(parent), true))
+            .expect("the app is listening");
+        app.poll_daemon();
+        app.expanded.insert(child);
+
+        let _ = app.state.close_pane(parent);
+
+        assert!(
+            app.tileable().contains(&child),
+            "the survivor keeps its place in the grid, got {:?}",
+            app.tileable()
+        );
     }
 
     #[test]

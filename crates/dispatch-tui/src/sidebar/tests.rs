@@ -290,6 +290,32 @@ fn a_finished_subagent_shows_how_it_ended() {
 }
 
 #[test]
+fn a_pane_nobody_delegated_carries_no_outcome_glyph() {
+    // The status dot already says what an ordinary pane is doing. A glyph
+    // beside it repeats the fact, and a column of them against every shell
+    // buries the one row that is actually reporting a subagent's result.
+    let mut state = AppState::new();
+    let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+
+    let mut shell = Pane::new(project, HarnessId::new("shell"));
+    shell.title = "a shell".into();
+    state.adopt_pane(shell).expect("the project exists");
+
+    let lines = render_lines(&state, 28, 4);
+    let row = lines
+        .iter()
+        .find(|line| line.contains("a shell"))
+        .expect("the pane has a row");
+
+    for glyph in ['⋯', '✓', '!'] {
+        assert!(
+            !row.contains(glyph),
+            "{glyph:?} does not belong on an undelegated pane: {row:?}"
+        );
+    }
+}
+
+#[test]
 fn a_tombstone_says_it_is_closed_and_still_shows_its_children() {
     let mut state = AppState::new();
     let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
