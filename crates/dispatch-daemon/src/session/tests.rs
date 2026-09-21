@@ -1813,3 +1813,79 @@ fn a_late_subscriber_is_told_about_pending_requests_oldest_first() {
         "a late subscriber should be caught up in the order the requests were asked"
     );
 }
+
+#[test]
+fn closing_an_empty_project_forgets_it_and_tells_everyone() {
+    let (mut daemon, project, _dir) = daemon("close-project");
+    let inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let _ = drain(&inbox);
+
+    daemon.request_for_test(1, ClientMessage::CloseProject { project });
+
+    assert!(
+        daemon.projects().is_empty(),
+        "the daemon forgets it, or the next Subscribe hands it straight back"
+    );
+    assert!(
+        drain(&inbox)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::ProjectClosed { project: p } if *p == project)),
+        "closing should be broadcast"
+    );
+}
+
+#[test]
+fn a_project_with_panes_is_not_closed() {
+    // Its agents belong to the daemon and would carry on running with nothing
+    // left to reach them by.
+    let (mut daemon, project, _dir) = daemon("close-project-busy");
+    let inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    daemon.request_for_test(
+        1,
+        ClientMessage::SpawnPane {
+            project,
+            harness: "shell".into(),
+            size: (80, 24),
+        },
+    );
+    wait_for(&mut daemon, &inbox, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. }))
+    });
+
+    daemon.request_for_test(1, ClientMessage::CloseProject { project });
+
+    assert_eq!(daemon.projects().len(), 1, "it stays");
+    assert!(
+        drain(&inbox)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::Error { .. })),
+        "and the client is told why"
+    );
+}
+
+#[test]
+fn closing_an_unknown_project_is_reported() {
+    let (mut daemon, _, _dir) = daemon("close-project-unknown");
+    let inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    let _ = drain(&inbox);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::CloseProject {
+            project: ProjectId::new(),
+        },
+    );
+
+    assert!(drain(&inbox).iter().any(|m| matches!(
+        m,
+        ServerMessage::Error {
+            error: ProtocolError::NoSuchProject(_)
+        }
+    )));
+}

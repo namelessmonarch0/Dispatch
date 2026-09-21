@@ -266,8 +266,23 @@ impl Harness {
         )
     }
 
+    /// Starts Dispatch against a directory other than the fixture's own,
+    /// sharing its configuration — which is where the kept project list is.
+    fn spawn_in(fixture: &Fixture, root: &std::path::Path, size: Size) -> Self {
+        Self::spawn_with_root(fixture, root, size, &[])
+    }
+
     fn spawn(fixture: &Fixture, size: Size, extra: &[String]) -> Self {
-        let mut args = vec![fixture.project.display().to_string()];
+        Self::spawn_with_root(fixture, &fixture.project.clone(), size, extra)
+    }
+
+    fn spawn_with_root(
+        fixture: &Fixture,
+        root: &std::path::Path,
+        size: Size,
+        extra: &[String],
+    ) -> Self {
+        let mut args = vec![root.display().to_string()];
         args.extend_from_slice(extra);
 
         let launch = Launch {
@@ -550,6 +565,30 @@ fn zoom_gives_a_pane_the_whole_grid_and_gives_it_back() {
     assert!(
         app.wait_for(|lines| contains(lines, &restored)),
         "unzooming should restore the grid and report {restored}"
+    );
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn a_project_opened_once_is_listed_on_the_next_start() {
+    // The sidebar is the list of projects the user keeps, not the one
+    // directory this process was pointed at.
+    let fixture = Fixture::new("kept");
+    let second = fixture.config.path().join("second");
+    std::fs::create_dir_all(&second).expect("temp dir is writable");
+
+    let mut first = Harness::spawn_in(&fixture, &fixture.project.clone(), Size::new(100, 30));
+    assert!(first.wait_for(|lines| sidebar_contains(lines, "project")));
+    first.send(b"\x01q");
+    drop(first);
+
+    let mut again = Harness::spawn_in(&fixture, &second, Size::new(100, 30));
+
+    assert!(
+        again.wait_for(
+            |lines| sidebar_contains(lines, "second") && sidebar_contains(lines, "project")
+        ),
+        "both the new directory and the kept one are listed"
     );
 }
 

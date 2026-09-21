@@ -29,4 +29,4 @@ pub use message::{
 ///
 /// Bumped only for a change an older peer cannot safely ignore. Adding a
 /// message variant or an optional field is not such a change.
-pub const VERSION: Version = Version { major: 1, minor: 0 };
+pub const VERSION: Version = Version { major: 1, minor: 1 };

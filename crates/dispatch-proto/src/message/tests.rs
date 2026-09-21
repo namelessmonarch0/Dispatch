@@ -500,3 +500,29 @@ fn a_pane_announced_by_an_older_daemon_is_not_durable() {
         }
     );
 }
+
+#[test]
+fn closing_a_project_round_trips_both_ways() {
+    // A client keeps its own list of projects; the daemon has to be told when
+    // one leaves it, or the next Subscribe hands it straight back.
+    let project = ProjectId::new();
+
+    let asked = ClientMessage::CloseProject { project };
+    assert_eq!(round_trip(&asked), asked);
+
+    let answered = ServerMessage::ProjectClosed { project };
+    assert_eq!(round_trip(&answered), answered);
+}
+
+#[test]
+fn a_higher_minor_version_is_still_compatible() {
+    // Adding a message is a minor bump: an older peer ignores a variant it has
+    // no name for. It must not be read as a reason to refuse the connection.
+    let older = Version {
+        major: crate::VERSION.major,
+        minor: 0,
+    };
+
+    assert!(crate::VERSION.is_compatible_with(older));
+    assert!(older.is_compatible_with(crate::VERSION));
+}

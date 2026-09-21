@@ -158,6 +158,16 @@ pub enum ClientMessage {
         root: PathBuf,
     },
 
+    /// Forgets a project the client no longer keeps.
+    ///
+    /// Refused while the project still has panes: the daemon owns them, and a
+    /// project it had forgotten would leave them running with nothing to
+    /// spawn into and no row to reach them by.
+    CloseProject {
+        /// Which project to forget.
+        project: ProjectId,
+    },
+
     /// Starts a pane.
     SpawnPane {
         /// Which project to start it in.
@@ -285,6 +295,12 @@ pub enum ServerMessage {
     ProjectOpened {
         /// The project, as the daemon resolved it.
         project: Project,
+    },
+
+    /// A project was forgotten, and every client should drop its row.
+    ProjectClosed {
+        /// Which project is gone.
+        project: ProjectId,
     },
 
     /// A pane was started.

@@ -20,6 +20,9 @@ pub enum StateError {
     /// The named pane does not exist.
     #[error("no pane with id {0}")]
     NoSuchPane(PaneId),
+    /// The project still has panes, so removing it would strand them.
+    #[error("project {0} still has panes")]
+    ProjectInUse(ProjectId),
 }
 
 /// Projects, their panes, and what the user is currently looking at.
@@ -66,6 +69,39 @@ impl AppState {
             self.selected_project = Some(id);
         }
         id
+    }
+
+    /// Forgets a project.
+    ///
+    /// Refused while it still has panes, tombstones included: an agent whose
+    /// project row has gone is running with no way left to reach it. Closing
+    /// them is the user's decision to make, one pane at a time.
+    ///
+    /// The view moves to whatever project is left, because the selection has
+    /// to name one that exists.
+    pub fn remove_project(&mut self, project: ProjectId) -> Result<(), StateError> {
+        let Some(index) = self.projects.iter().position(|p| p.id == project) else {
+            return Err(StateError::NoSuchProject(project));
+        };
+
+        if self.panes.iter().any(|pane| pane.project == project) {
+            return Err(StateError::ProjectInUse(project));
+        }
+
+        self.projects.remove(index);
+        self.collapsed_projects.remove(&project);
+
+        if self.selected_project == Some(project) {
+            self.zoomed_pane = None;
+            self.focused_pane = None;
+            self.selected_project = self.projects.first().map(|p| p.id);
+
+            if let Some(next) = self.selected_project {
+                self.focused_pane = self.panes_for(next).first().map(|p| p.id);
+            }
+        }
+
+        Ok(())
     }
 
     /// All registered projects, in the order they were added.
@@ -1382,5 +1418,55 @@ mod tests {
         state.close_pane(pane).expect("the pane exists");
 
         assert!(!state.is_pane_collapsed(pane));
+    }
+
+    #[test]
+    fn a_project_with_no_panes_can_be_removed() {
+        let (mut state, first) = with_project();
+        let second = state.add_project(Project::new("/tmp/beta", ProjectSource::LocalDir));
+
+        state.remove_project(first).expect("it has no panes");
+
+        assert_eq!(state.projects().len(), 1);
+        assert_eq!(
+            state.selected_project(),
+            Some(second),
+            "the view moves to what is left"
+        );
+    }
+
+    #[test]
+    fn removing_the_last_project_leaves_nothing_selected() {
+        let (mut state, only) = with_project();
+
+        state.remove_project(only).expect("it has no panes");
+
+        assert_eq!(state.selected_project(), None);
+    }
+
+    #[test]
+    fn a_project_still_running_panes_is_not_removed() {
+        // Removing it would take its agents off the screen while they carried
+        // on running, with no row left to reach them by.
+        let (mut state, project) = with_project();
+        state
+            .spawn_pane(project, harness("claude"))
+            .expect("the project exists");
+
+        assert!(matches!(
+            state.remove_project(project),
+            Err(StateError::ProjectInUse(_))
+        ));
+        assert_eq!(state.projects().len(), 1);
+    }
+
+    #[test]
+    fn removing_a_project_that_is_not_there_is_refused() {
+        let (mut state, _) = with_project();
+
+        assert!(matches!(
+            state.remove_project(ProjectId::new()),
+            Err(StateError::NoSuchProject(_))
+        ));
     }
 }

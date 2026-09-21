@@ -402,6 +402,8 @@ impl Daemon {
 
             ClientMessage::OpenProject { root } => self.open_project_for(id, root),
 
+            ClientMessage::CloseProject { project } => self.close_project_for(id, project),
+
             ClientMessage::SpawnPane {
                 project,
                 harness,
@@ -552,6 +554,44 @@ impl Daemon {
         // Every client hears about it: they are looking at the same fleet, and
         // a project one of them opened is one they can all spawn into.
         self.broadcast(ServerMessage::ProjectOpened { project });
+    }
+
+    /// Forgets a project, once nothing is running in it.
+    ///
+    /// The daemon outlives its clients, so a project it keeps is one the next
+    /// `Subscribe` announces again: a client that dropped it from its own list
+    /// would be handed it straight back. Refused while it has panes — they are
+    /// the daemon's, and a project it had forgotten would leave them running
+    /// with no row to reach them by.
+    fn close_project_for(&mut self, client: ClientId, project: ProjectId) {
+        if !self.projects.contains_key(&project) {
+            self.send(
+                client,
+                ServerMessage::Error {
+                    error: ProtocolError::NoSuchProject(project),
+                },
+            );
+            return;
+        }
+
+        if self.panes.values().any(|pane| pane.project == project) {
+            self.send(
+                client,
+                ServerMessage::Error {
+                    error: ProtocolError::Other(format!(
+                        "project {project} still has panes; close them first"
+                    )),
+                },
+            );
+            return;
+        }
+
+        self.projects.remove(&project);
+        tracing::info!(project = %project, "project closed");
+
+        // Every client hears about it, as they do when one is opened: they are
+        // looking at the same fleet.
+        self.broadcast(ServerMessage::ProjectClosed { project });
     }
 
     fn spawn_pane(&mut self, client: ClientId, project: ProjectId, harness: &str, size: Size) {

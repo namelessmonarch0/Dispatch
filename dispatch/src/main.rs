@@ -121,13 +121,35 @@ fn main() -> Result<ExitCode> {
     } else {
         args.projects.clone()
     };
-    let roots: Vec<PathBuf> = projects
+    let asked_for: Vec<PathBuf> = projects
         .iter()
         .map(|project| {
             dispatch_os::paths::resolve(project)
                 .with_context(|| format!("no such directory: {}", project.display()))
         })
         .collect::<Result<_>>()?;
+
+    // The fleet is not one directory: the projects kept from earlier runs are
+    // opened alongside whatever this one names, and a directory that has since
+    // been deleted or moved is skipped rather than taking the start down.
+    let config_dir = dispatch_os::paths::config_dir().context("failed to locate the config dir")?;
+    let mut roots: Vec<PathBuf> = dispatch_config::projects::load(&config_dir)
+        .context("failed to read the kept projects")?
+        .into_iter()
+        .filter(|root| {
+            if root.is_dir() {
+                return true;
+            }
+            tracing::warn!(root = %root.display(), "kept project is missing; skipping it");
+            false
+        })
+        .collect();
+
+    for root in asked_for {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
 
     let mut app = if args.attach {
         // Fails before the terminal is taken over, so the reason is readable.
@@ -138,6 +160,9 @@ fn main() -> Result<ExitCode> {
     } else {
         App::new(harnesses)
     };
+
+    // Set before the projects are added, so opening one is what keeps it.
+    app.keep_projects_in(&config_dir);
 
     for root in roots {
         app.add_project(root);

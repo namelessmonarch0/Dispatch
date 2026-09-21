@@ -86,6 +86,20 @@ still listed for the sake of a subagent under it.
 Every glyph is a Nerd Font one, so Dispatch wants a patched font in the
 terminal it runs in.
 
+## Keeping projects
+
+The sidebar is the list of projects you keep, not the one directory Dispatch
+was started in. Opening Dispatch in a directory adds it to that list, and it is
+there on every later start, whichever directory you started in. The list lives
+in `projects.toml` beside the rest of the configuration.
+
+`^a p` opens the list; `d` on a row drops that project for good. A project with
+panes is not dropped -- close them first, or its agents would carry on running
+with no row left to reach them by. Attached, the daemon is asked to forget it
+too, since it is the daemon that hands a client its projects on every connect.
+
+Nothing scans your disk, and nothing is kept that you did not open.
+
 ## Running the daemon
 
 Dispatch works on its own, with the agents as its children. Started that way,

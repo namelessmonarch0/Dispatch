@@ -3,6 +3,7 @@
 pub mod config;
 pub mod defaults;
 pub mod harness;
+pub mod projects;
 
 /// Shared by this crate's test modules, so there is one temporary-directory
 /// counter rather than one per module.

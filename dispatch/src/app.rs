@@ -1,7 +1,7 @@
 //! The running application: state, panes, and the event loop.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -242,6 +242,11 @@ pub struct App {
     generation: u64,
     /// The project roots this client asked for, so a reconnection can ask again.
     opened: Vec<PathBuf>,
+    /// Where the kept-projects file lives, when this client keeps one.
+    ///
+    /// `None` in a test, and in any client told to keep nothing: the list is a
+    /// convenience, and a client that cannot write it still runs.
+    kept: Option<PathBuf>,
     overlay: Option<Overlay>,
     state: AppState,
     panes: HashMap<PaneId, Pane>,
@@ -315,6 +320,7 @@ impl App {
             mode,
             generation,
             opened: Vec::new(),
+            kept: None,
             overlay: None,
             state: AppState::new(),
             panes: HashMap::new(),
@@ -334,12 +340,22 @@ impl App {
         }
     }
 
+    /// Keeps the list of opened projects in `dir`, so it outlives the process.
+    ///
+    /// Without this a client forgets every project the moment it exits, which
+    /// is what Dispatch did before the list existed.
+    pub fn keep_projects_in(&mut self, dir: impl Into<PathBuf>) {
+        self.kept = Some(dir.into());
+    }
+
     /// Registers a project.
     ///
     /// Attached, the daemon is asked to open it and the project appears when it
     /// answers: it is the daemon that names projects, and both clients on a
     /// fleet have to use the same id for the same checkout.
     pub fn add_project(&mut self, root: PathBuf) {
+        self.keep(&root);
+
         if let Mode::Attached(client) = &self.mode {
             client.send(ClientMessage::OpenProject { root: root.clone() });
             // Remembered so a reconnection asks again: a daemon that was
@@ -358,6 +374,32 @@ impl App {
         };
 
         self.state.add_project(Project::new(root, source));
+    }
+
+    /// Adds `root` to the kept list, if this client keeps one.
+    ///
+    /// A list that cannot be written is reported in the status line rather
+    /// than fatal: the project is open either way, and losing it on exit is
+    /// not worth refusing to run over.
+    fn keep(&mut self, root: &Path) {
+        let Some(dir) = self.kept.clone() else {
+            return;
+        };
+
+        if let Err(error) = dispatch_config::projects::remember(&dir, root) {
+            self.status = format!("could not keep {}: {error}", root.display());
+        }
+    }
+
+    /// Takes `root` off the kept list, if this client keeps one.
+    fn unkeep(&mut self, root: &Path) {
+        let Some(dir) = self.kept.clone() else {
+            return;
+        };
+
+        if let Err(error) = dispatch_config::projects::forget(&dir, root) {
+            self.status = format!("could not drop {}: {error}", root.display());
+        }
     }
 
     /// What the daemon calls itself, when attached to one.
@@ -531,6 +573,12 @@ impl App {
             ServerMessage::ProjectOpened { project } => {
                 self.state.add_project(project);
                 true
+            }
+
+            ServerMessage::ProjectClosed { project } => {
+                // Whatever the daemon says about its own list is the truth:
+                // this row is drawn from it.
+                self.state.remove_project(project).is_ok()
             }
 
             ServerMessage::PaneSpawned {
@@ -983,6 +1031,11 @@ impl App {
                     picker.previous();
                 }
             }
+            // Only the project picker: `d` in the harness picker would be a
+            // keystroke away from deleting the wrong kind of thing.
+            KeyCode::Char('d') if matches!(self.overlay, Some(Overlay::Project(_))) => {
+                self.drop_selected_project();
+            }
             KeyCode::Enter => {
                 let chosen = self.overlay.as_ref().and_then(|overlay| {
                     let kind = overlay.kind()?;
@@ -1218,6 +1271,66 @@ impl App {
         }
 
         self.overlay = Some(Overlay::Harness(Picker::new("New pane", items)));
+    }
+
+    /// Drops the project the picker is sitting on from the kept list.
+    ///
+    /// Refused while it still has panes: they would go on running with no row
+    /// left to reach them by. Attached, the daemon is asked and the row goes
+    /// when it answers — it keeps the list a client is handed on every
+    /// subscribe, so a row dropped here alone would come back.
+    fn drop_selected_project(&mut self) {
+        let Some(id) = self
+            .overlay
+            .as_ref()
+            .and_then(Overlay::picker)
+            .and_then(Picker::selected)
+            .map(|item| item.id.clone())
+        else {
+            return;
+        };
+
+        let Some(project) = self
+            .state
+            .projects()
+            .iter()
+            .find(|p| p.id.to_string() == id)
+            .map(|p| (p.id, p.root.clone()))
+        else {
+            return;
+        };
+        let (project, root) = project;
+
+        if !self.state.panes_for(project).is_empty() {
+            self.status = "close its panes first".into();
+            return;
+        }
+
+        self.unkeep(&root);
+        self.opened.retain(|kept| kept != &root);
+
+        if let Mode::Attached(client) = &self.mode {
+            client.send(ClientMessage::CloseProject { project });
+            // The row goes when the daemon says so.
+            return;
+        }
+
+        if self.state.remove_project(project).is_ok() {
+            self.status = format!("dropped {}", root.display());
+        }
+
+        self.reopen_project_picker();
+    }
+
+    /// Redraws the project picker over the list as it now is, or closes it
+    /// when nothing is left to choose.
+    fn reopen_project_picker(&mut self) {
+        if self.state.projects().is_empty() {
+            self.overlay = None;
+            return;
+        }
+
+        self.open_project_picker();
     }
 
     fn open_project_picker(&mut self) {
@@ -2343,6 +2456,133 @@ mod tests {
             rendered_text(&terminal).contains('\u{f0e7}'),
             "the harness icon reaches the sidebar"
         );
+    }
+
+    /// Types one key at the app.
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle(
+            &Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+            Size::new(100, 30),
+        )
+        .expect("a keystroke is handled");
+    }
+
+    /// Opens the project picker the way a user does: the prefix, then `p`.
+    fn open_project_picker(app: &mut App) {
+        app.handle(
+            &Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Size::new(100, 30),
+        )
+        .expect("a keystroke is handled");
+        press(app, KeyCode::Char('p'));
+    }
+
+    /// A scratch directory for a test that writes the kept-projects file.
+    fn scratch(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+
+        let path = std::env::temp_dir().join(format!(
+            "dispatch-app-{}-{label}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).expect("temp dir is writable");
+        path
+    }
+
+    #[test]
+    fn an_opened_project_is_kept_until_it_is_dropped() {
+        // The sidebar is the list of projects the user keeps, so opening one
+        // is what puts it there and only dropping it takes it off.
+        let dir = scratch("kept");
+        let mut app = App::new(HarnessRegistry::default());
+        app.keep_projects_in(&dir);
+
+        app.add_project(PathBuf::from("/tmp/alpha"));
+
+        assert_eq!(
+            dispatch_config::projects::load(&dir).expect("it reads back"),
+            [PathBuf::from("/tmp/alpha")]
+        );
+    }
+
+    #[test]
+    fn dropping_a_project_from_the_picker_forgets_it_for_good() {
+        let dir = scratch("dropped");
+        let mut app = App::new(HarnessRegistry::default());
+        app.keep_projects_in(&dir);
+        app.add_project(PathBuf::from("/tmp/alpha"));
+        app.add_project(PathBuf::from("/tmp/beta"));
+
+        open_project_picker(&mut app);
+        // The picker opens on the first project.
+        press(&mut app, KeyCode::Char('d'));
+
+        assert_eq!(app.state.projects().len(), 1, "its row is gone");
+        assert_eq!(
+            dispatch_config::projects::load(&dir).expect("it reads back"),
+            [PathBuf::from("/tmp/beta")],
+            "and it is not there on the next start"
+        );
+    }
+
+    #[test]
+    fn a_project_with_panes_is_not_dropped() {
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        app.state
+            .spawn_pane(project, HarnessId::new("shell"))
+            .expect("the project exists");
+
+        open_project_picker(&mut app);
+        press(&mut app, KeyCode::Char('d'));
+
+        assert_eq!(app.state.projects().len(), 1, "it stays");
+        assert!(
+            app.status.contains("panes"),
+            "and the user is told why: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn dropping_a_project_while_attached_asks_the_daemon() {
+        // The daemon owns the project list a client is handed on every
+        // subscribe, so dropping a row it still keeps would bring it back.
+        let (mut app, project, daemon, sent) = attached_app();
+        daemon
+            .send(ServerMessage::ProjectOpened {
+                project: Project::new("/tmp/second", ProjectSource::LocalDir),
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        open_project_picker(&mut app);
+        press(&mut app, KeyCode::Char('d'));
+
+        let asked = std::iter::from_fn(|| sent.try_recv().ok())
+            .any(|m| matches!(m, ClientMessage::CloseProject { project: p } if p == project));
+        assert!(asked, "the daemon is asked to close it");
+        assert_eq!(
+            app.state.projects().len(),
+            2,
+            "and the row stays until the daemon answers"
+        );
+    }
+
+    #[test]
+    fn a_project_the_daemon_closed_leaves_the_sidebar() {
+        let (mut app, project, daemon, _sent) = attached_app();
+
+        daemon
+            .send(ServerMessage::ProjectClosed { project })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        assert!(app.state.projects().is_empty());
     }
 
     /// A left-button press at `(column, row)`, as the terminal reports one.
