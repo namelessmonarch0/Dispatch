@@ -55,20 +55,17 @@ fn render_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
 const TOP: u16 = 1;
 const LEFT: u16 = 1;
 
-/// The column a row's status dot is drawn in.
-fn dot_column(buf: &Buffer, y: u16) -> Option<u16> {
-    (0..buf.area.width).find(|x| buf.cell((*x, y)).expect("cell exists").symbol() == DOT)
-}
-
-/// How many columns a rendered row is indented.
+/// Which column `text` starts in.
 ///
-/// Measured by the status dot's column rather than by counting leading
-/// spaces: a pane's own focus marker is a blank space when that pane is not
-/// focused, so on an unfocused row plain leading-whitespace counting cannot
-/// tell "no marker" apart from "less indented" — the dot is drawn at a fixed
-/// offset from the row's indent regardless of focus, so it is unambiguous.
-fn indent(line: &str) -> usize {
-    line.find(DOT).unwrap_or(0)
+/// Measured by the text itself rather than by counting leading spaces: a
+/// pane's focus marker and its twisty are both blanks when they have nothing
+/// to say, so leading-whitespace counting cannot tell "no marker" apart from
+/// "less indented".
+fn column_of(line: &str, text: &str) -> usize {
+    let byte = line
+        .find(text)
+        .unwrap_or_else(|| panic!("expected {text:?} in {line:?}"));
+    line[..byte].chars().count()
 }
 
 #[test]
@@ -110,10 +107,8 @@ fn the_selected_project_is_emphasised() {
     let (state, _, _) = state();
     let buf = render(&state, WIDTH, 10);
 
-    // The name starts two columns after the row's status dot.
-    let name_x = |y: u16| dot_column(&buf, y).expect("the row has a dot") + 2;
-    let selected = buf.cell((name_x(TOP), TOP)).expect("cell exists");
-    let unselected = buf.cell((name_x(TOP + 1), TOP + 1)).expect("cell exists");
+    let selected = buf.cell((LEFT + NAME, TOP)).expect("cell exists");
+    let unselected = buf.cell((LEFT + NAME, TOP + 1)).expect("cell exists");
 
     assert!(selected.modifier.contains(Modifier::BOLD));
     assert!(!unselected.modifier.contains(Modifier::BOLD));
@@ -133,58 +128,6 @@ fn the_focused_pane_is_marked() {
         "claude is not focused"
     );
     assert!(row_text(&buf, TOP + 2).contains('▌'), "codex is focused");
-}
-
-#[test]
-fn every_project_has_a_reserved_status_column() {
-    // The federation slice lights this per device. It must already be in the
-    // layout so adding that does not shift every row.
-    let (state, _, _) = state();
-    let buf = render(&state, WIDTH, 10);
-
-    assert_eq!(dot_column(&buf, TOP), dot_column(&buf, TOP + 1));
-    assert!(
-        dot_column(&buf, TOP).is_some_and(|x| x >= LEFT),
-        "the column is inside the frame"
-    );
-}
-
-#[test]
-fn pane_status_is_colour_coded() {
-    let (mut state, alpha, _) = state();
-    let running = spawn(&mut state, alpha, "claude");
-    let failed = spawn(&mut state, alpha, "codex");
-
-    state
-        .set_pane_status(running, PaneStatus::Running)
-        .expect("pane exists");
-    state
-        .set_pane_status(failed, PaneStatus::Exited(1))
-        .expect("pane exists");
-
-    let buf = render(&state, WIDTH, 10);
-
-    let colour = |y: u16| dot_column(&buf, y).map(|x| buf.cell((x, y)).expect("cell exists").fg);
-
-    assert_eq!(colour(TOP + 1), Some(Color::Green), "a running pane");
-    assert_eq!(colour(TOP + 2), Some(Color::Red), "a pane that failed");
-}
-
-#[test]
-fn a_pane_that_exited_cleanly_is_dimmed_rather_than_red() {
-    let (mut state, alpha, _) = state();
-    let pane = spawn(&mut state, alpha, "claude");
-    state
-        .set_pane_status(pane, PaneStatus::Exited(0))
-        .expect("pane exists");
-
-    let buf = render(&state, WIDTH, 10);
-    let dot_x = dot_column(&buf, TOP + 1).expect("the pane has a status dot");
-
-    assert_eq!(
-        buf.cell((dot_x, TOP + 1)).expect("cell exists").fg,
-        Color::DarkGray
-    );
 }
 
 #[test]
@@ -270,68 +213,10 @@ fn a_subagent_is_listed_under_the_pane_that_asked_for_it() {
 
     assert!(child_row > parent_row, "a child comes after its parent");
     assert!(
-        indent(&lines[child_row]) > indent(&lines[parent_row]),
+        column_of(&lines[child_row], "tests") > column_of(&lines[parent_row], "Claude Code"),
         "and is indented under it: {:?}",
         lines[child_row]
     );
-}
-
-#[test]
-fn a_finished_subagent_shows_how_it_ended() {
-    let mut state = AppState::new();
-    let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
-    let parent = state
-        .spawn_pane(project, HarnessId::new("claude"))
-        .expect("the project exists");
-
-    let mut clean = Pane::new(project, HarnessId::new("claude"));
-    clean.parent = Some(parent);
-    clean.title = "tests".into();
-    clean.status = PaneStatus::Exited(0);
-    state.adopt_pane(clean).expect("the project exists");
-
-    let mut failed = Pane::new(project, HarnessId::new("claude"));
-    failed.parent = Some(parent);
-    failed.title = "docs".into();
-    failed.status = PaneStatus::Exited(1);
-    state.adopt_pane(failed).expect("the project exists");
-
-    let lines = render_lines(&state, 28, 6);
-
-    assert!(
-        lines.iter().any(|l| l.contains("tests") && l.contains('✓')),
-        "a clean exit is marked: {lines:#?}"
-    );
-    assert!(
-        lines.iter().any(|l| l.contains("docs") && l.contains('!')),
-        "a failure is marked differently: {lines:#?}"
-    );
-}
-
-#[test]
-fn a_pane_nobody_delegated_carries_no_outcome_glyph() {
-    // The status dot already says what an ordinary pane is doing. A glyph
-    // beside it repeats the fact, and a column of them against every shell
-    // buries the one row that is actually reporting a subagent's result.
-    let mut state = AppState::new();
-    let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
-
-    let mut shell = Pane::new(project, HarnessId::new("shell"));
-    shell.title = "a shell".into();
-    state.adopt_pane(shell).expect("the project exists");
-
-    let lines = render_lines(&state, 28, 4);
-    let row = lines
-        .iter()
-        .find(|line| line.contains("a shell"))
-        .expect("the pane has a row");
-
-    for glyph in ['⋯', '✓', '!'] {
-        assert!(
-            !row.contains(glyph),
-            "{glyph:?} does not belong on an undelegated pane: {row:?}"
-        );
-    }
 }
 
 #[test]
@@ -357,7 +242,7 @@ fn a_tombstone_says_it_is_closed_and_still_shows_its_children() {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("Claude Code") && l.contains('⊘')),
+            .any(|l| l.contains("Claude Code") && l.contains(CLOSED)),
         "the closed parent is marked as such: {lines:#?}"
     );
     assert!(
@@ -521,11 +406,11 @@ fn a_project_with_panes_carries_a_twisty() {
     spawn(&mut state, alpha, "claude");
 
     let buf = render(&state, WIDTH, 6);
-    assert_eq!(buf.cell((LEFT, TOP)).expect("cell exists").symbol(), "▾");
+    assert_eq!(buf.cell((LEFT, TOP)).expect("cell exists").symbol(), OPEN);
 
     state.toggle_project_collapsed(alpha);
     let buf = render(&state, WIDTH, 6);
-    assert_eq!(buf.cell((LEFT, TOP)).expect("cell exists").symbol(), "▸");
+    assert_eq!(buf.cell((LEFT, TOP)).expect("cell exists").symbol(), SHUT);
 }
 
 #[test]
@@ -550,17 +435,17 @@ fn a_pane_with_children_carries_a_twisty_and_one_without_does_not() {
     let twisty = |y: u16| {
         (LEFT..WIDTH)
             .map(|x| buf.cell((x, y)).expect("cell exists").symbol().to_string())
-            .find(|s| s == "▾" || s == "▸")
+            .find(|s| s == OPEN || s == SHUT)
     };
 
-    assert_eq!(twisty(TOP + 1), Some("▾".into()), "the parent has one");
+    assert_eq!(twisty(TOP + 1), Some(OPEN.into()), "the parent has one");
     assert_eq!(twisty(TOP + 3), None, "a childless pane has none");
 
     state.toggle_pane_collapsed(parent);
     let buf = render(&state, WIDTH, 8);
     assert_eq!(
         buf.cell((LEFT + 2, TOP + 1)).expect("cell exists").symbol(),
-        "▸",
+        SHUT,
         "and it flips when collapsed"
     );
     let _ = lonely;
@@ -576,7 +461,7 @@ fn the_focus_marker_is_not_a_twisty() {
     let row = row_text(&buf, TOP + 1);
 
     assert!(row.contains('▌'), "the focused pane is marked: {row:?}");
-    assert!(!row.contains('▸'), "and not with a twisty: {row:?}");
+    assert!(!row.contains(SHUT), "and not with a twisty: {row:?}");
 }
 
 #[test]
@@ -705,5 +590,176 @@ fn a_tombstones_twisty_still_toggles() {
     assert_eq!(
         hit_test(&state, area, LEFT + 2, TOP + 1),
         Some(Hit::Twisty(parent))
+    );
+}
+
+#[test]
+fn the_twisty_is_a_nerd_font_caret() {
+    // The geometric triangles are East-Asian-ambiguous, which several
+    // terminals render two cells wide — and a two-cell glyph in a one-cell
+    // column pushes the whole row out of line.
+    assert_eq!(OPEN, "\u{f0d7}");
+    assert_eq!(SHUT, "\u{f0da}");
+}
+
+/// The last column inside the frame, where a pane's state is drawn.
+fn state_cell(buf: &Buffer, y: u16) -> (String, Color) {
+    let cell = buf
+        .cell((buf.area.width - 2, y))
+        .expect("the row has a last column");
+    (cell.symbol().to_string(), cell.fg)
+}
+
+#[test]
+fn a_panes_state_is_one_glyph_at_the_end_of_its_row() {
+    let (mut state, alpha, _) = state();
+    let pane = spawn(&mut state, alpha, "claude");
+    state
+        .set_pane_status(pane, PaneStatus::Running)
+        .expect("pane exists");
+
+    let buf = render(&state, WIDTH, 6);
+
+    assert_eq!(
+        state_cell(&buf, TOP + 1),
+        (RUNNING.to_string(), Color::Green)
+    );
+}
+
+#[test]
+fn every_state_has_a_glyph_of_its_own() {
+    // The dot said only "something is happening" and the outcome column said
+    // the rest. One glyph per state is one place to look.
+    let glyphs = [STARTING, RUNNING, IDLE, DONE, FAILED, CLOSED];
+
+    for (i, glyph) in glyphs.iter().enumerate() {
+        for other in &glyphs[i + 1..] {
+            assert_ne!(glyph, other, "two states share a glyph");
+        }
+    }
+}
+
+#[test]
+fn a_finished_pane_says_how_it_finished() {
+    let (mut state, alpha, _) = state();
+    let clean = spawn(&mut state, alpha, "claude");
+    let failed = spawn(&mut state, alpha, "codex");
+    state
+        .set_pane_status(clean, PaneStatus::Exited(0))
+        .expect("pane exists");
+    state
+        .set_pane_status(failed, PaneStatus::Exited(1))
+        .expect("pane exists");
+
+    let buf = render(&state, WIDTH, 6);
+
+    assert_eq!(state_cell(&buf, TOP + 1).0, DONE);
+    assert_eq!(state_cell(&buf, TOP + 2), (FAILED.to_string(), Color::Red));
+}
+
+#[test]
+fn a_tombstone_says_it_is_closed() {
+    let (mut state, alpha, _) = state();
+    let parent = spawn(&mut state, alpha, "claude");
+    let mut child = Pane::new(alpha, HarnessId::new("claude"));
+    child.parent = Some(parent);
+    child.durable = true;
+    state.adopt_pane(child).expect("the project exists");
+    state.close_pane(parent).expect("the pane exists");
+
+    let buf = render(&state, WIDTH, 6);
+
+    assert_eq!(
+        state_cell(&buf, TOP + 1),
+        (CLOSED.to_string(), Color::DarkGray)
+    );
+}
+
+#[test]
+fn no_row_carries_a_status_dot() {
+    // The state glyph carries the whole story now; a dot beside it was the
+    // same fact twice.
+    let (mut state, alpha, _) = state();
+    spawn(&mut state, alpha, "claude");
+
+    let text = all_text(&render(&state, WIDTH, 6));
+
+    assert!(!text.contains('●'), "no dots: {text}");
+}
+
+/// A registry holding one harness, with `icon` as its mark.
+fn registry(id: &str, icon: &str) -> dispatch_config::HarnessRegistry {
+    let def = dispatch_config::HarnessDef {
+        id: id.to_string(),
+        display_name: id.to_string(),
+        icon: Some(icon.to_string()),
+        ..dispatch_config::HarnessDef::default()
+    };
+
+    [def].into_iter().collect()
+}
+
+#[test]
+fn a_pane_is_marked_with_the_icon_of_its_harness() {
+    let (mut state, alpha, _) = state();
+    spawn(&mut state, alpha, "claude");
+
+    let harnesses = registry("claude", "C");
+    let area = Rect::new(0, 0, WIDTH, 6);
+    let mut buf = Buffer::empty(area);
+    Sidebar::new(&state)
+        .with_harnesses(&harnesses)
+        .render(area, &mut buf);
+
+    // Two columns in from the row's own edge: past its twisty and its focus
+    // marker.
+    assert_eq!(
+        buf.cell((LEFT + 2 + 2, TOP + 1))
+            .expect("cell exists")
+            .symbol(),
+        "C"
+    );
+}
+
+#[test]
+fn a_pane_whose_harness_is_unregistered_is_marked_generically() {
+    // A pane adopted from a daemon can name a harness this client has no file
+    // for, and a blank column there would read as a broken row.
+    let (mut state, alpha, _) = state();
+    spawn(&mut state, alpha, "something-else");
+
+    let harnesses = registry("claude", "C");
+    let area = Rect::new(0, 0, WIDTH, 6);
+    let mut buf = Buffer::empty(area);
+    Sidebar::new(&state)
+        .with_harnesses(&harnesses)
+        .render(area, &mut buf);
+
+    assert_eq!(
+        buf.cell((LEFT + 2 + 2, TOP + 1))
+            .expect("cell exists")
+            .symbol(),
+        dispatch_config::harness::DEFAULT_ICON
+    );
+}
+
+#[test]
+fn a_project_is_marked_by_what_kind_of_directory_it_is() {
+    let mut state = AppState::new();
+    state.add_project(Project::new("/tmp/plain", ProjectSource::LocalDir));
+    state.add_project(Project::new(
+        "/tmp/repo",
+        ProjectSource::GitRepo { remote: None },
+    ));
+
+    let buf = render(&state, WIDTH, 6);
+
+    assert_eq!(
+        buf.cell((LEFT + 1, TOP)).expect("cell exists").symbol(),
+        DIRECTORY
+    );
+    assert_eq!(
+        buf.cell((LEFT + 1, TOP + 1)).expect("cell exists").symbol(),
+        REPOSITORY
     );
 }

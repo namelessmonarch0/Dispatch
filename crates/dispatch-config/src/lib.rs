@@ -63,6 +63,18 @@ pub struct HarnessRegistry {
     harnesses: BTreeMap<String, HarnessDef>,
 }
 
+impl FromIterator<HarnessDef> for HarnessRegistry {
+    /// Collects definitions held in memory rather than read from a directory.
+    ///
+    /// A later id wins, as it does when two files declare one: the registry is
+    /// keyed by id and cannot hold both.
+    fn from_iter<I: IntoIterator<Item = HarnessDef>>(defs: I) -> Self {
+        Self {
+            harnesses: defs.into_iter().map(|def| (def.id.clone(), def)).collect(),
+        }
+    }
+}
+
 impl HarnessRegistry {
     /// Loads every `*.toml` in `dir`.
     ///

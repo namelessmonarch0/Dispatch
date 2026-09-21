@@ -4,7 +4,9 @@
 //! every project is reserved for the federation slice, which lights it green
 //! or red per device; in Slice 1 every project is local and the dot is dim.
 
-use dispatch_core::{AppState, Pane, PaneId, PaneStatus, ProjectId};
+use dispatch_config::HarnessRegistry;
+use dispatch_config::harness::DEFAULT_ICON;
+use dispatch_core::{AppState, Pane, PaneId, PaneStatus, ProjectId, ProjectSource};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -20,17 +22,55 @@ pub const WIDTH: u16 = 32;
 /// The title on the frame.
 const TITLE: &str = " Projects ";
 
-/// Marker drawn in the reserved status column.
-const DOT: &str = "●";
+/// What a pane is doing, one glyph per state, drawn in the row's last column.
+///
+/// A dot beside an outcome column said the same thing twice: the dot claimed
+/// something was happening and the glyph beside it said how it had ended.
+const STARTING: &str = "\u{f252}";
+
+/// Running.
+const RUNNING: &str = "\u{f04b}";
+
+/// Waiting on its user.
+const IDLE: &str = "\u{f04c}";
+
+/// Exited cleanly.
+const DONE: &str = "\u{f00c}";
+
+/// Exited with a failure.
+const FAILED: &str = "\u{f00d}";
+
+/// Closed, and still listed only because something under it is not.
+const CLOSED: &str = "\u{f05e}";
 
 /// The twisty of a node whose children are drawn.
-const OPEN: &str = "▾";
+///
+/// Nerd Font carets rather than the geometric triangles: those are
+/// East-Asian-ambiguous, and a terminal that renders one two cells wide pushes
+/// the rest of the row out of line with every other row.
+const OPEN: &str = "\u{f0d7}";
 
 /// The twisty of a node whose children are hidden.
-const SHUT: &str = "▸";
+const SHUT: &str = "\u{f0da}";
 
 /// Drawn where a node has no children to hide.
 const LEAF: &str = " ";
+
+/// The mark on a project kept in a git repository.
+const REPOSITORY: &str = "\u{e725}";
+
+/// The mark on a project that is a plain directory.
+const DIRECTORY: &str = "\u{f07b}";
+
+/// How far a project's name sits from the start of its row: past its twisty,
+/// the icon saying what kind of directory it is, and a space.
+const NAME: u16 = 3;
+
+/// How far a pane's title sits from the start of its row.
+///
+/// One column more than a project's name: a pane spends the extra on the focus
+/// marker between its twisty and its icon.
+const PANE_TITLE: u16 = NAME + 1;
 
 /// Marks the focused pane's row.
 ///
@@ -56,13 +96,42 @@ fn inner(area: Rect) -> Rect {
 #[derive(Debug, Clone, Copy)]
 pub struct Sidebar<'a> {
     state: &'a AppState,
+    harnesses: Option<&'a HarnessRegistry>,
 }
 
 impl<'a> Sidebar<'a> {
     /// Creates a sidebar for `state`.
     #[must_use]
     pub fn new(state: &'a AppState) -> Self {
-        Self { state }
+        Self {
+            state,
+            harnesses: None,
+        }
+    }
+
+    /// Marks each pane with the icon of the harness running in it.
+    ///
+    /// Optional, because the registry is the client's: a sidebar drawn without
+    /// one marks every pane generically rather than refusing to draw.
+    #[must_use]
+    pub fn with_harnesses(mut self, harnesses: &'a HarnessRegistry) -> Self {
+        self.harnesses = Some(harnesses);
+        self
+    }
+
+    /// The mark for the harness running in `pane`.
+    fn icon(&self, pane: &Pane) -> &str {
+        self.harnesses
+            .and_then(|harnesses| harnesses.get(pane.harness.as_str()))
+            .map_or(DEFAULT_ICON, dispatch_config::HarnessDef::icon)
+    }
+}
+
+/// The mark for a project, by what kind of directory it is.
+fn project_icon(source: &ProjectSource) -> &'static str {
+    match source {
+        ProjectSource::LocalDir => DIRECTORY,
+        ProjectSource::GitRepo { .. } => REPOSITORY,
     }
 }
 
@@ -112,41 +181,25 @@ fn twisty(has_children: bool, collapsed: bool) -> &'static str {
     }
 }
 
-/// The colour a pane's status is drawn in.
-fn status_style(status: PaneStatus) -> Style {
-    match status {
-        PaneStatus::Starting => Style::default().fg(Color::Yellow),
-        PaneStatus::Running => Style::default().fg(Color::Green),
-        PaneStatus::Idle => Style::default().fg(Color::Blue),
-        // An exited pane stays listed until it is closed, so it has to be
-        // visibly different from one that is still working.
-        PaneStatus::Exited(0) => Style::default().fg(Color::DarkGray),
-        PaneStatus::Exited(_) => Style::default().fg(Color::Red),
-    }
-}
-
-/// What a pane's outcome looks like in one glyph, drawn at the end of its row.
+/// What a pane's state looks like, and the colour it is drawn in.
 ///
-/// Only delegated work gets one. The status dot already says what a pane is
-/// doing, so a glyph beside it on an ordinary pane is the same fact twice —
-/// and a column of `⋯` against every shell was noise that made the one row
-/// actually reporting an outcome harder to find. A subagent is the case the
-/// glyph exists for: its parent is waiting on how the run turned out.
-///
-/// A tombstone keeps its glyph whatever it is: a closed row with live work
-/// beneath it has to look different from a row that is merely idle.
-fn outcome(pane: &Pane) -> Option<(&'static str, Style)> {
+/// A tombstone reports being closed whatever its process did: a closed row
+/// with live work beneath it has to look different from one that is merely
+/// finished.
+fn state_glyph(pane: &Pane) -> (&'static str, Style) {
     if pane.closed {
-        return Some(("⊘", Style::default().fg(Color::DarkGray)));
+        return (CLOSED, Style::default().fg(Color::DarkGray));
     }
 
-    pane.parent?;
-
-    Some(match pane.status {
-        PaneStatus::Exited(0) => ("✓", Style::default().fg(Color::Green)),
-        PaneStatus::Exited(_) => ("!", Style::default().fg(Color::Red)),
-        _ => ("⋯", Style::default().fg(Color::DarkGray)),
-    })
+    match pane.status {
+        PaneStatus::Starting => (STARTING, Style::default().fg(Color::Yellow)),
+        PaneStatus::Running => (RUNNING, Style::default().fg(Color::Green)),
+        PaneStatus::Idle => (IDLE, Style::default().fg(Color::Blue)),
+        // A pane that exited stays listed until it is closed, so it has to be
+        // visibly different from one that is still working.
+        PaneStatus::Exited(0) => (DONE, Style::default().fg(Color::DarkGray)),
+        PaneStatus::Exited(_) => (FAILED, Style::default().fg(Color::Red)),
+    }
 }
 
 /// One line of the sidebar.
@@ -327,27 +380,20 @@ impl Sidebar<'_> {
             write(buf, area, area.x, y, &blanks, style);
         }
 
-        // Reserved for the federation slice: green when the device hosting
-        // this project is reachable, red when it is not. Everything is local
-        // in Slice 1, so it stays dim.
-        let dot_style = Style::default().fg(Color::DarkGray);
-        let dot_style = if is_selected {
-            dot_style.add_modifier(Modifier::REVERSED)
-        } else {
-            dot_style
-        };
-        let x = write(
+        let twisty = twisty(has_panes, self.state.is_project_collapsed(id));
+        write(buf, area, area.x, y, twisty, style);
+        write(
             buf,
             area,
-            area.x,
+            area.x + 1,
             y,
-            twisty(has_panes, self.state.is_project_collapsed(id)),
+            project_icon(&project.source),
             style,
         );
-        let x = write(buf, area, x, y, DOT, dot_style);
 
-        let room = (area.x + area.width).saturating_sub(x + 1) as usize;
-        write(buf, area, x + 1, y, &truncate(&project.name, room), style);
+        let name_x = area.x + NAME;
+        let room = (area.x + area.width).saturating_sub(name_x) as usize;
+        write(buf, area, name_x, y, &truncate(&project.name, room), style);
     }
 
     /// Draws one pane row `indent` columns in from the sidebar's edge.
@@ -375,38 +421,23 @@ impl Sidebar<'_> {
             Style::default()
         };
 
-        let dot_style = if pane.closed {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            status_style(pane.status)
-        };
-
         let has_children = !self.state.children_of(pane.id).is_empty();
         let twisty = twisty(has_children, self.state.is_pane_collapsed(pane.id));
 
-        // Twisty, focus marker and status dot sit in adjacent columns, so a
-        // row's title starts one column after the dot whatever its depth —
-        // the same shape a project row has.
-        let x = write(buf, area, area.x + indent, y, twisty, style);
-        let x = write(buf, area, x, y, marker, style);
-        let x = write(buf, area, x, y, DOT, dot_style);
+        write(buf, area, area.x + indent, y, twisty, style);
+        write(buf, area, area.x + indent + 1, y, marker, style);
+        write(buf, area, area.x + indent + 2, y, self.icon(pane), style);
 
-        // The outcome glyph lives in the row's last column, so a long title is
-        // cut short before it rather than drawn under it. A row with no glyph
-        // gives that column back to the title.
-        let glyph = outcome(pane);
-        let right = (area.x + area.width).saturating_sub(2);
-        let room = if glyph.is_some() {
-            right.saturating_sub(x + 1) as usize
-        } else {
-            (area.x + area.width).saturating_sub(x + 1) as usize
-        };
+        // The state glyph owns the row's last column, so a long title is cut
+        // short before it rather than drawn under it.
+        let (glyph, glyph_style) = state_glyph(pane);
+        let state_x = (area.x + area.width).saturating_sub(1);
 
-        write(buf, area, x + 1, y, &truncate(&pane.title, room), style);
+        let title_x = area.x + indent + PANE_TITLE;
+        let room = state_x.saturating_sub(title_x + 1) as usize;
+        write(buf, area, title_x, y, &truncate(&pane.title, room), style);
 
-        if let Some((glyph, glyph_style)) = glyph {
-            write(buf, area, right + 1, y, glyph, glyph_style);
-        }
+        write(buf, area, state_x, y, glyph, glyph_style);
     }
 }
 

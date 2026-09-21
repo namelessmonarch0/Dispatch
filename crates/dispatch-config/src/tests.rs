@@ -524,3 +524,63 @@ args = []
 
     assert!(def.task_launch("anything").is_none());
 }
+
+#[test]
+fn every_built_in_ships_an_icon() {
+    // The sidebar names a pane by the agent running in it, and four rows of
+    // similar titles are told apart by the mark beside them.
+    for built_in in defaults::BUILT_INS {
+        let def: HarnessDef = toml::from_str(built_in.toml).expect("built-ins parse");
+        assert_ne!(
+            def.icon(),
+            harness::DEFAULT_ICON,
+            "{} falls back to the generic icon",
+            built_in.id
+        );
+    }
+}
+
+#[test]
+fn a_harness_with_no_icon_falls_back_to_a_generic_one() {
+    // Icons are optional: a harness registered by hand is still listed.
+    let def: HarnessDef =
+        toml::from_str("id = \"x\"\ndisplay_name = \"X\"\ncommand = \"x\"").expect("it parses");
+
+    assert_eq!(def.icon(), harness::DEFAULT_ICON);
+}
+
+#[test]
+fn an_icon_is_one_column_wide() {
+    // The sidebar reserves a single cell for it, so a two-cell glyph would
+    // push every title one column right on that row alone.
+    for built_in in defaults::BUILT_INS {
+        let def: HarnessDef = toml::from_str(built_in.toml).expect("built-ins parse");
+        assert_eq!(
+            def.icon().chars().count(),
+            1,
+            "{} has a multi-character icon",
+            built_in.id
+        );
+    }
+}
+
+#[test]
+fn a_built_in_without_an_icon_still_gets_its_own() {
+    // Dispatch never rewrites a harness file that already exists, so every
+    // installation made before icons existed has four files with no `icon`
+    // key. Falling back on the id keeps those looking right.
+    let def: HarnessDef =
+        toml::from_str("id = \"claude\"\ndisplay_name = \"Claude Code\"\ncommand = \"claude\"")
+            .expect("it parses");
+
+    let shipped: HarnessDef = toml::from_str(
+        defaults::BUILT_INS
+            .iter()
+            .find(|b| b.id == "claude")
+            .expect("claude ships")
+            .toml,
+    )
+    .expect("built-ins parse");
+
+    assert_eq!(def.icon(), shipped.icon());
+}

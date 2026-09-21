@@ -93,13 +93,38 @@ pub struct TaskLaunch {
     pub platform: BTreeMap<String, TaskArgs>,
 }
 
+/// The mark drawn beside a harness that names none of its own.
+///
+/// A terminal, because that is what every harness is until it says otherwise.
+/// Nerd Font, like the rest of Dispatch's glyphs.
+pub const DEFAULT_ICON: &str = "\u{f120}";
+
+/// The mark a harness Dispatch ships is drawn with, by id.
+fn built_in_icon(id: &str) -> Option<&'static str> {
+    match id {
+        "claude" => Some("\u{f069}"),
+        "codex" => Some("\u{f544}"),
+        "agy" => Some("\u{f135}"),
+        "opencode" => Some("\u{f121}"),
+        _ => None,
+    }
+}
+
 /// A registered coding agent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessDef {
     /// Stable identifier, matching the file stem by convention.
     pub id: String,
     /// Name shown in pickers.
     pub display_name: String,
+
+    /// A single character drawn beside this harness's panes in the sidebar.
+    ///
+    /// Optional: a harness that names none is drawn with [`DEFAULT_ICON`]. One
+    /// column is reserved for it, so a glyph wider than a cell pushes the title
+    /// of that row alone out of line.
+    #[serde(default)]
+    pub icon: Option<String>,
 
     /// Default launch configuration, used when no platform override applies.
     #[serde(flatten)]
@@ -124,6 +149,19 @@ pub struct HarnessDef {
 }
 
 impl HarnessDef {
+    /// The mark drawn beside this harness's panes.
+    ///
+    /// A file with no `icon` key falls back on its id before the generic
+    /// glyph: Dispatch never rewrites a harness file it already wrote, so
+    /// every installation made before icons existed has four of them.
+    #[must_use]
+    pub fn icon(&self) -> &str {
+        self.icon
+            .as_deref()
+            .or_else(|| built_in_icon(&self.id))
+            .unwrap_or(DEFAULT_ICON)
+    }
+
     /// The identifier as a [`HarnessId`].
     #[must_use]
     pub fn harness_id(&self) -> HarnessId {

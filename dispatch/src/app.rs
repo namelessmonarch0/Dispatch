@@ -1458,7 +1458,10 @@ impl App {
             body_height,
         );
 
-        frame.render_widget(Sidebar::new(&self.state), sidebar_area);
+        frame.render_widget(
+            Sidebar::new(&self.state).with_harnesses(&self.harnesses),
+            sidebar_area,
+        );
         self.sidebar_area = sidebar_area;
 
         // One row above the grid, and only once there is a second tab: a row
@@ -2309,6 +2312,37 @@ mod tests {
         app.overlay = Some(Overlay::Approval { scroll: 0 });
 
         (app, request)
+    }
+
+    #[test]
+    fn the_sidebar_marks_a_pane_with_its_harnesss_icon() {
+        // The registry is the client's, so the sidebar only has icons if the
+        // client hands them over.
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            icon: Some("\u{f0e7}".to_string()),
+            ..dispatch_config::HarnessDef::default()
+        };
+        let mut app = App::new([def].into_iter().collect());
+
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        app.state
+            .spawn_pane(project, HarnessId::new("shell"))
+            .expect("the project exists");
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+
+        assert!(
+            rendered_text(&terminal).contains('\u{f0e7}'),
+            "the harness icon reaches the sidebar"
+        );
     }
 
     /// A left-button press at `(column, row)`, as the terminal reports one.

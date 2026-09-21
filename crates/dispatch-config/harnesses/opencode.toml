@@ -1,4 +1,5 @@
 id = "opencode"
+icon = ""
 display_name = "opencode"
 command = "opencode"
 args = []

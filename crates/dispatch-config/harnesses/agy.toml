@@ -1,4 +1,5 @@
 id = "agy"
+icon = ""
 display_name = "agy"
 command = "agy"
 args = []
