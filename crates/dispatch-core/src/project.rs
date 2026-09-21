@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::id::ProjectId;
+use crate::id::{DeviceId, ProjectId};
 
 /// Where a project's code lives.
 ///
@@ -26,6 +26,14 @@ pub enum ProjectSource {
 pub struct Project {
     /// Stable identifier.
     pub id: ProjectId,
+    /// Which machine this project is on.
+    ///
+    /// Skipped on the wire: the daemon sends this very type in
+    /// `ServerMessage::ProjectOpened` and knows nothing about the other
+    /// machines a client is holding, so the client stamps the device on as it
+    /// adopts the project. Default until it does.
+    #[serde(skip)]
+    pub device: DeviceId,
     /// Display name, shown in the sidebar.
     pub name: String,
     /// Absolute path to the project root.
@@ -49,6 +57,7 @@ impl Project {
 
         Self {
             id: ProjectId::new(),
+            device: DeviceId::default(),
             name,
             root,
             source,
@@ -59,6 +68,13 @@ impl Project {
     #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
+        self
+    }
+
+    /// Says which machine the project is on.
+    #[must_use]
+    pub fn with_device(mut self, device: DeviceId) -> Self {
+        self.device = device;
         self
     }
 }

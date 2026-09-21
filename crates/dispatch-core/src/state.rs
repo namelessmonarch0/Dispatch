@@ -7,7 +7,8 @@
 
 use std::collections::HashSet;
 
-use crate::id::{PaneId, ProjectId};
+use crate::device::Device;
+use crate::id::{DeviceId, PaneId, ProjectId};
 use crate::pane::{HarnessId, Pane, PaneRole, PaneStatus};
 use crate::project::Project;
 
@@ -42,6 +43,10 @@ pub struct AppState {
     collapsed_projects: HashSet<ProjectId>,
     /// Panes whose children the sidebar hides, on the same rule.
     collapsed_panes: HashSet<PaneId>,
+    /// The machines whose projects are on screen, in the order they answered.
+    devices: Vec<Device>,
+    /// Devices whose projects the sidebar hides.
+    collapsed_devices: HashSet<DeviceId>,
 }
 
 impl AppState {
@@ -108,6 +113,108 @@ impl AppState {
     #[must_use]
     pub fn projects(&self) -> &[Project] {
         &self.projects
+    }
+
+    /// Registers a machine, or updates one already known by that id.
+    pub fn add_device(&mut self, device: Device) -> DeviceId {
+        let id = device.id;
+
+        if let Some(existing) = self.devices.iter_mut().find(|d| d.id == id) {
+            *existing = device;
+            return id;
+        }
+
+        self.devices.push(device);
+        id
+    }
+
+    /// Every machine, in the order they answered.
+    #[must_use]
+    pub fn devices(&self) -> &[Device] {
+        &self.devices
+    }
+
+    /// Looks up one machine.
+    #[must_use]
+    pub fn device(&self, id: DeviceId) -> Option<&Device> {
+        self.devices.iter().find(|device| device.id == id)
+    }
+
+    /// Records whether a machine's connection is up.
+    pub fn set_device_reachable(&mut self, id: DeviceId, reachable: bool) {
+        if let Some(device) = self.devices.iter_mut().find(|device| device.id == id) {
+            device.reachable = reachable;
+        }
+    }
+
+    /// Forgets everything a machine was showing, keeping the machine itself.
+    ///
+    /// What a reconnect needs: that daemon's `Subscribe` replay describes its
+    /// fleet afresh, and a row kept from the old connection would be a pane
+    /// nothing can reach. The device stays so its row does not blink out and
+    /// back while it reattaches.
+    pub fn forget_device_projects(&mut self, id: DeviceId) {
+        let projects: Vec<ProjectId> = self
+            .projects
+            .iter()
+            .filter(|project| project.device == id)
+            .map(|project| project.id)
+            .collect();
+
+        self.panes.retain(|pane| !projects.contains(&pane.project));
+        self.projects.retain(|project| project.device != id);
+
+        for project in projects {
+            self.collapsed_projects.remove(&project);
+        }
+
+        self.repair_selection();
+    }
+
+    /// Forgets a machine, its projects and their panes.
+    ///
+    /// Not refused while panes are running, unlike [`Self::remove_project`]:
+    /// the machine has left the fleet, so there is no daemon left to reach
+    /// them through and nothing to refuse on their behalf.
+    pub fn remove_device(&mut self, id: DeviceId) {
+        self.forget_device_projects(id);
+        self.devices.retain(|device| device.id != id);
+        self.collapsed_devices.remove(&id);
+    }
+
+    /// Points the selection and the focus at something that still exists.
+    ///
+    /// Shared by every removal: a selection naming a project that has gone is
+    /// a sidebar with nothing highlighted and a grid drawing nobody's panes.
+    fn repair_selection(&mut self) {
+        if self
+            .selected_project
+            .is_some_and(|selected| !self.projects.iter().any(|p| p.id == selected))
+        {
+            self.selected_project = self.projects.first().map(|p| p.id);
+            self.focused_pane = None;
+            self.zoomed_pane = None;
+        }
+
+        if self
+            .focused_pane
+            .is_some_and(|focused| self.pane(focused).is_none())
+        {
+            self.focused_pane = None;
+        }
+    }
+
+    /// Whether the sidebar hides `device`'s projects.
+    #[must_use]
+    pub fn is_device_collapsed(&self, device: DeviceId) -> bool {
+        self.collapsed_devices.contains(&device)
+    }
+
+    /// Hides `device`'s projects, or shows them again.
+    pub fn toggle_device_collapsed(&mut self, device: DeviceId) {
+        if !self.collapsed_devices.remove(&device) {
+            self.collapsed_devices.insert(device);
+        }
     }
 
     /// The project whose panes are on screen.
@@ -577,6 +684,7 @@ mod tests {
         ));
     }
 
+    use crate::device::Device;
     use crate::project::ProjectSource;
 
     /// State with one project selected, plus that project's id.
@@ -1468,5 +1576,81 @@ mod tests {
             state.remove_project(ProjectId::new()),
             Err(StateError::NoSuchProject(_))
         ));
+    }
+
+    #[test]
+    fn a_device_is_registered_and_found_again() {
+        let mut state = AppState::new();
+        let id = state.add_device(Device::new("laptop"));
+
+        assert_eq!(state.device(id).map(|d| d.name.as_str()), Some("laptop"));
+        assert_eq!(state.devices().len(), 1);
+    }
+
+    #[test]
+    fn registering_a_device_twice_is_one_device() {
+        // A reconnect announces the same machine again, and two rows for one
+        // daemon would give its projects two places to be drawn.
+        let mut state = AppState::new();
+        let device = Device::new("laptop");
+        let id = device.id;
+
+        state.add_device(device.clone());
+        state.add_device(device);
+
+        assert_eq!(state.devices().len(), 1);
+        assert_eq!(state.device(id).map(|d| d.id), Some(id));
+    }
+
+    #[test]
+    fn a_device_that_goes_quiet_is_marked_unreachable() {
+        let mut state = AppState::new();
+        let id = state.add_device(Device::new("tower"));
+
+        state.set_device_reachable(id, false);
+
+        assert_eq!(state.device(id).map(|d| d.reachable), Some(false));
+    }
+
+    #[test]
+    fn removing_a_device_takes_its_projects_and_their_panes() {
+        // Unlike a project, this is not refused while panes are running: the
+        // machine has left the fleet, so there is nothing left to refuse on
+        // their behalf.
+        let mut state = AppState::new();
+        let device = state.add_device(Device::new("tower"));
+        let project = state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir).with_device(device));
+        let pane = state
+            .spawn_pane(project, harness("claude"))
+            .expect("the project exists");
+
+        state.remove_device(device);
+
+        assert!(state.devices().is_empty());
+        assert!(state.projects().is_empty());
+        assert!(state.pane(pane).is_none());
+    }
+
+    #[test]
+    fn a_device_is_expanded_until_it_is_collapsed() {
+        let mut state = AppState::new();
+        let id = state.add_device(Device::new("laptop"));
+
+        assert!(!state.is_device_collapsed(id));
+
+        state.toggle_device_collapsed(id);
+        assert!(state.is_device_collapsed(id));
+
+        state.toggle_device_collapsed(id);
+        assert!(!state.is_device_collapsed(id));
+    }
+
+    #[test]
+    fn a_project_names_the_device_it_is_on() {
+        let device = DeviceId::new();
+        let project = Project::new("/tmp/one", ProjectSource::LocalDir).with_device(device);
+
+        assert_eq!(project.device, device);
     }
 }

@@ -29,8 +29,14 @@ macro_rules! id_type {
         }
 
         impl Default for $name {
+            /// The nil id, not a fresh random one.
+            ///
+            /// A field that is `#[serde(skip)]` gets this value back on every
+            /// decode, so if `default()` minted a random id here, the same
+            /// message would stop equaling itself the moment it crossed the
+            /// wire. Call [`Self::new`] for an actual new identity.
             fn default() -> Self {
-                Self::new()
+                Self(Uuid::nil())
             }
         }
 
@@ -53,8 +59,9 @@ macro_rules! id_type {
 id_type! {
     /// Identifies a machine running a Dispatch daemon.
     ///
-    /// Unused in Slice 1, which is single-machine. Reserved so the federation
-    /// slice does not have to reshape the types below.
+    /// Minted by the client rather than the daemon: a daemon names itself but
+    /// knows nothing of the other machines a client is holding, so identity
+    /// across a fleet is the client's to assign.
     DeviceId
 }
 
