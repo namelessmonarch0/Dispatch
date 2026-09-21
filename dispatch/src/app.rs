@@ -30,6 +30,14 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Widget};
 
+/// How many panes are tiled at once.
+///
+/// Four is the most that stays readable in a terminal: past it every pane is
+/// too narrow for a wrapped line of code and too short for a prompt plus its
+/// answer. Panes beyond the fourth are not hidden — they go on the next tab,
+/// and all of them are always listed in the sidebar.
+const PANES_PER_TAB: usize = 4;
+
 /// The border drawn around one pane.
 ///
 /// A plain thin line, brighter on the focused pane. Rounded corners read as
@@ -249,6 +257,7 @@ pub struct App {
     ///
     /// Only drawing wants this; everything else means [`App::layout`].
     frames: Vec<(PaneId, Rect)>,
+
     /// Where the sidebar was drawn last frame.
     ///
     /// The sidebar has no keyboard focus of its own, so a click is the only
@@ -817,6 +826,8 @@ impl App {
             Action::NewPane => self.open_harness_picker(),
             Action::ProjectPicker => self.open_project_picker(),
             Action::HarnessManager => self.open_harness_manager(),
+            Action::SelectTab(index) => self.select_tab(index),
+            Action::NextTab => self.select_tab(self.current_tab() + 1),
             Action::Scrollback => self.scroll_focused(-10),
             Action::Approvals => self.open_next_approval(),
             Action::ExpandChild => self.expand_child(),
@@ -824,6 +835,25 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Shows a tab by focusing its first pane.
+    ///
+    /// Focusing is how a tab is shown at all, since the view follows the focus.
+    /// Out of range wraps to the first, so `^a 9` on a two-tab fleet lands
+    /// somewhere real rather than doing nothing.
+    fn select_tab(&mut self, index: usize) {
+        let index = if index < self.tab_count() { index } else { 0 };
+
+        if let Some(first) = self
+            .tileable()
+            .chunks(PANES_PER_TAB)
+            .nth(index)
+            .and_then(<[PaneId]>::first)
+            .copied()
+        {
+            let _ = self.state.focus(first);
+        }
     }
 
     /// Focuses a pane and, if it is a subagent, brings it into the tiled grid.
@@ -1421,6 +1451,22 @@ impl App {
         frame.render_widget(Sidebar::new(&self.state), sidebar_area);
         self.sidebar_area = sidebar_area;
 
+        // One row above the grid, and only once there is a second tab: a row
+        // saying "1" and nothing else is a row of output given away for no
+        // information.
+        let panes_area = if self.tab_count() > 1 {
+            let tabs_row = Rect::new(panes_area.x, panes_area.y, panes_area.width, 1);
+            self.draw_tabs(frame, tabs_row);
+            Rect::new(
+                panes_area.x,
+                panes_area.y + 1,
+                panes_area.width,
+                panes_area.height.saturating_sub(1),
+            )
+        } else {
+            panes_area
+        };
+
         self.frames = self.compute_frames(panes_area);
         self.layout = self
             .frames
@@ -1503,9 +1549,40 @@ impl App {
             .collect()
     }
 
+    /// How many tabs the tileable panes fill.
+    ///
+    /// Always at least one, so an empty project still has a tab to be on.
+    fn tab_count(&self) -> usize {
+        self.tileable().len().div_ceil(PANES_PER_TAB).max(1)
+    }
+
+    /// The tab on screen: the one holding the focused pane.
+    ///
+    /// Derived rather than stored, because a stored tab and the focus can
+    /// disagree — a pane spawning, exiting, or being adopted from the daemon
+    /// all move focus without going anywhere near a tab — and a view showing
+    /// one tab while typing went to another would be the worst bug here.
+    fn current_tab(&self) -> usize {
+        let tileable = self.tileable();
+
+        self.state
+            .focused_pane()
+            .and_then(|id| tileable.iter().position(|pane| *pane == id))
+            .map_or(0, |index| index / PANES_PER_TAB)
+    }
+
+    /// The panes on the tab being shown.
+    fn panes_on_tab(&self) -> Vec<PaneId> {
+        self.tileable()
+            .chunks(PANES_PER_TAB)
+            .nth(self.current_tab())
+            .map(<[PaneId]>::to_vec)
+            .unwrap_or_default()
+    }
+
     /// Which tile each visible pane gets this frame, border included.
     fn compute_frames(&self, area: Rect) -> Vec<(PaneId, Rect)> {
-        let visible = self.tileable();
+        let visible = self.panes_on_tab();
 
         if let Some(zoomed) = self.state.zoomed_pane()
             && visible.contains(&zoomed)
@@ -1561,6 +1638,40 @@ impl App {
         }
     }
 
+    /// Draws the row of tabs above the grid.
+    fn draw_tabs(&self, frame: &mut Frame<'_>, area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+
+        let current = self.current_tab();
+        let mut spans = Vec::new();
+
+        for index in 0..self.tab_count() {
+            let panes = self
+                .tileable()
+                .chunks(PANES_PER_TAB)
+                .nth(index)
+                .map_or(0, <[PaneId]>::len);
+
+            let style = if index == current {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Gray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
+            spans.push(ratatui::text::Span::styled(
+                format!(" {} ({panes}) ", index + 1),
+                style,
+            ));
+        }
+
+        Paragraph::new(ratatui::text::Line::from(spans)).render(area, frame.buffer_mut());
+    }
+
     fn draw_status(&self, frame: &mut Frame<'_>, area: Rect) {
         if area.height == 0 {
             return;
@@ -1608,13 +1719,22 @@ impl App {
                 self.status.clone()
             } else {
                 let panes = self.state.visible_panes().len();
+                let tabs = if self.tab_count() > 1 {
+                    format!(
+                        "  tab {}/{}  ^a 1-9",
+                        self.current_tab() + 1,
+                        self.tab_count()
+                    )
+                } else {
+                    String::new()
+                };
                 // Attached is worth saying: it is the difference between
                 // closing Dispatch and killing the agents.
                 let where_ = self
                     .device()
                     .map_or_else(String::new, |device| format!("  {device}"));
                 format!(
-                    "{panes} pane(s){where_}  ^a n new  ^a x close  ^a z zoom  ^a s child  ^a c collapse  ^a q quit"
+                    "{panes} pane(s){where_}{tabs}  ^a n new  ^a x close  ^a z zoom  ^a s child  ^a c collapse  ^a q quit"
                 )
             };
 
@@ -1746,6 +1866,103 @@ mod tests {
             .find(needle)
             .unwrap_or_else(|| panic!("expected {needle:?} in {line:?}"));
         line[..byte].chars().count()
+    }
+
+    /// Announces `count` top-level panes and returns their ids in order.
+    fn spawn_several(
+        app: &mut App,
+        daemon: &Sender<ServerMessage>,
+        project: ProjectId,
+        count: usize,
+    ) -> Vec<PaneId> {
+        let ids: Vec<PaneId> = (0..count).map(|_| PaneId::new()).collect();
+
+        for id in &ids {
+            daemon
+                .send(spawned(*id, project, "shell", None, false))
+                .expect("the app is listening");
+        }
+        app.poll_daemon();
+
+        ids
+    }
+
+    #[test]
+    fn a_fifth_pane_opens_a_second_tab_rather_than_shrinking_the_other_four() {
+        // Past four, every pane is too narrow for a wrapped line of code and
+        // too short for a prompt and its answer.
+        let (mut app, project, daemon, _outbox) = attached_app();
+        let ids = spawn_several(&mut app, &daemon, project, 5);
+
+        assert_eq!(app.tab_count(), 2, "five panes need a second tab");
+        assert_eq!(
+            app.panes_on_tab().len(),
+            1,
+            "the fifth pane is alone on the tab it opened"
+        );
+        assert_eq!(
+            app.current_tab(),
+            1,
+            "and the view followed it, because spawning focused it"
+        );
+
+        app.select_tab(0);
+        assert_eq!(
+            app.panes_on_tab(),
+            ids[..4].to_vec(),
+            "the first tab holds exactly the first four"
+        );
+    }
+
+    #[test]
+    fn the_tab_shown_is_the_one_holding_the_focused_pane() {
+        // The view is derived from the focus rather than stored beside it, so
+        // that no path can move one without the other.
+        let (mut app, project, daemon, _outbox) = attached_app();
+        let ids = spawn_several(&mut app, &daemon, project, 6);
+
+        app.focus_pane(ids[0]);
+        assert_eq!(app.current_tab(), 0);
+
+        app.focus_pane(ids[5]);
+        assert_eq!(
+            app.current_tab(),
+            1,
+            "focusing across the cap moves the view"
+        );
+    }
+
+    #[test]
+    fn a_pane_that_exited_gives_its_tile_back() {
+        // Typing `/exit` in an agent should hand the floor space to the panes
+        // still working, while leaving the transcript in the sidebar.
+        let (mut app, project, daemon, _outbox) = attached_app();
+        let ids = spawn_several(&mut app, &daemon, project, 2);
+
+        assert_eq!(app.tileable().len(), 2);
+
+        daemon
+            .send(ServerMessage::PaneChanged {
+                pane: ids[0],
+                update: PaneUpdate::Status {
+                    status: PaneStatus::Exited(0),
+                },
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        assert_eq!(
+            app.tileable(),
+            vec![ids[1]],
+            "the exited pane is out of the grid"
+        );
+        assert!(
+            app.state
+                .visible_panes()
+                .iter()
+                .any(|pane| pane.id == ids[0]),
+            "but still listed, because its output is worth reading"
+        );
     }
 
     #[test]

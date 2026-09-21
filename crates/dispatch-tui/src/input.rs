@@ -60,6 +60,10 @@ pub enum Action {
     ProjectPicker,
     /// Open the harness manager.
     HarnessManager,
+    /// Show the tab holding this many panes in, counting from zero.
+    SelectTab(usize),
+    /// Move to the next tab, wrapping.
+    NextTab,
     /// Enter scrollback mode.
     Scrollback,
     /// Reopen the approval prompt for whatever delegation requests are queued.
@@ -253,6 +257,13 @@ fn command_for(event: &KeyEvent) -> Action {
         KeyCode::Char('s') => Action::ExpandChild,
         KeyCode::Char('c') => Action::CollapseChild,
         KeyCode::Char('[') => Action::Scrollback,
+        // A grid holds four panes at most, so a fifth opens a tab rather than
+        // shrinking the other four into unreadability. Digits pick one
+        // directly; Tab walks them for anyone who would rather not count.
+        KeyCode::Char(digit @ '1'..='9') => {
+            Action::SelectTab(digit.to_digit(10).unwrap_or(1) as usize - 1)
+        }
+        KeyCode::Tab => Action::NextTab,
         KeyCode::Char('q') => Action::Quit,
         // An unbound key after the prefix does nothing rather than reaching
         // the pane, so a mistyped command cannot run something in an agent.

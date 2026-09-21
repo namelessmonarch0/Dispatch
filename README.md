@@ -54,6 +54,20 @@ cargo build --workspace --target x86_64-pc-windows-gnu
 | `dispatchd` | The daemon binary. |
 | `xtask` | Build tooling — regenerates FFI bindings on version bumps. |
 
+## The grid
+
+Every pane is drawn inside a thin border carrying its title, so one agent's
+output cannot be mistaken for the next one's or for the sidebar.
+
+At most four panes are tiled at once. A fifth does not shrink the other four —
+it opens a second tab, and `^a 1` through `^a 9` move between them (`^a Tab`
+walks them in order). The sidebar always lists every pane, whichever tab it is
+on, and the status row says which tab you are looking at.
+
+A pane whose process exits gives its tile back straight away and the remaining
+panes spread into the space. It stays in the sidebar, where selecting it shows
+what it printed — `^a x` is what removes it for good.
+
 ## Running the daemon
 
 Dispatch works on its own, with the agents as its children. Started that way,
