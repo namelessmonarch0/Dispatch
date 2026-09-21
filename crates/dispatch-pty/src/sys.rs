@@ -35,7 +35,28 @@ pub mod data {
     pub const CURSOR_X: i32 = 3;
     /// Cursor row within the active area, zero-indexed. Output type `uint16_t *`.
     pub const CURSOR_Y: i32 = 4;
+    /// A mode's current value. Output type `GhosttyTerminalModeConfig *`, with
+    /// its `mode` field set before the call.
+    pub const MODE: i32 = 37;
 }
+
+/// `GhosttyTerminalModeConfig` from `terminal.h`, whose layout is frozen.
+///
+/// `mode` is set by the caller and `value` filled in by the getter.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ModeConfig {
+    /// The mode to query, as `ghostty_mode_new` encodes it.
+    pub mode: u16,
+    /// The mode's current value.
+    pub value: bool,
+}
+
+/// `GHOSTTY_MODE_BRACKETED_PASTE`, which is `ghostty_mode_new(2004, false)`.
+///
+/// The encoding is `(value & 0x7fff) | (ansi << 15)`, and 2004 is a DEC private
+/// mode, so the high bit stays clear and the constant is the number itself.
+pub const MODE_BRACKETED_PASTE: u16 = 2004;
 
 /// `GhosttyFormatterFormat::GHOSTTY_FORMATTER_FORMAT_PLAIN`
 pub const FORMAT_PLAIN: i32 = 0;
@@ -156,6 +177,19 @@ unsafe extern "C" {
     ///
     /// `out` must point at storage of the type the selector documents.
     pub fn ghostty_terminal_get(terminal: Terminal, data: i32, out: *mut c_void) -> GhosttyResult;
+
+    /// `ghostty_paste_encode(char*, size_t, bool, char*, size_t, size_t*)`
+    ///
+    /// Rewrites `data` in place and writes the encoded form into `buf`,
+    /// reporting the size it needs when the buffer is too small.
+    pub fn ghostty_paste_encode(
+        data: *mut u8,
+        data_len: usize,
+        bracketed: bool,
+        buf: *mut u8,
+        buf_len: usize,
+        out_written: *mut usize,
+    ) -> GhosttyResult;
 
     /// `ghostty_formatter_terminal_new(const GhosttyAllocator*, GhosttyFormatter*, GhosttyTerminal, GhosttyFormatterTerminalOptions)`
     ///

@@ -226,3 +226,36 @@ fn a_cursor_outside_the_area_is_not_reported() {
         None
     );
 }
+
+#[test]
+fn a_pane_blanks_the_part_of_its_rectangle_its_screen_does_not_cover() {
+    // The grid changes shape before the emulators hear about it, and with a
+    // daemon in between they hear about it later still. Whatever the last frame
+    // drew in this rectangle is another pane's output, and leaving it there is
+    // how a tiled screen turns to soup.
+    let small = screen(b"new", Size::new(3, 1));
+    let area = Rect::new(0, 0, 10, 4);
+
+    let mut buf = Buffer::empty(area);
+    for y in 0..area.height {
+        for x in 0..area.width {
+            buf[(x, y)].set_symbol("X");
+        }
+    }
+
+    PaneWidget::new(&small).render(area, &mut buf);
+
+    assert_eq!(row_text(&buf, 0), "new", "the screen is painted");
+    for y in 1..area.height {
+        assert_eq!(
+            row_text(&buf, y),
+            "",
+            "row {y} is outside the screen and must be blank"
+        );
+    }
+    assert_eq!(
+        buf[(5, 0)].symbol(),
+        " ",
+        "the rest of the screen's own row must be blank too"
+    );
+}

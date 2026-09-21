@@ -85,6 +85,24 @@ impl Widget for PaneWidget<'_> {
         let rows = usize::from(area.height.min(self.screen.size.rows));
         let cols = usize::from(area.width.min(self.screen.size.cols));
 
+        // Everything the screen does not cover is blanked first. A pane whose
+        // emulator is smaller than its rectangle -- which is every pane for at
+        // least a frame after the grid changes shape, and longer when a daemon
+        // is between the two -- would otherwise leave whatever was drawn there
+        // before on the screen. That is not a stale pixel here and there: it is
+        // another pane's output sitting inside this one's borders.
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if usize::from(y) < rows && usize::from(x) < cols {
+                    continue;
+                }
+
+                if let Some(cell) = buf.cell_mut((area.x + x, area.y + y)) {
+                    cell.reset();
+                }
+            }
+        }
+
         for y in 0..rows {
             let Some(row) = self.screen.rows.get(y) else {
                 break;

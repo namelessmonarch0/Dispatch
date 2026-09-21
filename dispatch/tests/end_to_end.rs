@@ -387,6 +387,17 @@ fn log_tail(path: &std::path::Path) -> String {
     }
 }
 
+/// Cells a pane's border takes off each axis.
+///
+/// Every pane is drawn inside a thin frame, so the terminal it runs is two
+/// columns narrower and two rows shorter than the tile it was given.
+const BORDER: u16 = 2;
+
+/// What `stty size` should report for a tile of `cols` by `rows`.
+fn reported_size(cols: u16, rows: u16) -> String {
+    format!("{} {}", rows - BORDER, cols - BORDER)
+}
+
 /// How many pane rows the sidebar shows.
 ///
 /// Counted by a row's indent, not by its label. A pane is named by whatever its
@@ -480,8 +491,8 @@ fn a_pane_is_told_the_size_of_the_rectangle_it_was_given() {
     app.send(b"stty size\r");
 
     // One pane fills the width left by the sidebar and the height left by the
-    // status row.
-    let expected = format!("{} {}", 30 - 1, 100 - dispatch_tui::sidebar::WIDTH);
+    // status row, less its own border.
+    let expected = reported_size(100 - dispatch_tui::sidebar::WIDTH, 30 - 1);
     assert!(
         app.wait_for(|lines| contains(lines, &expected)),
         "the child should report {expected}"
@@ -502,7 +513,7 @@ fn a_second_pane_halves_the_width_of_the_first() {
     app.send(b"stty size\r");
 
     let full = 100 - dispatch_tui::sidebar::WIDTH;
-    let expected = format!("{} {}", 30 - 1, full / 2);
+    let expected = reported_size(full / 2, 30 - 1);
     assert!(
         app.wait_for(|lines| contains(lines, &expected)),
         "with two panes the child should report {expected}"
@@ -522,7 +533,7 @@ fn zoom_gives_a_pane_the_whole_grid_and_gives_it_back() {
 
     app.send(b"\x01z");
     app.send(b"stty size\r");
-    let zoomed = format!("{} {}", 30 - 1, full);
+    let zoomed = reported_size(full, 30 - 1);
     assert!(
         app.wait_for(|lines| contains(lines, &zoomed)),
         "a zoomed pane should fill the grid and report {zoomed}"
@@ -530,7 +541,7 @@ fn zoom_gives_a_pane_the_whole_grid_and_gives_it_back() {
 
     app.send(b"\x01z");
     app.send(b"stty size\r");
-    let restored = format!("{} {}", 30 - 1, full / 2);
+    let restored = reported_size(full / 2, 30 - 1);
     assert!(
         app.wait_for(|lines| contains(lines, &restored)),
         "unzooming should restore the grid and report {restored}"

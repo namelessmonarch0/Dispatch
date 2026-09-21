@@ -167,6 +167,36 @@ impl VtTerminal {
         })
     }
 
+    /// Whether the child has turned bracketed paste on.
+    ///
+    /// Pasted text may only be wrapped in `\x1b[200~`/`\x1b[201~` when this is
+    /// true. A child that never asked for the mode has no idea what those bytes
+    /// mean and runs them as input: `sh` reads the wrapper as the start of a
+    /// command and answers `00~…: command not found`.
+    ///
+    /// A failed query reads as off, which is the safe way round — the wrapper is
+    /// an optimisation for children that understand it, and text arriving
+    /// unwrapped is merely typing.
+    #[must_use]
+    pub fn bracketed_paste(&self) -> bool {
+        let mut config = sys::ModeConfig {
+            mode: sys::MODE_BRACKETED_PASTE,
+            value: false,
+        };
+
+        // SAFETY: the terminal is live, and `config` is the type the MODE
+        // selector documents, with its `mode` field set as the header requires.
+        let result = unsafe {
+            sys::ghostty_terminal_get(
+                self.handle,
+                sys::data::MODE,
+                std::ptr::from_mut(&mut config).cast(),
+            )
+        };
+
+        result == sys::SUCCESS && config.value
+    }
+
     /// Moves the viewport over the scrollback.
     ///
     /// Scrolling is a property of the viewport, not of the screen contents, so
@@ -266,6 +296,66 @@ impl Drop for VtTerminal {
     }
 }
 
+/// Encodes pasted text for writing to a child.
+///
+/// Wraps it in bracketed paste markers when `bracketed`, turns newlines into
+/// carriage returns when not — a child that cannot be told "this is a paste"
+/// must at least be sent what a keyboard would send — and replaces the control
+/// bytes that could otherwise end the paste and inject a command.
+///
+/// This is the vendored terminal library's own encoder rather than our reading
+/// of the rules. Dispatch wrapped every paste by hand once, for children that
+/// had not asked for the mode, and they ran the wrapper as a command.
+#[must_use]
+pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    // The encoder rewrites its input, so it gets a copy rather than the
+    // caller's string.
+    let mut data = text.as_bytes().to_vec();
+
+    // Enough for the markers and any expansion; a short paste is one call.
+    let mut buf = vec![0u8; data.len() + 16];
+    let mut written = 0usize;
+
+    // SAFETY: both pointers address their own buffers for the lengths given,
+    // and `written` is a live `usize`.
+    let mut result = unsafe {
+        sys::ghostty_paste_encode(
+            data.as_mut_ptr(),
+            data.len(),
+            bracketed,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &raw mut written,
+        )
+    };
+
+    if result == sys::OUT_OF_SPACE {
+        // `written` now holds the size it wants, so the retry cannot fail for
+        // the same reason.
+        buf = vec![0u8; written];
+        let mut data = text.as_bytes().to_vec();
+
+        // SAFETY: as above, with a buffer the encoder has asked for by size.
+        result = unsafe {
+            sys::ghostty_paste_encode(
+                data.as_mut_ptr(),
+                data.len(),
+                bracketed,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &raw mut written,
+            )
+        };
+    }
+
+    if result != sys::SUCCESS {
+        return Vec::new();
+    }
+
+    buf.truncate(written);
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +373,44 @@ mod tests {
             lines.pop();
         }
         lines
+    }
+
+    #[test]
+    fn an_unbracketed_paste_carries_no_markers() {
+        // The bug this exists to stop: `sh` never enables mode 2004, so a
+        // wrapper reaches it as text and it runs `00~` as a command.
+        let encoded = encode_paste("one\ntwo", false);
+        let text = String::from_utf8_lossy(&encoded);
+
+        assert!(!text.contains("200~"), "got {text:?}");
+        assert!(!text.contains("201~"), "got {text:?}");
+        assert!(text.contains("one"), "got {text:?}");
+        assert!(text.contains("two"), "got {text:?}");
+    }
+
+    #[test]
+    fn a_bracketed_paste_is_wrapped_for_a_child_that_asked() {
+        // An agent that turned the mode on wants the whole paste in one piece
+        // rather than a line at a time.
+        let encoded = encode_paste("one\ntwo", true);
+        let text = String::from_utf8_lossy(&encoded);
+
+        assert!(text.starts_with("\x1b[200~"), "got {text:?}");
+        assert!(text.ends_with("\x1b[201~"), "got {text:?}");
+    }
+
+    #[test]
+    fn bracketed_paste_is_off_until_the_child_asks_for_it() {
+        // Wrapping a paste for a child that never asked is how `sh` ends up
+        // running `00~` as a command.
+        let mut terminal = terminal();
+        assert!(!terminal.bracketed_paste(), "nothing has enabled it");
+
+        terminal.feed(b"\x1b[?2004h");
+        assert!(terminal.bracketed_paste(), "the child enabled mode 2004");
+
+        terminal.feed(b"\x1b[?2004l");
+        assert!(!terminal.bracketed_paste(), "the child turned it off again");
     }
 
     #[test]

@@ -28,7 +28,35 @@ use dispatch_tui::{Item, PaneWidget, Picker, Sidebar, sidebar};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Clear, Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Widget};
+
+/// The border drawn around one pane.
+///
+/// A plain thin line, brighter on the focused pane. Rounded corners read as
+/// softer than the square ones the sidebar and status row use, which is enough
+/// to tell a pane's edge from the frame of the interface around it.
+fn pane_block(focused: bool) -> Block<'static> {
+    let colour = if focused {
+        Color::White
+    } else {
+        Color::DarkGray
+    };
+
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(colour))
+}
+
+/// What to write on a pane's border.
+///
+/// The pane's own title when it has set one, so a bordered pane says which
+/// agent it is without costing a row of output for a header.
+fn pane_title(state: &AppState, id: PaneId) -> String {
+    state
+        .pane(id)
+        .map(|pane| format!(" {} ", pane.title))
+        .unwrap_or_default()
+}
 
 /// Which picker is open, decoupled from the picker itself so a selection can
 /// be read out before the overlay is closed. `Overlay::Approval` has no
@@ -211,8 +239,16 @@ pub struct App {
     panes: HashMap<PaneId, Pane>,
     harnesses: HarnessRegistry,
     router: InputRouter,
-    /// Where each pane was drawn last frame, for resolving the pointer.
+    /// Each pane's content rectangle last frame — inside its border.
+    ///
+    /// This is what a pointer is resolved against and what a pane is resized
+    /// to, so it has to be the area the emulator actually owns rather than the
+    /// tile drawn around it.
     layout: Vec<(PaneId, Rect)>,
+    /// Each pane's tile last frame, border included.
+    ///
+    /// Only drawing wants this; everything else means [`App::layout`].
+    frames: Vec<(PaneId, Rect)>,
     /// Where the sidebar was drawn last frame.
     ///
     /// The sidebar has no keyboard focus of its own, so a click is the only
@@ -275,6 +311,7 @@ impl App {
             panes: HashMap::new(),
             harnesses,
             router: InputRouter::new(),
+            frames: Vec::new(),
             layout: Vec::new(),
             sidebar_area: Rect::default(),
             expanded: HashSet::new(),
@@ -1297,12 +1334,14 @@ impl App {
             return;
         };
 
-        // Wrap in bracketed paste markers so the child knows this is pasted
-        // text rather than typing, and does not act on each line as it lands.
-        let mut bytes = Vec::with_capacity(text.len() + 12);
-        bytes.extend_from_slice(b"\x1b[200~");
-        bytes.extend_from_slice(text.as_bytes());
-        bytes.extend_from_slice(b"\x1b[201~");
+        // Wrapped in bracketed paste markers only for a child that turned the
+        // mode on. Dispatch used to wrap unconditionally, so a shell -- which
+        // never asks for it -- received `\x1b[200~` as input and answered
+        // `00~…: command not found`, with the pasted command mangled along with
+        // it. The encoder also takes care of what an unwrapped paste needs
+        // instead: newlines become carriage returns, as a keyboard would send.
+        let bracketed = pane.backend.terminal().bracketed_paste();
+        let bytes = dispatch_pty::encode_paste(text, bracketed);
 
         if let Err(error) = pane.backend.write(&bytes) {
             tracing::warn!(%error, "failed to paste into a pane");
@@ -1382,7 +1421,12 @@ impl App {
         frame.render_widget(Sidebar::new(&self.state), sidebar_area);
         self.sidebar_area = sidebar_area;
 
-        self.layout = self.compute_layout(panes_area);
+        self.frames = self.compute_frames(panes_area);
+        self.layout = self
+            .frames
+            .iter()
+            .map(|(id, frame)| (*id, Self::interior(*frame)))
+            .collect();
         self.draw_panes(frame);
         self.draw_status(frame, area);
 
@@ -1445,17 +1489,22 @@ impl App {
     /// Children are left out unless the user has opened them: ten subagents
     /// would otherwise shrink every pane to nothing. Which rows are open is
     /// this client's business, so the daemon is never told.
+    ///
+    /// A pane whose process has exited leaves the grid at once and the others
+    /// spread into its place. It stays in the sidebar, where selecting it shows
+    /// what it printed — the output is worth keeping, the floor space is not.
     fn tileable(&self) -> Vec<PaneId> {
         self.state
             .visible_panes()
             .iter()
+            .filter(|pane| pane.status.is_live())
             .filter(|pane| pane.parent.is_none() || self.expanded.contains(&pane.id))
             .map(|pane| pane.id)
             .collect()
     }
 
-    /// Where each visible pane goes this frame.
-    fn compute_layout(&self, area: Rect) -> Vec<(PaneId, Rect)> {
+    /// Which tile each visible pane gets this frame, border included.
+    fn compute_frames(&self, area: Rect) -> Vec<(PaneId, Rect)> {
         let visible = self.tileable();
 
         if let Some(zoomed) = self.state.zoomed_pane()
@@ -1471,22 +1520,38 @@ impl App {
             .collect()
     }
 
+    /// The area inside a tile's border, which is what the pane itself owns.
+    fn interior(frame: Rect) -> Rect {
+        pane_block(false).inner(frame)
+    }
+
     fn draw_panes(&mut self, frame: &mut Frame<'_>) {
         let focused = self.state.focused_pane();
         let mut cursor = None;
 
-        for (id, rect) in &self.layout {
+        for ((id, outer), (_, inner)) in self.frames.iter().zip(&self.layout) {
             let Some(pane) = self.panes.get(id) else {
                 continue;
             };
 
-            let widget = PaneWidget::new(&pane.screen).focused(focused == Some(*id));
+            let is_focused = focused == Some(*id);
 
-            if let Some(position) = widget.cursor_position(*rect) {
+            // Drawn before the contents, and over the whole tile, so the border
+            // is what separates one agent's output from the next and from the
+            // sidebar. Without it two panes of similarly-coloured text read as
+            // one pane with a very confusing wrap.
+            frame.render_widget(
+                pane_block(is_focused).title(pane_title(&self.state, *id)),
+                *outer,
+            );
+
+            let widget = PaneWidget::new(&pane.screen).focused(is_focused);
+
+            if let Some(position) = widget.cursor_position(*inner) {
                 cursor = Some(position);
             }
 
-            frame.render_widget(widget, *rect);
+            frame.render_widget(widget, *inner);
         }
 
         // Placing the real cursor is what makes typing feel native rather
@@ -1667,6 +1732,15 @@ mod tests {
     /// Counted in characters rather than bytes: the status dot and the focus
     /// marker are three bytes each, so a byte offset would make a focused row
     /// look indented further than an unfocused one at the same depth.
+    /// Just the sidebar's columns of one rendered row.
+    ///
+    /// A pane's border carries its title, so a whole row can name a harness
+    /// twice: once in the sidebar and once around the pane running it. A test
+    /// about the sidebar has to say so.
+    fn sidebar_column(line: &str) -> String {
+        line.chars().take(sidebar::WIDTH as usize).collect()
+    }
+
     fn column_of(line: &str, needle: &str) -> usize {
         let byte = line
             .find(needle)
@@ -1713,11 +1787,12 @@ mod tests {
         let drawn = rendered_text(&terminal);
         let lines: Vec<&str> = drawn.lines().collect();
 
-        let parent_row = lines
+        let sidebar: Vec<String> = lines.iter().map(|line| sidebar_column(line)).collect();
+        let parent_row = sidebar
             .iter()
             .position(|line| line.contains("claude"))
             .expect("the parent has a row");
-        let child_row = lines
+        let child_row = sidebar
             .iter()
             .position(|line| line.contains("codex"))
             .expect("the child has a row");
@@ -1727,8 +1802,8 @@ mod tests {
             "the child belongs under its parent:\n{drawn}"
         );
         assert_eq!(
-            column_of(lines[child_row], "codex"),
-            column_of(lines[parent_row], "claude") + 2,
+            column_of(&sidebar[child_row], "codex"),
+            column_of(&sidebar[parent_row], "claude") + 2,
             "and indented one level in from it:\n{drawn}"
         );
 
