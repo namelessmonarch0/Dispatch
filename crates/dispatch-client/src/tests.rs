@@ -46,6 +46,44 @@ impl Endpoint {
     }
 }
 
+/// Points the environment at a directory for as long as this is held,
+/// without removing it on drop.
+///
+/// `Endpoint` deletes its directory when it goes, which is right for a guard
+/// that owns a socket for the whole test but wrong here: this is used only to
+/// get a daemon bound *somewhere other than* `Endpoint`'s directory, and that
+/// daemon keeps serving — and the socket file keeps needing to exist — after
+/// this guard has restored the variable and gone out of scope.
+struct Elsewhere {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl Elsewhere {
+    fn new(dir: &Path) -> Self {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("temp dir is writable");
+
+        let previous = std::env::var_os(dispatch_os::paths::CONFIG_DIR_ENV);
+
+        // SAFETY: as on `Endpoint`.
+        unsafe { std::env::set_var(dispatch_os::paths::CONFIG_DIR_ENV, dir) };
+
+        Self { previous }
+    }
+}
+
+impl Drop for Elsewhere {
+    fn drop(&mut self) {
+        // SAFETY: as on `Endpoint`.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(dispatch_os::paths::CONFIG_DIR_ENV, value),
+                None => std::env::remove_var(dispatch_os::paths::CONFIG_DIR_ENV),
+            }
+        }
+    }
+}
+
 impl Drop for Endpoint {
     fn drop(&mut self) {
         // SAFETY: as above.
@@ -238,6 +276,26 @@ fn serve_one(
         stopped,
         endpoint,
     }
+}
+
+/// Stands a fake daemon up at `dir`'s endpoint, leaving `DISPATCH_CONFIG_DIR`
+/// pointed elsewhere once it returns.
+///
+/// `serve_one` binds wherever the environment currently points, because that
+/// is what `Listener::bind` and `dispatch_os::ipc::endpoint` both read. Proving
+/// that `attach_at` honours the endpoint it is *given*, rather than quietly
+/// falling back to the environment, means the daemon it reaches must be
+/// listening somewhere that variable does not point at when the client
+/// attaches — so this points it at `dir` only for the moment of binding, then
+/// restores it.
+fn serve_one_at(
+    dir: &Path,
+    answer: ServerMessage,
+    serve: impl FnOnce(&mut Writer) + Send + 'static,
+    after: After,
+) -> Server {
+    let _guard = Elsewhere::new(dir);
+    serve_one(answer, serve, after)
 }
 
 /// Waits for `condition`, returning whether it held before the deadline.
@@ -604,4 +662,34 @@ fn a_daemon_that_answers_is_left_alone() {
             .any(|m| matches!(m, ClientMessage::Ping { .. })),
         "the client should have asked at least once"
     );
+}
+
+#[test]
+fn a_client_attaches_to_an_endpoint_it_is_given() {
+    // Federation dials one socket per machine, so the endpoint cannot come
+    // from this process's own configuration. Proving that means the daemon
+    // has to be reachable only through the argument: `DISPATCH_CONFIG_DIR`
+    // is left pointed at a directory with nothing listening in it, so a
+    // client that ignored `attach_at`'s endpoint and fell back to the
+    // environment, as `attach_with_as` does, would fail to connect.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _endpoint = Endpoint::new("attach-at-wrong");
+    let wrong = dispatch_os::ipc::endpoint().expect("the endpoint resolves");
+
+    let elsewhere = std::env::temp_dir().join(format!(
+        "dispatch-client-{}-attach-at-right",
+        std::process::id()
+    ));
+    let heard = serve_one_at(&elsewhere, welcome(), |_| {}, After::Answer);
+    let right = elsewhere.join("dispatchd.sock");
+    assert_ne!(wrong, right, "the daemon must not be at the wrong endpoint");
+
+    let client = Client::attach_at(Role::Interface, "test", Liveness::default(), right)
+        .expect("the daemon is listening at the endpoint given, not the environment's");
+
+    assert!(client.is_connected());
+
+    drop(client);
+    drop(heard);
+    let _ = std::fs::remove_dir_all(&elsewhere);
 }

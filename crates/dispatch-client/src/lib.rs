@@ -255,8 +255,28 @@ impl Client {
 
     /// Connects and shakes hands as the given role, with something other than
     /// the usual patience for silence.
+    ///
+    /// Resolves the endpoint from this process's own configuration and
+    /// delegates: everyone who does not need to name a daemon explicitly gets
+    /// the behaviour they always had.
     pub fn attach_with_as(role: Role, name: &str, liveness: Liveness) -> Result<Self, ClientError> {
         let endpoint = dispatch_os::ipc::endpoint()?;
+        Self::attach_at(role, name, liveness, endpoint)
+    }
+
+    /// Connects and shakes hands with the daemon listening on `endpoint`,
+    /// rather than the one this configuration would otherwise resolve to.
+    ///
+    /// Federation holds one connection per machine, so the endpoint has to be
+    /// the caller's to name: a client attaching to three daemons cannot take
+    /// all three from the one endpoint this process's own configuration
+    /// resolves to.
+    pub fn attach_at(
+        role: Role,
+        name: &str,
+        liveness: Liveness,
+        endpoint: PathBuf,
+    ) -> Result<Self, ClientError> {
         let (reader, writer, device) = connect_within(name, role, &endpoint, HANDSHAKE_TIMEOUT)?;
 
         let wire = Arc::new(Wire {
