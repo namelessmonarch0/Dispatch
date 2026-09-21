@@ -891,9 +891,28 @@ impl App {
         }
 
         for (id, code) in exited {
+            let status = PaneStatus::Exited(code);
+
+            // A pane's last output and its exit rarely arrive in the same
+            // poll: the agent prints its goodbye, that poll draws it, and the
+            // process is gone by the next one with nothing left to read. Only
+            // reporting a change when there was output left the dead pane
+            // holding its tile until some unrelated keystroke forced a frame.
+            //
+            // Asked rather than assumed, because the status is set on every
+            // poll for as long as the pane is listed: reporting a change each
+            // time would redraw the screen forever at the frame rate.
+            if self
+                .state
+                .pane(id)
+                .is_some_and(|pane| pane.status != status)
+            {
+                changed = true;
+            }
+
             // An exited pane keeps its screen and stays selectable, so its
             // final output can be read before it is closed.
-            let _ = self.state.set_pane_status(id, PaneStatus::Exited(code));
+            let _ = self.state.set_pane_status(id, status);
         }
 
         changed
@@ -2592,6 +2611,53 @@ mod tests {
             app.state.pane(pane).map(|p| p.title.as_str()),
             Some("Claude Code")
         );
+    }
+
+    #[test]
+    fn a_pane_that_exits_quietly_still_redraws_the_grid() {
+        // An agent's last output and its exit rarely land in the same poll:
+        // `/exit` prints its goodbye, that poll redraws, and the process is
+        // gone by the next one with nothing left to read. A poll that reports
+        // no change leaves the dead pane holding its tile until some unrelated
+        // keystroke forces a frame — which is what "press Enter again to close
+        // it" was.
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = PaneId::new();
+        daemon
+            .send(spawned(pane, project, "shell", None, false))
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        let Some(Backend::Remote(remote)) = app.panes.get_mut(&pane).map(|p| &mut p.backend) else {
+            panic!("the pane is a remote one");
+        };
+        remote.set_state(RunState::Exited(0));
+
+        assert!(app.poll_panes(), "the exit is worth a frame");
+        assert_eq!(
+            app.state.pane(pane).map(|p| p.status),
+            Some(PaneStatus::Exited(0))
+        );
+    }
+
+    #[test]
+    fn a_pane_that_is_still_dead_is_not_worth_another_frame() {
+        // The status is set on every poll, so reporting a change each time
+        // would redraw the whole screen forever at the frame rate.
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = PaneId::new();
+        daemon
+            .send(spawned(pane, project, "shell", None, false))
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        let Some(Backend::Remote(remote)) = app.panes.get_mut(&pane).map(|p| &mut p.backend) else {
+            panic!("the pane is a remote one");
+        };
+        remote.set_state(RunState::Exited(0));
+
+        assert!(app.poll_panes());
+        assert!(!app.poll_panes(), "nothing changed the second time");
     }
 
     /// Types one key at the app.
