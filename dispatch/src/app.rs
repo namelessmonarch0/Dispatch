@@ -801,10 +801,20 @@ impl App {
         // resolved here rather than through the router.
         if let Event::Mouse(mouse) = event
             && matches!(mouse.kind, MouseEventKind::Down(_))
-            && let Some(id) =
+            && let Some(hit) =
                 sidebar::hit_test(&self.state, self.sidebar_area, mouse.column, mouse.row)
         {
-            self.focus_pane(id);
+            match hit {
+                // A heading carries no pane, so the whole row is the
+                // project's: a click both moves the view there and folds the
+                // panes away.
+                sidebar::Hit::Project(id) => {
+                    let _ = self.state.select_project(id);
+                    self.state.toggle_project_collapsed(id);
+                }
+                sidebar::Hit::Twisty(id) => self.state.toggle_pane_collapsed(id),
+                sidebar::Hit::Pane(id) => self.focus_pane(id),
+            }
             return Ok(());
         }
 
@@ -2299,6 +2309,97 @@ mod tests {
         app.overlay = Some(Overlay::Approval { scroll: 0 });
 
         (app, request)
+    }
+
+    /// A left-button press at `(column, row)`, as the terminal reports one.
+    fn click(app: &mut App, column: u16, row: u16) {
+        let event = Event::Mouse(dispatch_tui::input::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        app.handle(&event, Size::new(100, 30))
+            .expect("a click is handled");
+    }
+
+    /// An app with two projects, a pane in the first, and a subagent under
+    /// that pane — drawn once, so `sidebar_area` is the rectangle a click is
+    /// resolved against.
+    fn app_with_a_drawn_sidebar() -> (
+        App,
+        ratatui::Terminal<ratatui::backend::TestBackend>,
+        ProjectId,
+        PaneId,
+        PaneId,
+    ) {
+        let mut app = App::new(HarnessRegistry::default());
+        let first = app
+            .state
+            .add_project(Project::new("/tmp/first", ProjectSource::LocalDir));
+        app.state
+            .add_project(Project::new("/tmp/second", ProjectSource::LocalDir));
+
+        let parent = app
+            .state
+            .spawn_pane(first, HarnessId::new("shell"))
+            .expect("the project exists");
+
+        let mut child = dispatch_core::Pane::new(first, HarnessId::new("shell"));
+        child.parent = Some(parent);
+        child.title = "subagent".into();
+        let child = app.state.adopt_pane(child).expect("the project exists");
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+
+        (app, terminal, first, parent, child)
+    }
+
+    #[test]
+    fn a_click_on_a_project_row_selects_it_and_folds_its_panes() {
+        let (mut app, _terminal, first, _parent, _child) = app_with_a_drawn_sidebar();
+
+        // The first row inside the sidebar's frame is the first project.
+        click(&mut app, 1, 1);
+
+        assert_eq!(app.state.selected_project(), Some(first));
+        assert!(app.state.is_project_collapsed(first), "and it folds");
+
+        click(&mut app, 1, 1);
+        assert!(!app.state.is_project_collapsed(first), "and unfolds again");
+    }
+
+    #[test]
+    fn a_click_on_a_panes_twisty_folds_its_children_without_focusing_it() {
+        let (mut app, _terminal, _first, parent, child) = app_with_a_drawn_sidebar();
+
+        let _ = app.state.focus(child);
+        // A pane row is indented two columns inside the frame, and its twisty
+        // is the first of them.
+        click(&mut app, 3, 2);
+
+        assert!(app.state.is_pane_collapsed(parent));
+        assert_eq!(
+            app.state.focused_pane(),
+            Some(child),
+            "folding is not focusing"
+        );
+    }
+
+    #[test]
+    fn a_click_on_the_rest_of_a_pane_row_still_focuses_it() {
+        let (mut app, _terminal, _first, parent, child) = app_with_a_drawn_sidebar();
+
+        let _ = app.state.focus(child);
+        click(&mut app, 8, 2);
+
+        assert_eq!(app.state.focused_pane(), Some(parent));
+        assert!(!app.state.is_pane_collapsed(parent), "and folds nothing");
     }
 
     /// Every cell of the last-drawn frame, as one string with a newline

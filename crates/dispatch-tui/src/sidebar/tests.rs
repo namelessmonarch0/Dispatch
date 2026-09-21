@@ -48,6 +48,18 @@ fn render_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
     (0..buf.area.height).map(|y| row_text(&buf, y)).collect()
 }
 
+/// The first row inside the frame, and the first column inside it.
+///
+/// Every row assertion is relative to these: the frame's own edge is not part
+/// of the list.
+const TOP: u16 = 1;
+const LEFT: u16 = 1;
+
+/// The column a row's status dot is drawn in.
+fn dot_column(buf: &Buffer, y: u16) -> Option<u16> {
+    (0..buf.area.width).find(|x| buf.cell((*x, y)).expect("cell exists").symbol() == DOT)
+}
+
 /// How many columns a rendered row is indented.
 ///
 /// Measured by the status dot's column rather than by counting leading
@@ -64,8 +76,8 @@ fn projects_are_listed_in_the_order_they_were_added() {
     let (state, _, _) = state();
     let buf = render(&state, WIDTH, 10);
 
-    assert!(row_text(&buf, 0).contains("alpha"));
-    assert!(row_text(&buf, 1).contains("beta"));
+    assert!(row_text(&buf, TOP).contains("alpha"));
+    assert!(row_text(&buf, TOP + 1).contains("beta"));
 }
 
 #[test]
@@ -76,10 +88,10 @@ fn panes_are_listed_under_their_project() {
 
     let buf = render(&state, WIDTH, 10);
 
-    assert!(row_text(&buf, 0).contains("alpha"));
-    assert!(row_text(&buf, 1).contains("claude"));
-    assert!(row_text(&buf, 2).contains("beta"));
-    assert!(row_text(&buf, 3).contains("codex"));
+    assert!(row_text(&buf, TOP).contains("alpha"));
+    assert!(row_text(&buf, TOP + 1).contains("claude"));
+    assert!(row_text(&buf, TOP + 2).contains("beta"));
+    assert!(row_text(&buf, TOP + 3).contains("codex"));
 }
 
 #[test]
@@ -98,9 +110,10 @@ fn the_selected_project_is_emphasised() {
     let (state, _, _) = state();
     let buf = render(&state, WIDTH, 10);
 
-    // "alpha" starts after the reserved status column and its spacer.
-    let selected = buf.cell((2, 0)).expect("cell exists");
-    let unselected = buf.cell((2, 1)).expect("cell exists");
+    // The name starts two columns after the row's status dot.
+    let name_x = |y: u16| dot_column(&buf, y).expect("the row has a dot") + 2;
+    let selected = buf.cell((name_x(TOP), TOP)).expect("cell exists");
+    let unselected = buf.cell((name_x(TOP + 1), TOP + 1)).expect("cell exists");
 
     assert!(selected.modifier.contains(Modifier::BOLD));
     assert!(!unselected.modifier.contains(Modifier::BOLD));
@@ -115,8 +128,11 @@ fn the_focused_pane_is_marked() {
     // Spawning focuses the new pane, so codex is focused.
     let buf = render(&state, WIDTH, 10);
 
-    assert!(!row_text(&buf, 1).contains('▸'), "claude is not focused");
-    assert!(row_text(&buf, 2).contains('▸'), "codex is focused");
+    assert!(
+        !row_text(&buf, TOP + 1).contains('▌'),
+        "claude is not focused"
+    );
+    assert!(row_text(&buf, TOP + 2).contains('▌'), "codex is focused");
 }
 
 #[test]
@@ -126,8 +142,11 @@ fn every_project_has_a_reserved_status_column() {
     let (state, _, _) = state();
     let buf = render(&state, WIDTH, 10);
 
-    assert_eq!(buf.cell((0, 0)).expect("cell exists").symbol(), DOT);
-    assert_eq!(buf.cell((0, 1)).expect("cell exists").symbol(), DOT);
+    assert_eq!(dot_column(&buf, TOP), dot_column(&buf, TOP + 1));
+    assert!(
+        dot_column(&buf, TOP).is_some_and(|x| x >= LEFT),
+        "the column is inside the frame"
+    );
 }
 
 #[test]
@@ -145,15 +164,10 @@ fn pane_status_is_colour_coded() {
 
     let buf = render(&state, WIDTH, 10);
 
-    // The dot sits two columns after the focus marker.
-    let find_dot = |y: u16| {
-        (0..WIDTH)
-            .find(|x| buf.cell((*x, y)).expect("cell exists").symbol() == DOT)
-            .map(|x| buf.cell((x, y)).expect("cell exists").fg)
-    };
+    let colour = |y: u16| dot_column(&buf, y).map(|x| buf.cell((x, y)).expect("cell exists").fg);
 
-    assert_eq!(find_dot(1), Some(Color::Green), "a running pane");
-    assert_eq!(find_dot(2), Some(Color::Red), "a pane that failed");
+    assert_eq!(colour(TOP + 1), Some(Color::Green), "a running pane");
+    assert_eq!(colour(TOP + 2), Some(Color::Red), "a pane that failed");
 }
 
 #[test]
@@ -165,12 +179,10 @@ fn a_pane_that_exited_cleanly_is_dimmed_rather_than_red() {
         .expect("pane exists");
 
     let buf = render(&state, WIDTH, 10);
-    let dot_x = (0..WIDTH)
-        .find(|x| buf.cell((*x, 1)).expect("cell exists").symbol() == DOT)
-        .expect("the pane has a status dot");
+    let dot_x = dot_column(&buf, TOP + 1).expect("the pane has a status dot");
 
     assert_eq!(
-        buf.cell((dot_x, 1)).expect("cell exists").fg,
+        buf.cell((dot_x, TOP + 1)).expect("cell exists").fg,
         Color::DarkGray
     );
 }
@@ -184,7 +196,7 @@ fn a_long_name_is_truncated_rather_than_overflowing() {
     );
 
     let buf = render(&state, 20, 5);
-    let line = row_text(&buf, 0);
+    let line = row_text(&buf, TOP);
 
     assert!(line.chars().count() <= 20, "line overflowed: {line:?}");
     assert!(line.contains('…'), "truncation should be visible: {line:?}");
@@ -201,15 +213,22 @@ fn rendering_stops_at_the_bottom_of_the_area() {
     let buf = render(&state, WIDTH, 3);
 
     assert_eq!(buf.area.height, 3);
-    assert!(row_text(&buf, 0).contains("p0"));
+    assert!(row_text(&buf, TOP).contains("p0"));
 }
 
 #[test]
-fn an_empty_state_paints_nothing() {
+fn an_empty_state_lists_nothing() {
+    // The frame is still drawn — it is part of the layout, not of the list.
     let state = AppState::new();
     let buf = render(&state, WIDTH, 5);
 
-    assert_eq!(all_text(&buf).trim(), "");
+    for y in TOP..4 {
+        assert_eq!(
+            row_text(&buf, y).trim_matches('│').trim(),
+            "",
+            "row {y} lists nothing"
+        );
+    }
 }
 
 #[test]
@@ -353,7 +372,10 @@ fn a_click_on_a_pane_row_finds_that_pane() {
     let pane = spawn(&mut state, alpha, "claude");
 
     let area = Rect::new(0, 0, WIDTH, 10);
-    assert_eq!(hit_test(&state, area, area.x, 1), Some(pane));
+    assert_eq!(
+        hit_test(&state, area, LEFT + 4, TOP + 1),
+        Some(Hit::Pane(pane))
+    );
 }
 
 #[test]
@@ -366,19 +388,30 @@ fn a_click_on_a_child_row_finds_the_child_rather_than_its_parent() {
 
     let area = Rect::new(0, 0, WIDTH, 10);
 
-    assert_eq!(hit_test(&state, area, area.x, 1), Some(parent));
-    assert_eq!(hit_test(&state, area, area.x, 2), Some(child));
+    assert_eq!(
+        hit_test(&state, area, LEFT + 6, TOP + 1),
+        Some(Hit::Pane(parent))
+    );
+    assert_eq!(
+        hit_test(&state, area, LEFT + 6, TOP + 2),
+        Some(Hit::Pane(child))
+    );
 }
 
 #[test]
-fn a_click_on_a_project_heading_finds_nothing() {
-    // The heading names a project, not a pane, so there is nothing there to
-    // focus.
+fn a_click_anywhere_on_a_project_heading_finds_the_project() {
+    // The heading names no pane, so the whole row is the project's control:
+    // clicking it selects the project and folds its panes away.
     let (mut state, alpha, _) = state();
     spawn(&mut state, alpha, "claude");
 
     let area = Rect::new(0, 0, WIDTH, 10);
-    assert_eq!(hit_test(&state, area, area.x, 0), None);
+
+    assert_eq!(hit_test(&state, area, LEFT, TOP), Some(Hit::Project(alpha)));
+    assert_eq!(
+        hit_test(&state, area, WIDTH - 2, TOP),
+        Some(Hit::Project(alpha))
+    );
 }
 
 #[test]
@@ -387,10 +420,14 @@ fn a_click_on_a_closed_panes_tombstone_finds_nothing() {
     // no live pane behind it to bring into the grid.
     let (mut state, alpha, _) = state();
     let pane = spawn(&mut state, alpha, "claude");
+    let mut child = Pane::new(alpha, HarnessId::new("claude"));
+    child.parent = Some(pane);
+    child.durable = true;
+    state.adopt_pane(child).expect("the project exists");
     state.close_pane(pane).expect("the pane exists");
 
     let area = Rect::new(0, 0, WIDTH, 10);
-    assert_eq!(hit_test(&state, area, area.x, 1), None);
+    assert_eq!(hit_test(&state, area, LEFT + 4, TOP + 1), None);
 }
 
 #[test]
@@ -399,6 +436,274 @@ fn a_click_outside_the_sidebars_area_finds_nothing() {
     spawn(&mut state, alpha, "claude");
 
     let area = Rect::new(0, 0, WIDTH, 10);
-    assert_eq!(hit_test(&state, area, WIDTH + 5, 1), None);
-    assert_eq!(hit_test(&state, area, area.x, 20), None);
+    assert_eq!(hit_test(&state, area, WIDTH + 5, TOP + 1), None);
+    assert_eq!(hit_test(&state, area, LEFT + 4, 20), None);
+}
+
+#[test]
+fn the_list_is_framed_and_titled() {
+    // The sidebar abuts a pane's own output, and without an edge between them
+    // a project name reads as a line the agent printed.
+    let (state, _, _) = state();
+    let buf = render(&state, WIDTH, 6);
+
+    assert_eq!(buf.cell((0, 0)).expect("cell exists").symbol(), "┌");
+    assert_eq!(buf.cell((WIDTH - 1, 0)).expect("cell exists").symbol(), "┐");
+    assert_eq!(buf.cell((0, 5)).expect("cell exists").symbol(), "└");
+    assert!(
+        row_text(&buf, 0).contains("Projects"),
+        "the frame is titled: {:?}",
+        row_text(&buf, 0)
+    );
+}
+
+#[test]
+fn rows_are_drawn_inside_the_frame() {
+    let (state, _, _) = state();
+    let buf = render(&state, WIDTH, 6);
+
+    assert!(
+        row_text(&buf, 1).contains("alpha"),
+        "the first project sits on the frame's first inner row: {:?}",
+        row_text(&buf, 1)
+    );
+    assert_eq!(
+        buf.cell((0, 1)).expect("cell exists").symbol(),
+        "│",
+        "the frame's own column is not written over"
+    );
+}
+
+#[test]
+fn the_selected_projects_whole_row_is_highlighted() {
+    // Emphasis on the name alone is easy to miss in a list of directory names
+    // that already look alike. The bar runs the width of the list so the eye
+    // finds it without reading.
+    let (state, _, _) = state();
+    let buf = render(&state, WIDTH, 6);
+
+    for x in LEFT..WIDTH - 1 {
+        assert!(
+            buf.cell((x, TOP))
+                .expect("cell exists")
+                .modifier
+                .contains(Modifier::REVERSED),
+            "column {x} of the selected row is part of the bar"
+        );
+    }
+
+    assert!(
+        !buf.cell((LEFT, TOP + 1))
+            .expect("cell exists")
+            .modifier
+            .contains(Modifier::REVERSED),
+        "an unselected project carries no bar"
+    );
+}
+
+#[test]
+fn the_frame_is_not_painted_by_the_highlight() {
+    let (state, _, _) = state();
+    let buf = render(&state, WIDTH, 6);
+
+    assert!(
+        !buf.cell((0, TOP))
+            .expect("cell exists")
+            .modifier
+            .contains(Modifier::REVERSED),
+        "the bar stops at the frame"
+    );
+}
+
+#[test]
+fn a_project_with_panes_carries_a_twisty() {
+    let (mut state, alpha, _) = state();
+    spawn(&mut state, alpha, "claude");
+
+    let buf = render(&state, WIDTH, 6);
+    assert_eq!(buf.cell((LEFT, TOP)).expect("cell exists").symbol(), "▾");
+
+    state.toggle_project_collapsed(alpha);
+    let buf = render(&state, WIDTH, 6);
+    assert_eq!(buf.cell((LEFT, TOP)).expect("cell exists").symbol(), "▸");
+}
+
+#[test]
+fn a_project_with_no_panes_carries_no_twisty() {
+    // There is nothing to hide, so a control that toggles nothing is a lie.
+    let (state, _, _) = state();
+    let buf = render(&state, WIDTH, 6);
+
+    assert_eq!(buf.cell((LEFT, TOP)).expect("cell exists").symbol(), " ");
+}
+
+#[test]
+fn a_pane_with_children_carries_a_twisty_and_one_without_does_not() {
+    let (mut state, alpha, _) = state();
+    let parent = spawn(&mut state, alpha, "claude");
+    let mut child = Pane::new(alpha, HarnessId::new("claude"));
+    child.parent = Some(parent);
+    state.adopt_pane(child).expect("the project exists");
+    let lonely = spawn(&mut state, alpha, "codex");
+
+    let buf = render(&state, WIDTH, 8);
+    let twisty = |y: u16| {
+        (LEFT..WIDTH)
+            .map(|x| buf.cell((x, y)).expect("cell exists").symbol().to_string())
+            .find(|s| s == "▾" || s == "▸")
+    };
+
+    assert_eq!(twisty(TOP + 1), Some("▾".into()), "the parent has one");
+    assert_eq!(twisty(TOP + 3), None, "a childless pane has none");
+
+    state.toggle_pane_collapsed(parent);
+    let buf = render(&state, WIDTH, 8);
+    assert_eq!(
+        buf.cell((LEFT + 2, TOP + 1)).expect("cell exists").symbol(),
+        "▸",
+        "and it flips when collapsed"
+    );
+    let _ = lonely;
+}
+
+#[test]
+fn the_focus_marker_is_not_a_twisty() {
+    // Two different `▸` in one row read as one control.
+    let (mut state, alpha, _) = state();
+    spawn(&mut state, alpha, "claude");
+
+    let buf = render(&state, WIDTH, 6);
+    let row = row_text(&buf, TOP + 1);
+
+    assert!(row.contains('▌'), "the focused pane is marked: {row:?}");
+    assert!(!row.contains('▸'), "and not with a twisty: {row:?}");
+}
+
+#[test]
+fn a_collapsed_project_hides_its_panes() {
+    let (mut state, alpha, beta) = state();
+    spawn(&mut state, alpha, "claude");
+    spawn(&mut state, beta, "codex");
+
+    state.toggle_project_collapsed(alpha);
+    let lines = render_lines(&state, WIDTH, 8);
+    let text = lines.join("\n");
+
+    assert!(!text.contains("claude"), "its panes are hidden: {lines:#?}");
+    assert!(
+        text.contains("alpha"),
+        "the project itself stays: {lines:#?}"
+    );
+    assert!(
+        text.contains("codex"),
+        "another project is unaffected: {lines:#?}"
+    );
+}
+
+#[test]
+fn a_collapsed_project_hides_its_subagents_too() {
+    // The children hang off a pane that is itself hidden, so leaving them
+    // drawn would strand them under nothing.
+    let (mut state, alpha, _) = state();
+    let parent = spawn(&mut state, alpha, "claude");
+    let mut child = Pane::new(alpha, HarnessId::new("claude"));
+    child.parent = Some(parent);
+    child.title = "tests".into();
+    state.adopt_pane(child).expect("the project exists");
+
+    state.toggle_project_collapsed(alpha);
+    let text = render_lines(&state, WIDTH, 8).join("\n");
+
+    assert!(!text.contains("tests"), "the subagent is hidden: {text:?}");
+}
+
+#[test]
+fn a_collapsed_pane_hides_its_children_and_keeps_its_own_row() {
+    let (mut state, alpha, _) = state();
+    let parent = spawn(&mut state, alpha, "claude");
+    state
+        .set_pane_title(parent, "Claude Code")
+        .expect("it exists");
+    let mut child = Pane::new(alpha, HarnessId::new("claude"));
+    child.parent = Some(parent);
+    child.title = "tests".into();
+    state.adopt_pane(child).expect("the project exists");
+
+    state.toggle_pane_collapsed(parent);
+    let text = render_lines(&state, WIDTH, 8).join("\n");
+
+    assert!(text.contains("Claude Code"), "the parent stays: {text:?}");
+    assert!(!text.contains("tests"), "its child is hidden: {text:?}");
+}
+
+#[test]
+fn a_click_lands_on_the_row_below_a_collapsed_project() {
+    // Rendering and hit testing walk the same rows, or a click answers for a
+    // row the user cannot see.
+    let (mut state, alpha, beta) = state();
+    spawn(&mut state, alpha, "claude");
+    let codex = spawn(&mut state, beta, "codex");
+
+    state.toggle_project_collapsed(alpha);
+    let area = Rect::new(0, 0, WIDTH, 10);
+
+    // alpha, then beta's heading, then codex.
+    assert_eq!(
+        hit_test(&state, area, LEFT + 4, TOP + 2),
+        Some(Hit::Pane(codex))
+    );
+}
+
+#[test]
+fn a_click_on_a_panes_twisty_toggles_it_rather_than_focusing_it() {
+    let (mut state, alpha, _) = state();
+    let parent = spawn(&mut state, alpha, "claude");
+    let mut child = Pane::new(alpha, HarnessId::new("claude"));
+    child.parent = Some(parent);
+    state.adopt_pane(child).expect("the project exists");
+
+    let area = Rect::new(0, 0, WIDTH, 10);
+
+    // The twisty sits in the row's first column, two in from the list's edge.
+    assert_eq!(
+        hit_test(&state, area, LEFT + 2, TOP + 1),
+        Some(Hit::Twisty(parent))
+    );
+    assert_eq!(
+        hit_test(&state, area, LEFT + 3, TOP + 1),
+        Some(Hit::Pane(parent)),
+        "the rest of the row still focuses the pane"
+    );
+}
+
+#[test]
+fn a_click_on_a_childless_panes_twisty_column_focuses_it() {
+    // Nothing is drawn in that column, so there is no control to hit.
+    let (mut state, alpha, _) = state();
+    let pane = spawn(&mut state, alpha, "claude");
+
+    let area = Rect::new(0, 0, WIDTH, 10);
+    assert_eq!(
+        hit_test(&state, area, LEFT + 2, TOP + 1),
+        Some(Hit::Pane(pane))
+    );
+}
+
+#[test]
+fn a_tombstones_twisty_still_toggles() {
+    // A tombstone exists only to hold its children, so folding them away is
+    // the one thing its row can still do.
+    let (mut state, alpha, _) = state();
+    let parent = spawn(&mut state, alpha, "claude");
+    let mut child = Pane::new(alpha, HarnessId::new("claude"));
+    child.parent = Some(parent);
+    child.durable = true;
+    state.adopt_pane(child).expect("the project exists");
+    state.close_pane(parent).expect("the pane exists");
+
+    let area = Rect::new(0, 0, WIDTH, 10);
+    assert_eq!(
+        hit_test(&state, area, LEFT + 2, TOP + 1),
+        Some(Hit::Twisty(parent))
+    );
 }

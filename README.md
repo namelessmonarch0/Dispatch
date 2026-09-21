@@ -68,6 +68,14 @@ A pane whose process exits gives its tile back straight away and the remaining
 panes spread into the space. It stays in the sidebar, where selecting it shows
 what it printed — `^a x` is what removes it for good.
 
+## The sidebar
+
+The project list is framed on the left. It is a tree: each project carries a
+twisty, and so does any pane running subagents. Clicking a project's row moves
+the view to it and folds its panes away; clicking a pane's twisty folds its
+subagents, and clicking anywhere else on a pane's row focuses it. The project
+the grid is showing is highlighted across the full width of the row.
+
 ## Running the daemon
 
 Dispatch works on its own, with the agents as its children. Started that way,

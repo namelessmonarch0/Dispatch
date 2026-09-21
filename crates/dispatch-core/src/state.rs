@@ -33,6 +33,12 @@ pub struct AppState {
     selected_project: Option<ProjectId>,
     focused_pane: Option<PaneId>,
     zoomed_pane: Option<PaneId>,
+    /// Projects whose panes the sidebar hides. Absence means expanded, so a
+    /// project is expanded the moment it is added and nothing has to be
+    /// recorded for the ordinary case.
+    collapsed_projects: HashSet<ProjectId>,
+    /// Panes whose children the sidebar hides, on the same rule.
+    collapsed_panes: HashSet<PaneId>,
 }
 
 impl AppState {
@@ -367,6 +373,7 @@ impl AppState {
             return;
         };
         let closed = self.panes.remove(index);
+        self.collapsed_panes.remove(&id);
 
         if self.zoomed_pane == Some(id) {
             self.zoomed_pane = None;
@@ -383,6 +390,36 @@ impl AppState {
             self.focused_pane = siblings
                 .get(index.min(siblings.len().saturating_sub(1)))
                 .map(|p| p.id);
+        }
+    }
+
+    /// Whether the sidebar hides `project`'s panes.
+    #[must_use]
+    pub fn is_project_collapsed(&self, project: ProjectId) -> bool {
+        self.collapsed_projects.contains(&project)
+    }
+
+    /// Hides `project`'s panes, or shows them again.
+    ///
+    /// Takes an unknown project without complaint: this answers a click on a
+    /// row, and a row for a project that has just gone is not worth an error
+    /// path of its own.
+    pub fn toggle_project_collapsed(&mut self, project: ProjectId) {
+        if !self.collapsed_projects.remove(&project) {
+            self.collapsed_projects.insert(project);
+        }
+    }
+
+    /// Whether the sidebar hides `pane`'s children.
+    #[must_use]
+    pub fn is_pane_collapsed(&self, pane: PaneId) -> bool {
+        self.collapsed_panes.contains(&pane)
+    }
+
+    /// Hides `pane`'s children, or shows them again.
+    pub fn toggle_pane_collapsed(&mut self, pane: PaneId) {
+        if !self.collapsed_panes.remove(&pane) {
+            self.collapsed_panes.insert(pane);
         }
     }
 
@@ -1301,5 +1338,49 @@ mod tests {
             state.pane(leaf).is_none(),
             "the walk finished and the leaf went"
         );
+    }
+
+    #[test]
+    fn a_project_is_expanded_until_it_is_collapsed() {
+        let (mut state, project) = with_project();
+
+        assert!(!state.is_project_collapsed(project));
+
+        state.toggle_project_collapsed(project);
+        assert!(state.is_project_collapsed(project));
+
+        state.toggle_project_collapsed(project);
+        assert!(!state.is_project_collapsed(project));
+    }
+
+    #[test]
+    fn a_pane_is_expanded_until_it_is_collapsed() {
+        let (mut state, project) = with_project();
+        let pane = state
+            .spawn_pane(project, harness("claude"))
+            .expect("the project exists");
+
+        assert!(!state.is_pane_collapsed(pane));
+
+        state.toggle_pane_collapsed(pane);
+        assert!(state.is_pane_collapsed(pane));
+
+        state.toggle_pane_collapsed(pane);
+        assert!(!state.is_pane_collapsed(pane));
+    }
+
+    #[test]
+    fn closing_a_pane_forgets_that_it_was_collapsed() {
+        // Ids are not reused, but a set that only ever grows is a leak, and a
+        // pane adopted from the daemon must start expanded like any other.
+        let (mut state, project) = with_project();
+        let pane = state
+            .spawn_pane(project, harness("claude"))
+            .expect("the project exists");
+
+        state.toggle_pane_collapsed(pane);
+        state.close_pane(pane).expect("the pane exists");
+
+        assert!(!state.is_pane_collapsed(pane));
     }
 }

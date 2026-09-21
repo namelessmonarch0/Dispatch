@@ -404,7 +404,11 @@ fn reported_size(cols: u16, rows: u16) -> String {
 /// agent calls itself, and the shell this harness starts on Windows announces a
 /// title the moment it is ready — so the harness's display name is on the screen
 /// for a moment and gone, and counting it measured the shell rather than the
-/// fleet. Project rows start at the left edge; every pane is indented under one.
+/// fleet.
+///
+/// Inside the sidebar's frame, a project row opens with its twisty and then
+/// its status dot; every pane is indented two columns under one, so two
+/// leading spaces is what tells a pane row from a project row.
 ///
 /// The last row is the status line, which is not part of the sidebar.
 fn panes_shown(lines: &[String]) -> usize {
@@ -414,7 +418,8 @@ fn panes_shown(lines: &[String]) -> usize {
     sidebar
         .iter()
         .map(|line| line.chars().take(width).collect::<String>())
-        .filter(|column| column.starts_with(' ') && !column.trim().is_empty())
+        .map(|column| column.trim_matches('│').to_string())
+        .filter(|row| row.starts_with("  ") && !row.trim().is_empty())
         .count()
 }
 
