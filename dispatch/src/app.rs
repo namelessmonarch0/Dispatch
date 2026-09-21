@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use dispatch_client::Client;
 use dispatch_config::{HarnessRegistry, Launch};
 use dispatch_core::{
-    AppState, HarnessId, Pane as CorePane, PaneId, PaneStatus, Project, ProjectId, ProjectSource,
-    RequestId,
+    AppState, Device, DeviceId, HarnessId, Pane as CorePane, PaneId, PaneStatus, Project,
+    ProjectId, ProjectSource, RequestId,
 };
 use dispatch_layout::{tile, tile_zoomed};
 use dispatch_proto::{ClientMessage, DelegateOutcome, PaneUpdate, ServerMessage};
@@ -247,6 +247,28 @@ impl Overlay {
     }
 }
 
+/// What to call the machine Dispatch is running on.
+///
+/// The hostname, because a fleet of rows all saying "local" names nothing.
+fn this_machine() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "this machine".to_string())
+}
+
+/// One daemon this client is holding.
+struct Attachment {
+    /// The machine it is, as the sidebar names it.
+    device: DeviceId,
+    client: Client,
+    /// That connection's generation. Per attachment, because one daemon
+    /// restarting says nothing about the others.
+    generation: u64,
+    /// Roots asked of this daemon, so its own reconnect can ask again.
+    opened: Vec<PathBuf>,
+}
+
 /// Where this Dispatch's agents run.
 ///
 /// Attached is what lets the work outlive the interface; standalone is what
@@ -254,18 +276,18 @@ impl Overlay {
 enum Mode {
     /// The agents are this process's children.
     Standalone,
-    /// The agents belong to a daemon.
-    Attached(Client),
+    /// The agents belong to daemons — one per machine.
+    Attached(Vec<Attachment>),
 }
 
 /// The application.
 pub struct App {
     mode: Mode,
-    /// Which daemon connection the state on screen was built from. Zero when
-    /// the agents are this process's own.
-    generation: u64,
-    /// The project roots this client asked for, so a reconnection can ask again.
-    opened: Vec<PathBuf>,
+    /// The machine Dispatch itself is, while it runs its own agents.
+    ///
+    /// `None` from the first `attach` on: the agents are a daemon's from then
+    /// on, and every project belongs to the machine that announced it.
+    local: Option<DeviceId>,
     /// Where the directory browser starts, when it has not been opened yet.
     ///
     /// The working directory Dispatch was started in, which is the directory
@@ -333,29 +355,20 @@ pub struct App {
 impl App {
     /// Creates an application that owns its own agents.
     pub fn new(harnesses: HarnessRegistry) -> Self {
-        Self::with_mode(harnesses, Mode::Standalone)
-    }
+        let mut state = AppState::new();
 
-    /// Creates an application whose agents belong to `client`'s daemon.
-    pub fn attached(harnesses: HarnessRegistry, client: Client) -> Self {
-        Self::with_mode(harnesses, Mode::Attached(client))
-    }
-
-    fn with_mode(harnesses: HarnessRegistry, mode: Mode) -> Self {
-        let generation = match &mode {
-            Mode::Standalone => 0,
-            Mode::Attached(client) => client.generation(),
-        };
+        // Standalone runs its agents itself, but it is still a machine: one
+        // code path beats asking "device or not" at every use.
+        let local = state.add_device(Device::new(this_machine()));
 
         Self {
-            mode,
-            generation,
-            opened: Vec::new(),
+            mode: Mode::Standalone,
+            local: Some(local),
             browse_from: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             kept: None,
             browser: None,
             overlay: None,
-            state: AppState::new(),
+            state,
             panes: HashMap::new(),
             harnesses,
             router: InputRouter::new(),
@@ -371,6 +384,132 @@ impl App {
             #[cfg(test)]
             sent: Vec::new(),
         }
+    }
+
+    /// Creates an application whose agents belong to `client`'s daemon.
+    ///
+    /// Construct, then attach once: the fleet has no shape of its own beyond
+    /// the daemons in it, so one daemon is the same path as five.
+    pub fn attached(harnesses: HarnessRegistry, client: Client) -> Self {
+        let mut app = Self::new(harnesses);
+        app.attach(client);
+        app
+    }
+
+    /// Adds a daemon to the fleet, registering the machine it names itself as.
+    ///
+    /// The device is registered here, before the connection has said anything,
+    /// so every project this daemon announces has a machine's row to be drawn
+    /// under. A project stamped with a device the sidebar does not know is
+    /// drawn nowhere at all.
+    pub fn attach(&mut self, client: Client) {
+        // The agents are no longer this process's to run, so the machine it
+        // was standing in for goes with them: from here on what is on screen
+        // belongs to a daemon.
+        if let Some(local) = self.local.take() {
+            self.state.remove_device(local);
+        }
+
+        let device = self.state.add_device(Device::new(client.device()));
+        let generation = client.generation();
+
+        let attachment = Attachment {
+            device,
+            client,
+            generation,
+            opened: Vec::new(),
+        };
+
+        match &mut self.mode {
+            Mode::Attached(attachments) => attachments.push(attachment),
+            Mode::Standalone => self.mode = Mode::Attached(vec![attachment]),
+        }
+    }
+
+    /// The daemons this client is holding, or nothing when it holds none.
+    fn attachments(&self) -> &[Attachment] {
+        match &self.mode {
+            Mode::Attached(attachments) => attachments,
+            Mode::Standalone => &[],
+        }
+    }
+
+    /// The daemon a pane is on.
+    fn attachment_for_pane(&self, pane: PaneId) -> Option<&Attachment> {
+        let project = self.state.pane(pane)?.project;
+        self.attachment_for_project(project)
+    }
+
+    /// The daemon a project is on.
+    fn attachment_for_project(&self, project: ProjectId) -> Option<&Attachment> {
+        let device = self
+            .state
+            .projects()
+            .iter()
+            .find(|candidate| candidate.id == project)?
+            .device;
+
+        self.attachments()
+            .iter()
+            .find(|attachment| attachment.device == device)
+    }
+
+    /// The daemon a project is on, or `None` with the reason said out loud.
+    fn reachable_for_project(&mut self, project: ProjectId) -> Option<&Attachment> {
+        let device = self.attachment_for_project(project)?.device;
+
+        if self.state.device(device).is_some_and(|d| d.reachable) {
+            // Looked up a second time rather than kept: the borrow above has
+            // to end before the status line below can be written.
+            return self.attachment_for_project(project);
+        }
+
+        self.refuse(device);
+        None
+    }
+
+    /// Whether the machine a pane is on will take a write, saying so when it
+    /// will not.
+    ///
+    /// True when nothing is attached behind the pane: a standalone client's
+    /// panes are this process's own children, and there is no machine between
+    /// the keystroke and the process.
+    fn reachable_for_pane(&mut self, pane: PaneId) -> bool {
+        let Some(device) = self.attachment_for_pane(pane).map(|a| a.device) else {
+            return true;
+        };
+
+        if self.state.device(device).is_some_and(|d| d.reachable) {
+            return true;
+        }
+
+        self.refuse(device);
+        false
+    }
+
+    /// Whether a pane's machine is reachable, without saying anything.
+    ///
+    /// For the frame's own work — resizing — which happens without the user
+    /// asking and so has no business writing the status line every tick.
+    fn can_reach_pane(&self, pane: PaneId) -> bool {
+        let Some(device) = self.attachment_for_pane(pane).map(|a| a.device) else {
+            return true;
+        };
+
+        self.state.device(device).is_some_and(|d| d.reachable)
+    }
+
+    /// Says which machine could not be reached.
+    ///
+    /// Named rather than "the daemon": on a fleet, which one is the whole
+    /// question.
+    fn refuse(&mut self, device: DeviceId) {
+        let name = self
+            .state
+            .device(device)
+            .map_or_else(|| "that machine".to_string(), |d| d.name.clone());
+
+        self.status = format!("{name} is unreachable");
     }
 
     /// Folds or unfolds whatever the focus is in.
@@ -458,13 +597,20 @@ impl App {
     pub fn add_project(&mut self, root: PathBuf) {
         self.keep(&root);
 
-        if let Mode::Attached(client) = &self.mode {
-            client.send(ClientMessage::OpenProject { root: root.clone() });
+        // The first daemon, because a root is a path and nothing has yet asked
+        // the user which machine to read it on. For a client holding one — the
+        // only shape there has ever been — it is that one.
+        if let Mode::Attached(attachments) = &mut self.mode
+            && let Some(attachment) = attachments.first_mut()
+        {
+            attachment
+                .client
+                .send(ClientMessage::OpenProject { root: root.clone() });
             // Remembered so a reconnection asks again: a daemon that was
             // restarted is serving whatever its own command line said, which
             // need not include what this client was opened with.
-            if !self.opened.contains(&root) {
-                self.opened.push(root);
+            if !attachment.opened.contains(&root) {
+                attachment.opened.push(root);
             }
             return;
         }
@@ -475,7 +621,13 @@ impl App {
             ProjectSource::LocalDir
         };
 
-        self.state.add_project(Project::new(root, source));
+        // Stamped with this machine, like any other project: a project whose
+        // device is registered nowhere has no row to be drawn under.
+        let project = match self.local {
+            Some(device) => Project::new(root, source).with_device(device),
+            None => Project::new(root, source),
+        };
+        self.state.add_project(project);
     }
 
     /// Adds `root` to the kept list, if this client keeps one.
@@ -504,13 +656,19 @@ impl App {
         }
     }
 
-    /// What the daemon calls itself, when attached to one.
+    /// What the daemons call themselves, when attached to any.
+    ///
+    /// All of them, comma-separated: the status line says where the agents are,
+    /// and on a fleet that is more than one place.
     #[must_use]
     pub fn device(&self) -> Option<String> {
-        match &self.mode {
-            Mode::Standalone => None,
-            Mode::Attached(client) => Some(client.device()),
-        }
+        let names: Vec<String> = self
+            .attachments()
+            .iter()
+            .map(|attachment| attachment.client.device())
+            .collect();
+
+        (!names.is_empty()).then(|| names.join(", "))
     }
 
     /// Whether the loop should stop.
@@ -529,22 +687,41 @@ impl App {
             return Ok(());
         };
 
-        let Some(def) = self.harnesses.get(harness) else {
+        // Cloned out of the registry rather than borrowed: naming the machine
+        // that cannot be reached is a write to the status line, and the
+        // registry is a field of the same `self`.
+        let Some((display_name, launch)): Option<(String, Launch)> =
+            self.harnesses.get(harness).map(|def| {
+                (
+                    def.display_name.clone(),
+                    def.launch_for_current_platform().clone(),
+                )
+            })
+        else {
             self.status = format!("unknown harness {harness:?}");
             return Ok(());
         };
 
-        if let Mode::Attached(client) = &self.mode {
-            client.send(ClientMessage::SpawnPane {
+        // Attached, the machine the project is on is the one asked — and a
+        // machine out of reach is told to the user rather than written into a
+        // socket nobody is reading.
+        if !self.attachments().is_empty() {
+            let Some(daemon) = self
+                .reachable_for_project(project_id)
+                .map(|attachment| attachment.client.handle())
+            else {
+                return Ok(());
+            };
+
+            daemon.send(ClientMessage::SpawnPane {
                 project: project_id,
                 harness: harness.to_string(),
                 size: (area.cols, area.rows),
             });
-            self.status = format!("starting {}…", def.display_name);
+            self.status = format!("starting {display_name}…");
             return Ok(());
         }
 
-        let launch: Launch = def.launch_for_current_platform().clone();
         let cwd = self
             .state
             .projects()
@@ -554,14 +731,13 @@ impl App {
             .context("the selected project is registered")?;
 
         let session = PtySession::spawn(&launch, &cwd, area)
-            .with_context(|| format!("failed to start {}", def.display_name))?;
+            .with_context(|| format!("failed to start {display_name}"))?;
 
         let id = self
             .state
             .spawn_pane(project_id, HarnessId::new(harness))
             .context("the selected project is registered")?;
 
-        let display_name = def.display_name.clone();
         self.adopt(id, Backend::Local(session), &display_name)
     }
 
@@ -599,81 +775,132 @@ impl App {
     /// Returns whether anything needs redrawing. Standalone, there is nothing
     /// to hear and this does nothing.
     pub fn poll_daemon(&mut self) -> bool {
-        let Mode::Attached(client) = &self.mode else {
+        let Mode::Attached(attachments) = &self.mode else {
             return false;
         };
 
-        let generation = client.generation();
-        let connected = client.is_connected();
-        let device = client.device();
-        let messages = client.poll();
+        // Collected first: applying a message borrows `self` mutably, and the
+        // attachments are borrowed from it. One entry per machine, so this
+        // grows with the fleet rather than with the session.
+        let snapshot: Vec<(DeviceId, u64, bool, String, Vec<ServerMessage>)> = attachments
+            .iter()
+            .map(|attachment| {
+                (
+                    attachment.device,
+                    attachment.client.generation(),
+                    attachment.client.is_connected(),
+                    attachment.client.device(),
+                    attachment.client.poll(),
+                )
+            })
+            .collect();
+
         let mut changed = false;
 
-        if generation != self.generation {
-            // Everything on screen was described by a connection that is gone.
-            // The new one announces its projects and panes on subscribing, so
-            // the view is rebuilt from what it says rather than kept and
-            // patched.
-            self.generation = generation;
-            self.forget_the_fleet();
-            self.reopen_projects();
-            self.status = format!("reattached to {device}");
-            changed = true;
-        }
+        for (device, generation, connected, name, messages) in snapshot {
+            changed |= self.sync_attachment(device, generation, connected, &name);
 
-        for message in messages {
-            changed |= self.apply(message);
+            for message in messages {
+                changed |= self.apply_from(device, message);
+            }
         }
-
-        // Whether the daemon is gone is asked at draw time rather than stamped
-        // here. `connected` above is a snapshot, and the reconnection runs on
-        // another thread: read it a moment before the supervisor flips it and a
-        // stamped notice overwrites the "reattached" message and then outlives
-        // the disconnection it described, because the generation only changes
-        // once and nothing writes the status again. CI caught exactly that.
-        changed |= !connected;
 
         changed
     }
 
-    /// Asks the daemon for the projects this client was opened with.
-    fn reopen_projects(&mut self) {
-        let Mode::Attached(client) = &self.mode else {
-            return;
+    /// Brings one attachment's device up to date, and rebuilds its rows when
+    /// the connection behind them has been replaced.
+    ///
+    /// Returns whether anything changed on screen. A frame is asked for on the
+    /// transitions only: saying "changed" every tick because a machine is still
+    /// down would redraw the whole interface at the frame rate for as long as
+    /// it stays down.
+    fn sync_attachment(
+        &mut self,
+        device: DeviceId,
+        generation: u64,
+        connected: bool,
+        name: &str,
+    ) -> bool {
+        let was = self.state.device(device).is_some_and(|d| d.reachable);
+        self.state.set_device_reachable(device, connected);
+        let changed = was != connected;
+
+        let Mode::Attached(attachments) = &mut self.mode else {
+            return changed;
+        };
+        let Some(attachment) = attachments.iter_mut().find(|a| a.device == device) else {
+            return changed;
         };
 
-        for root in &self.opened {
+        if attachment.generation == generation {
+            return changed;
+        }
+
+        // Everything this machine was showing was described by a connection
+        // that is gone. Its `Subscribe` replay describes its own fleet afresh,
+        // so the rows are rebuilt from what it says rather than patched — and
+        // only its rows: one daemon restarting says nothing about the others.
+        attachment.generation = generation;
+        let roots = attachment.opened.clone();
+        let client = &attachment.client;
+
+        for root in &roots {
             client.send(ClientMessage::OpenProject { root: root.clone() });
         }
+
+        self.forget_device(device);
+        self.status = format!("reattached to {name}");
+
+        true
     }
 
-    /// Forgets what a daemon told us over a connection that has ended.
+    /// Forgets what one machine told us over a connection that has ended.
     ///
     /// A pane the old connection described may not exist any more: a daemon that
     /// was restarted names its panes afresh. Anything still running is described
     /// again by the new connection.
-    fn forget_the_fleet(&mut self) {
-        self.panes.clear();
-        self.state = AppState::new();
-        self.layout.clear();
-        // A picker offering projects that have just been forgotten would act on
-        // an id nothing answers to, and a request from a pane that no longer
-        // exists would be answered into a void. The new connection's `Subscribe`
-        // catch-up replays whatever is still actually outstanding.
-        self.overlay = None;
-        self.pending.clear();
-        // Both are about requests that belonged to the connection that ended:
-        // the new one names its panes afresh, and a title kept for a pane id
-        // that will never be announced again is just a leak.
-        self.answered.clear();
-        self.child_titles.clear();
+    fn forget_device(&mut self, device: DeviceId) {
+        self.state.forget_device_projects(device);
+
+        // Whatever the state dropped with those projects is dropped here too.
+        // A view kept for a pane that is gone draws output nothing can reach
+        // and takes keystrokes nothing would answer.
+        self.panes.retain(|id, _| self.state.pane(*id).is_some());
+        self.expanded.retain(|id| self.state.pane(*id).is_some());
+        self.layout.retain(|(id, _)| self.state.pane(*id).is_some());
+
+        // A request from a pane that no longer exists would be answered into a
+        // void; the new connection's catch-up replays whatever is still
+        // outstanding. `answered` and `child_titles` are left alone: they are
+        // keyed by request and pane, which say nothing about which machine
+        // they came from, and both are a handful of short strings.
+        let live: Vec<ProjectId> = self.state.projects().iter().map(|p| p.id).collect();
+        let was_shown = matches!(self.overlay, Some(Overlay::Approval { .. }))
+            && self
+                .pending
+                .front()
+                .is_some_and(|waiting| !live.contains(&waiting.project));
+        self.pending
+            .retain(|waiting| live.contains(&waiting.project));
+
+        // A prompt whose request has just been forgotten cannot be answered,
+        // and a picker offering projects that are gone would act on an id
+        // nothing answers to.
+        if was_shown || matches!(self.overlay, Some(Overlay::Project(_))) {
+            self.overlay = None;
+        }
     }
 
-    /// Applies one message from the daemon. Returns whether to redraw.
-    fn apply(&mut self, message: ServerMessage) -> bool {
+    /// Applies one message a daemon sent, stamped with the machine it came
+    /// from. Returns whether to redraw.
+    fn apply_from(&mut self, device: DeviceId, message: ServerMessage) -> bool {
         match message {
             ServerMessage::ProjectOpened { project } => {
-                self.state.add_project(project);
+                // Stamped here, the one place a project enters this client
+                // from a daemon: the daemon knows nothing of the other
+                // machines, so which one it is, is this client's to say.
+                self.state.add_project(project.with_device(device));
                 true
             }
 
@@ -835,6 +1062,22 @@ impl App {
         }
     }
 
+    /// Applies one message from no machine in particular.
+    ///
+    /// For tests that drive a message straight in rather than through a
+    /// daemon's queue. Only for messages that name a pane or a request: a
+    /// project arriving this way would be stamped with a machine the sidebar
+    /// has never heard of, which is a project drawn nowhere at all.
+    #[cfg(test)]
+    fn apply(&mut self, message: ServerMessage) -> bool {
+        debug_assert!(
+            !matches!(message, ServerMessage::ProjectOpened { .. }),
+            "a project has to arrive from a machine"
+        );
+
+        self.apply_from(DeviceId::nil(), message)
+    }
+
     /// Takes on a pane the daemon has started.
     ///
     /// `parent` and `durable` come from the announcement rather than from
@@ -854,10 +1097,18 @@ impl App {
             return false;
         }
 
-        let Mode::Attached(client) = &self.mode else {
+        // The machine the pane's project is on, not "the daemon": a write to
+        // this pane has to go to the connection that owns it and to no other.
+        let Some(daemon) = self
+            .attachment_for_project(project)
+            .map(|attachment| attachment.client.handle())
+        else {
+            // A pane in a project this client has not been told about: the
+            // announcement is on its way, and the pane arrives with the next
+            // subscribe rather than being drawn with nowhere to belong.
+            tracing::warn!(pane = %id, project = %project, "a pane for an unknown project");
             return false;
         };
-        let daemon = client.handle();
 
         let mut pane = CorePane::new(project, HarnessId::new(harness));
         pane.id = id;
@@ -1322,8 +1573,13 @@ impl App {
         #[cfg(test)]
         self.sent.push(message.clone());
 
-        if let Mode::Attached(client) = &self.mode {
-            client.send(message);
+        // Answered to the machine that asked. Another machine's daemon knows
+        // nothing of this request and would only log an id it has never seen.
+        if let Some(daemon) = self
+            .attachment_for_project(waiting.project)
+            .map(|attachment| attachment.client.handle())
+        {
+            daemon.send(message);
         }
 
         self.open_next_approval();
@@ -1492,10 +1748,21 @@ impl App {
         }
 
         self.unkeep(&root);
-        self.opened.retain(|kept| kept != &root);
+        if let Mode::Attached(attachments) = &mut self.mode {
+            for attachment in attachments.iter_mut() {
+                attachment.opened.retain(|kept| kept != &root);
+            }
+        }
 
-        if let Mode::Attached(client) = &self.mode {
-            client.send(ClientMessage::CloseProject { project });
+        if !self.attachments().is_empty() {
+            let Some(daemon) = self
+                .reachable_for_project(project)
+                .map(|attachment| attachment.client.handle())
+            else {
+                return;
+            };
+
+            daemon.send(ClientMessage::CloseProject { project });
             // The row goes when the daemon says so.
             return;
         }
@@ -1595,6 +1862,13 @@ impl App {
             return;
         };
 
+        // A keystroke for a machine that is out of reach is refused and said
+        // out loud: dropped silently, the user types a whole command into a
+        // pane that never sees it.
+        if !self.reachable_for_pane(id) {
+            return;
+        }
+
         // Typing jumps back to the newest output, as every terminal does:
         // otherwise the reply to what was just typed appears somewhere the
         // user is not looking.
@@ -1627,6 +1901,28 @@ impl App {
     /// nothing, and a wheel event then scrolls its scrollback instead, which
     /// is what a terminal without mouse tracking does.
     fn send_mouse(&mut self, id: PaneId, input: MouseInput) {
+        use dispatch_pty::MouseButton;
+
+        let wheel = match input.button {
+            MouseButton::WheelUp => Some(-3),
+            MouseButton::WheelDown => Some(3),
+            _ => None,
+        };
+
+        // A pointer event the agent would answer is refused out loud when its
+        // machine is out of reach. A wheel is not: with nowhere to send it, it
+        // falls through to this client's own scrollback below, and reading
+        // never needed the daemon.
+        if !self.can_reach_pane(id) {
+            match wheel {
+                Some(rows) => self.scroll_pane(id, rows),
+                // Called for what it says, not what it answers: the machine is
+                // already known to be out of reach.
+                None => drop(self.reachable_for_pane(id)),
+            }
+            return;
+        }
+
         let Some(pane) = self.panes.get_mut(&id) else {
             return;
         };
@@ -1648,11 +1944,8 @@ impl App {
         }
 
         // Nothing was encoded, so the pane is not tracking the mouse.
-        use dispatch_pty::MouseButton;
-        let rows = match input.button {
-            MouseButton::WheelUp => -3,
-            MouseButton::WheelDown => 3,
-            _ => return,
+        let Some(rows) = wheel else {
+            return;
         };
 
         self.scroll_pane(id, rows);
@@ -1705,6 +1998,12 @@ impl App {
         let Some(id) = self.state.focused_pane() else {
             return;
         };
+
+        // As with a keystroke: a paste that vanishes is worse than one refused.
+        if !self.reachable_for_pane(id) {
+            return;
+        }
+
         let Some(pane) = self.panes.get_mut(&id) else {
             return;
         };
@@ -1766,6 +2065,13 @@ impl App {
         let Some(id) = self.state.focused_pane() else {
             return;
         };
+
+        // Refused rather than done locally: the machine still has the process,
+        // and a row taken off this client's screen is a running agent nobody
+        // can find again.
+        if !self.reachable_for_pane(id) {
+            return;
+        }
 
         if let Some(mut pane) = self.panes.remove(&id) {
             pane.backend.terminate();
@@ -2090,25 +2396,31 @@ impl App {
             && !matches!(self.overlay, Some(Overlay::Approval { .. })))
         .then(|| format!("{} delegation(s) waiting — ^a a", self.pending.len()));
 
-        // Asked now, not remembered: the connection can come back on another
-        // thread at any moment, and a notice that outlives the disconnection is
-        // worse than none — it says the agents are unreachable when they are
-        // not.
-        let disconnected = match &self.mode {
-            Mode::Attached(client) => !client.is_connected(),
-            Mode::Standalone => false,
-        };
+        // Asked now, not remembered: a connection can come back on another
+        // thread at any moment, and a notice that outlives the disconnection
+        // says the agents are unreachable when they are not. Named, because on
+        // a fleet "the daemon" says nothing about which machine went.
+        let unreachable: Vec<String> = self
+            .state
+            .devices()
+            .iter()
+            .filter(|device| !device.reachable)
+            .map(|device| device.name.clone())
+            .collect();
 
         let text = if self.router.is_armed() {
             // A prefix that armed invisibly is how a keystroke goes missing
             // with no explanation.
             "PREFIX".to_string()
         } else {
-            let base = if disconnected {
+            let base = if !unreachable.is_empty() {
                 // Ahead of `self.status`, which may still hold whatever was
                 // happening when the connection went: a user needs to know the
                 // agents are out of reach more than they need the last message.
-                "waiting for the daemon — the agents are still running".to_string()
+                format!(
+                    "waiting for {} — its agents are still running",
+                    unreachable.join(", ")
+                )
             } else if !self.status.is_empty() {
                 self.status.clone()
             } else {
@@ -2160,6 +2472,15 @@ impl App {
         let layout = self.layout.clone();
 
         for (id, rect) in layout {
+            // Silently, unlike a keystroke: this runs every frame, and a
+            // machine that is down would otherwise rewrite the status line at
+            // the frame rate. The pane keeps its old geometry until the
+            // machine answers again, when the mismatch this leaves behind
+            // resizes it on the next frame.
+            if !self.can_reach_pane(id) {
+                continue;
+            }
+
             let Some(pane) = self.panes.get_mut(&id) else {
                 continue;
             };
@@ -4141,6 +4462,153 @@ mod tests {
         assert!(
             text.contains("approve"),
             "the key legend should still be visible, not scrolled away:\n{text}"
+        );
+    }
+
+    /// Two attached daemons, each with a project of its own.
+    fn two_daemons() -> (
+        App,
+        ProjectId,
+        ProjectId,
+        Receiver<ClientMessage>,
+        Receiver<ClientMessage>,
+    ) {
+        let (first, first_daemon, first_sent) = Client::for_test();
+        let (second, second_daemon, second_sent) = Client::for_test();
+
+        let mut app = App::new(HarnessRegistry::default());
+        app.attach(first);
+        app.attach(second);
+
+        let alpha = Project::new("/tmp/alpha", ProjectSource::LocalDir);
+        let beta = Project::new("/tmp/beta", ProjectSource::LocalDir);
+        let (alpha_id, beta_id) = (alpha.id, beta.id);
+
+        first_daemon
+            .send(ServerMessage::ProjectOpened { project: alpha })
+            .expect("the app is listening");
+        second_daemon
+            .send(ServerMessage::ProjectOpened { project: beta })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        (app, alpha_id, beta_id, first_sent, second_sent)
+    }
+
+    /// The device a project is on, as the sidebar would read it.
+    fn device_of(app: &App, project: ProjectId) -> Option<DeviceId> {
+        app.state
+            .projects()
+            .iter()
+            .find(|candidate| candidate.id == project)
+            .map(|candidate| candidate.device)
+    }
+
+    #[test]
+    fn each_daemons_projects_are_attributed_to_its_own_device() {
+        let (app, alpha, beta, _, _) = two_daemons();
+
+        assert_eq!(app.state.devices().len(), 2);
+        assert_ne!(device_of(&app, alpha), device_of(&app, beta));
+    }
+
+    #[test]
+    fn a_project_from_a_daemon_lands_on_a_machine_the_sidebar_knows() {
+        // The invariant the whole slice rests on: the sidebar groups projects
+        // under their machine's row, so a project stamped with a device that
+        // was never registered is drawn nowhere at all — open, invisible and
+        // unreachable. `attach` registers the machine before its connection
+        // can announce anything, which is what makes that impossible.
+        let (app, alpha, beta, _, _) = two_daemons();
+
+        for project in [alpha, beta] {
+            let device = device_of(&app, project).expect("the project is registered");
+            assert!(
+                app.state.device(device).is_some(),
+                "the machine a project names must be one the sidebar draws"
+            );
+        }
+    }
+
+    #[test]
+    fn a_keystroke_reaches_the_daemon_the_pane_is_on() {
+        // The whole point of the slice: one screen, two machines, and no
+        // chance of typing into the wrong one.
+        let (mut app, _alpha, beta, first_sent, second_sent) = two_daemons();
+        let pane = PaneId::new();
+        // The pane belongs to the second daemon's project.
+        app.apply(spawned(pane, beta, "shell", None, false));
+        // Focus follows the selection, so the second machine's project is
+        // what the user is looking at.
+        let _ = app.state.select_project(beta);
+        let _ = app.state.focus(pane);
+
+        press(&mut app, KeyCode::Char('x'));
+
+        assert!(
+            std::iter::from_fn(|| second_sent.try_recv().ok())
+                .any(|m| matches!(m, ClientMessage::WritePane { pane: p, .. } if p == pane)),
+            "the daemon that owns the pane hears it"
+        );
+        assert!(
+            !std::iter::from_fn(|| first_sent.try_recv().ok())
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "and the other one hears nothing"
+        );
+    }
+
+    #[test]
+    fn one_daemon_restarting_rebuilds_only_its_own_rows() {
+        let (mut app, alpha, beta, _, _) = two_daemons();
+        let device = device_of(&app, alpha).expect("the project is on a machine");
+
+        app.state.forget_device_projects(device);
+
+        assert!(
+            !app.state.projects().iter().any(|p| p.id == alpha),
+            "that machine's project is gone"
+        );
+        assert!(
+            app.state.projects().iter().any(|p| p.id == beta),
+            "and the other machine's is not"
+        );
+        assert_eq!(
+            app.state.devices().len(),
+            2,
+            "both machines keep their rows"
+        );
+    }
+
+    #[test]
+    fn a_standalone_client_is_a_machine_too() {
+        // One code path rather than "device or not" at every use.
+        let app = App::new(HarnessRegistry::default());
+
+        assert_eq!(app.state.devices().len(), 1);
+    }
+
+    #[test]
+    fn a_keystroke_for_an_unreachable_machine_is_refused_out_loud() {
+        let (mut app, _alpha, beta, _, second_sent) = two_daemons();
+        let pane = PaneId::new();
+        app.apply(spawned(pane, beta, "shell", None, false));
+        let _ = app.state.select_project(beta);
+        let _ = app.state.focus(pane);
+
+        let device = device_of(&app, beta).expect("the pane is on a machine");
+        app.state.set_device_reachable(device, false);
+
+        press(&mut app, KeyCode::Char('x'));
+
+        assert!(
+            !std::iter::from_fn(|| second_sent.try_recv().ok())
+                .any(|m| matches!(m, ClientMessage::WritePane { .. })),
+            "nothing is sent into the void"
+        );
+        assert!(
+            app.status.contains("unreachable"),
+            "and the user is told: {:?}",
+            app.status
         );
     }
 }

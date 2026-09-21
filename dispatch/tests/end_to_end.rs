@@ -863,9 +863,11 @@ fn a_client_waits_for_a_daemon_that_is_restarted() {
     dispatch.spawn_shell();
 
     daemon.stop();
+    // Named, not "the daemon": the client holds one connection per machine, so
+    // the notice has to say which one went quiet.
     assert!(
-        dispatch.wait_for(|lines| contains(lines, "waiting for the daemon")),
-        "the client should say the daemon is gone rather than look alive"
+        dispatch.wait_for(|lines| contains(lines, "waiting for local")),
+        "the client should say which daemon is gone rather than look alive"
     );
 
     let _restarted = Daemon::start(&fixture);
