@@ -76,6 +76,14 @@ pub enum Action {
     /// If the focused pane is a subagent, remove it from the tiled grid and
     /// return focus to its parent.
     CollapseChild,
+    /// Fold or unfold whatever the focus is in: the focused pane's subagents,
+    /// or its project when the pane has none.
+    ///
+    /// The sidebar's twistys answer a click, and a click needs mouse reporting
+    /// — which is exactly what an SSH session without it does not have.
+    ToggleFold,
+    /// Open the directory browser, to add a project without restarting.
+    OpenProject,
     /// Quit.
     Quit,
 }
@@ -256,6 +264,8 @@ fn command_for(event: &KeyEvent) -> Action {
         // reporting.
         KeyCode::Char('s') => Action::ExpandChild,
         KeyCode::Char('c') => Action::CollapseChild,
+        KeyCode::Char('f') => Action::ToggleFold,
+        KeyCode::Char('o') => Action::OpenProject,
         KeyCode::Char('[') => Action::Scrollback,
         // A grid holds four panes at most, so a fifth opens a tab rather than
         // shrinking the other four into unreadability. Digits pick one

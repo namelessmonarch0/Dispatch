@@ -361,6 +361,30 @@ impl App {
         }
     }
 
+    /// Folds or unfolds whatever the focus is in.
+    ///
+    /// A focused pane with subagents folds those; a pane with none folds the
+    /// project above it, which is the common case and would otherwise leave
+    /// the key doing nothing. With no pane focused there is only the selected
+    /// project to fold.
+    fn toggle_fold(&mut self) {
+        if let Some(pane) = self.state.focused_pane() {
+            if !self.state.children_of(pane).is_empty() {
+                self.state.toggle_pane_collapsed(pane);
+                return;
+            }
+
+            if let Some(project) = self.state.pane(pane).map(|pane| pane.project) {
+                self.state.toggle_project_collapsed(project);
+                return;
+            }
+        }
+
+        if let Some(project) = self.state.selected_project() {
+            self.state.toggle_project_collapsed(project);
+        }
+    }
+
     /// Records a title an agent set for one of its panes.
     ///
     /// Every title an agent announces arrives here, local or remote, because
@@ -970,6 +994,8 @@ impl App {
             Action::NextTab => self.select_tab(self.current_tab() + 1),
             Action::Scrollback => self.scroll_focused(-10),
             Action::Approvals => self.open_next_approval(),
+            Action::ToggleFold => self.toggle_fold(),
+            Action::OpenProject => {}
             Action::ExpandChild => self.expand_child(),
             Action::CollapseChild => self.collapse_child(),
         }
@@ -2611,6 +2637,74 @@ mod tests {
             app.state.pane(pane).map(|p| p.title.as_str()),
             Some("Claude Code")
         );
+    }
+
+    /// Presses the prefix, then `key`.
+    fn command(app: &mut App, key: char) {
+        app.handle(
+            &Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Size::new(100, 30),
+        )
+        .expect("a keystroke is handled");
+        press(app, KeyCode::Char(key));
+    }
+
+    #[test]
+    fn folding_from_the_keyboard_folds_the_focused_panes_subagents() {
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let parent = app
+            .state
+            .spawn_pane(project, HarnessId::new("shell"))
+            .expect("the project exists");
+        let mut child = dispatch_core::Pane::new(project, HarnessId::new("shell"));
+        child.parent = Some(parent);
+        app.state.adopt_pane(child).expect("the project exists");
+        let _ = app.state.focus(parent);
+
+        command(&mut app, 'f');
+
+        assert!(app.state.is_pane_collapsed(parent));
+        assert!(
+            !app.state.is_project_collapsed(project),
+            "the project is not what was folded"
+        );
+
+        command(&mut app, 'f');
+        assert!(!app.state.is_pane_collapsed(parent), "and it unfolds again");
+    }
+
+    #[test]
+    fn folding_a_pane_with_no_subagents_folds_its_project() {
+        // Otherwise the key does nothing on the common case: most panes have
+        // no children, and the row above them is what there is to fold.
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let pane = app
+            .state
+            .spawn_pane(project, HarnessId::new("shell"))
+            .expect("the project exists");
+        let _ = app.state.focus(pane);
+
+        command(&mut app, 'f');
+
+        assert!(app.state.is_project_collapsed(project));
+    }
+
+    #[test]
+    fn folding_with_no_pane_focused_folds_the_selected_project() {
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+
+        command(&mut app, 'f');
+
+        assert!(app.state.is_project_collapsed(project));
     }
 
     #[test]
