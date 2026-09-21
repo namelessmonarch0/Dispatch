@@ -70,6 +70,13 @@ plus:
 A pane names its project and a project names its device, so nothing else has to
 carry one.
 
+`Project` is the type the daemon sends in `ServerMessage::ProjectOpened`, so
+its new field is marked `#[serde(skip)]`: the wire shape is byte-for-byte what
+it is today, and the client fills the device in as it adopts the project. A
+project built by hand keeps `Project::new(root, source)` and gains
+`with_device(DeviceId)`, so the only code that names a device is the code that
+knows which connection the project arrived on.
+
 **The protocol does not change in this slice.** A daemon already names itself
 in `ServerMessage::Hello { device }`; the client mints the `DeviceId`, stamps it
 on every project that connection announces, and the daemon never learns of it.
@@ -113,9 +120,11 @@ needed anyway.
 
 **Disconnection.** `Client::is_connected` per attachment sets
 `Device::reachable`. An unreachable device keeps its rows so its agents stay
-visible; a keystroke aimed at one of its panes is dropped with a status line
-naming the machine, because the alternative is typing into a void and believing
-an agent received it. The status line says which machines are out of reach, not
+visible; anything that would reach its daemon — a keystroke, a paste, a mouse
+event, a resize, a close, a spawn into one of its projects — is dropped with a
+status line naming the machine, because the alternative is typing into a void
+and believing an agent received it. Reading is unaffected: its panes keep the
+output they had, and scrollback still works. The status line says which machines are out of reach, not
 "the daemon".
 
 **Attaching to more than one.** `--attach` gains a repeatable companion,
