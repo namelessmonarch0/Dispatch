@@ -421,20 +421,26 @@ fn reported_size(cols: u16, rows: u16) -> String {
 /// for a moment and gone, and counting it measured the shell rather than the
 /// fleet.
 ///
-/// Inside the sidebar's frame, a project row opens with its twisty and then
-/// its status dot; every pane is indented two columns under one, so two
-/// leading spaces is what tells a pane row from a project row.
+/// Counted by the state glyph at the end of a row: every pane carries one and
+/// nothing else in the list does. Indentation cannot tell them apart — a
+/// project with no panes has a blank twisty, so its row starts with spaces
+/// exactly as a pane's does.
 ///
 /// The last row is the status line, which is not part of the sidebar.
 fn panes_shown(lines: &[String]) -> usize {
+    use dispatch_tui::sidebar::{CLOSED, DONE, FAILED, IDLE, RUNNING, STARTING};
+
     let width = dispatch_tui::sidebar::WIDTH as usize;
     let sidebar = lines.split_last().map_or(lines, |(_status, rest)| rest);
 
     sidebar
         .iter()
         .map(|line| line.chars().take(width).collect::<String>())
-        .map(|column| column.trim_matches('│').to_string())
-        .filter(|row| row.starts_with("  ") && !row.trim().is_empty())
+        .filter(|row| {
+            [STARTING, RUNNING, IDLE, DONE, FAILED, CLOSED]
+                .iter()
+                .any(|glyph| row.contains(glyph))
+        })
         .count()
 }
 

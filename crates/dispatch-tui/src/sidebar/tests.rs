@@ -744,7 +744,38 @@ fn a_pane_whose_harness_is_unregistered_is_marked_generically() {
 }
 
 #[test]
-fn a_project_is_marked_by_what_kind_of_directory_it_is() {
+fn a_project_folder_is_open_while_its_panes_are_shown() {
+    let (mut state, alpha, _) = state();
+    spawn(&mut state, alpha, "claude");
+
+    let buf = render(&state, WIDTH, 6);
+    assert_eq!(
+        buf.cell((LEFT + 2, TOP)).expect("cell exists").symbol(),
+        OPEN_FOLDER
+    );
+
+    state.toggle_project_collapsed(alpha);
+    let buf = render(&state, WIDTH, 6);
+    assert_eq!(
+        buf.cell((LEFT + 2, TOP)).expect("cell exists").symbol(),
+        SHUT_FOLDER
+    );
+}
+
+#[test]
+fn a_project_with_nothing_in_it_is_a_shut_folder() {
+    // There is nothing inside it to be looking at.
+    let (state, _, _) = state();
+    let buf = render(&state, WIDTH, 6);
+
+    assert_eq!(
+        buf.cell((LEFT + 2, TOP)).expect("cell exists").symbol(),
+        SHUT_FOLDER
+    );
+}
+
+#[test]
+fn a_repository_carries_a_git_mark_beside_its_folder() {
     let mut state = AppState::new();
     state.add_project(Project::new("/tmp/plain", ProjectSource::LocalDir));
     state.add_project(Project::new(
@@ -756,10 +787,31 @@ fn a_project_is_marked_by_what_kind_of_directory_it_is() {
 
     assert_eq!(
         buf.cell((LEFT + 1, TOP)).expect("cell exists").symbol(),
-        DIRECTORY
+        " ",
+        "a plain directory has no git mark"
     );
     assert_eq!(
         buf.cell((LEFT + 1, TOP + 1)).expect("cell exists").symbol(),
-        REPOSITORY
+        REPOSITORY,
+        "and a repository does"
+    );
+}
+
+#[test]
+fn the_git_mark_column_is_reserved_on_every_project_row() {
+    // Reserved rather than inserted, so a repository and a plain directory
+    // line their names up with each other.
+    let mut state = AppState::new();
+    state.add_project(Project::new("/tmp/plain", ProjectSource::LocalDir));
+    state.add_project(Project::new(
+        "/tmp/repo",
+        ProjectSource::GitRepo { remote: None },
+    ));
+
+    let lines = render_lines(&state, WIDTH, 6);
+
+    assert_eq!(
+        column_of(&lines[TOP as usize], "plain"),
+        column_of(&lines[TOP as usize + 1], "repo")
     );
 }

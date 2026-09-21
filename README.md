@@ -76,9 +76,10 @@ the view to it and folds its panes away; clicking a pane's twisty folds its
 subagents, and clicking anywhere else on a pane's row focuses it. The project
 the grid is showing is highlighted across the full width of the row.
 
-A row is marked on both sides. On the left, a project shows whether it is a git
-repository or a plain directory, and a pane shows the icon of the harness
-running in it -- the `icon` key in that harness's TOML, so a harness you
+A row is marked on both sides. On the left, a project shows a folder -- open
+while you are looking inside it, shut while its panes are folded away or it has
+none -- with a git mark beside it when its root is a repository. A pane shows
+the icon of the harness running in it -- the `icon` key in that harness's TOML, so a harness you
 register yourself can have one too. On the right, one glyph says what the pane
 is doing: starting, running, idle, exited cleanly, exited badly, or closed and
 still listed for the sake of a subagent under it.

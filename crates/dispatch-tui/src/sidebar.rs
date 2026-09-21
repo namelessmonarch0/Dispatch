@@ -24,24 +24,27 @@ const TITLE: &str = " Projects ";
 
 /// What a pane is doing, one glyph per state, drawn in the row's last column.
 ///
+/// Public because they are how a row is recognised as a pane's from outside:
+/// nothing else in the list carries one.
+///
 /// A dot beside an outcome column said the same thing twice: the dot claimed
 /// something was happening and the glyph beside it said how it had ended.
-const STARTING: &str = "\u{f252}";
+pub const STARTING: &str = "\u{f252}";
 
 /// Running.
-const RUNNING: &str = "\u{f04b}";
+pub const RUNNING: &str = "\u{f04b}";
 
 /// Waiting on its user.
-const IDLE: &str = "\u{f04c}";
+pub const IDLE: &str = "\u{f04c}";
 
 /// Exited cleanly.
-const DONE: &str = "\u{f00c}";
+pub const DONE: &str = "\u{f00c}";
 
 /// Exited with a failure.
-const FAILED: &str = "\u{f00d}";
+pub const FAILED: &str = "\u{f00d}";
 
 /// Closed, and still listed only because something under it is not.
-const CLOSED: &str = "\u{f05e}";
+pub const CLOSED: &str = "\u{f05e}";
 
 /// The twisty of a node whose children are drawn.
 ///
@@ -56,21 +59,25 @@ const SHUT: &str = "\u{f0da}";
 /// Drawn where a node has no children to hide.
 const LEAF: &str = " ";
 
-/// The mark on a project kept in a git repository.
+/// The mark beside the folder of a project kept in a git repository.
+///
+/// Its own column, blank on a project that is a plain directory, so both kinds
+/// of row line their names up with each other.
 const REPOSITORY: &str = "\u{e725}";
 
-/// The mark on a project that is a plain directory.
-const DIRECTORY: &str = "\u{f07b}";
+/// A project whose panes are listed below it.
+const OPEN_FOLDER: &str = "\u{f115}";
 
-/// How far a project's name sits from the start of its row: past its twisty,
-/// the icon saying what kind of directory it is, and a space.
-const NAME: u16 = 3;
+/// A project whose panes are folded away, or which has none.
+const SHUT_FOLDER: &str = "\u{f07b}";
 
-/// How far a pane's title sits from the start of its row.
+/// How far a row's text sits from the start of that row.
 ///
-/// One column more than a project's name: a pane spends the extra on the focus
-/// marker between its twisty and its icon.
-const PANE_TITLE: u16 = NAME + 1;
+/// The same for both kinds of row, which is what lines a project's name up
+/// with the titles beneath it. A project spends those columns on its twisty,
+/// the git mark and its folder; a pane spends them on its twisty, its focus
+/// marker and the icon of the harness running in it.
+const NAME: u16 = 4;
 
 /// Marks the focused pane's row.
 ///
@@ -127,10 +134,15 @@ impl<'a> Sidebar<'a> {
     }
 }
 
-/// The mark for a project, by what kind of directory it is.
-fn project_icon(source: &ProjectSource) -> &'static str {
+/// The mark for a project's folder, by whether you are looking inside it.
+fn folder_icon(open: bool) -> &'static str {
+    if open { OPEN_FOLDER } else { SHUT_FOLDER }
+}
+
+/// The mark beside that folder, by what kind of directory it is.
+fn source_icon(source: &ProjectSource) -> &'static str {
     match source {
-        ProjectSource::LocalDir => DIRECTORY,
+        ProjectSource::LocalDir => " ",
         ProjectSource::GitRepo { .. } => REPOSITORY,
     }
 }
@@ -380,16 +392,21 @@ impl Sidebar<'_> {
             write(buf, area, area.x, y, &blanks, style);
         }
 
-        let twisty = twisty(has_panes, self.state.is_project_collapsed(id));
-        write(buf, area, area.x, y, twisty, style);
+        // Open only when there is something inside to be looking at: a folder
+        // standing open on a project with no panes promises nothing.
+        let collapsed = self.state.is_project_collapsed(id);
+        let open = has_panes && !collapsed;
+
+        write(buf, area, area.x, y, twisty(has_panes, collapsed), style);
         write(
             buf,
             area,
             area.x + 1,
             y,
-            project_icon(&project.source),
+            source_icon(&project.source),
             style,
         );
+        write(buf, area, area.x + 2, y, folder_icon(open), style);
 
         let name_x = area.x + NAME;
         let room = (area.x + area.width).saturating_sub(name_x) as usize;
@@ -433,7 +450,7 @@ impl Sidebar<'_> {
         let (glyph, glyph_style) = state_glyph(pane);
         let state_x = (area.x + area.width).saturating_sub(1);
 
-        let title_x = area.x + indent + PANE_TITLE;
+        let title_x = area.x + indent + NAME;
         let room = state_x.saturating_sub(title_x + 1) as usize;
         write(buf, area, title_x, y, &truncate(&pane.title, room), style);
 
