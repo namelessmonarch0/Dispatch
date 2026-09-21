@@ -96,6 +96,27 @@ struct PendingRequest {
     depth: u8,
 }
 
+/// A title with the agent's own mark taken off the front.
+///
+/// Agents announce themselves with one: Claude Code's terminal title is
+/// "✳ Claude Code". The sidebar draws the harness's icon beside the row
+/// already, so the mark in the title is the same fact twice — and two marks in
+/// a row of four rows reads as a broken glyph rather than as a name.
+///
+/// Only symbols are taken: a title that opens with a letter, a digit or a path
+/// is whatever the agent meant it to be.
+fn strip_mark(title: &str) -> &str {
+    title
+        .trim_start_matches(|c: char| {
+            matches!(c,
+                '\u{2190}'..='\u{2bff}'      // arrows, dingbats, geometric shapes
+                | '\u{e000}'..='\u{f8ff}'    // private use: every Nerd Font glyph
+                | '\u{1f300}'..='\u{1faff}'  // emoji
+            )
+        })
+        .trim()
+}
+
 /// Frame budget. A chatty agent can produce output faster than any terminal
 /// can draw it, so redraws are coalesced rather than done per byte.
 const FRAME: Duration = Duration::from_millis(16);
@@ -338,6 +359,45 @@ impl App {
             #[cfg(test)]
             sent: Vec::new(),
         }
+    }
+
+    /// Records a title an agent set for one of its panes.
+    ///
+    /// Every title an agent announces arrives here, local or remote, because
+    /// the two things worth fixing about one are the same on both sides: an
+    /// agent that prefixes its own mark, and an agent that names its terminal
+    /// after the directory it is working in.
+    fn rename(&mut self, id: PaneId, title: &str) {
+        let title = strip_mark(title);
+
+        // Codex titles its terminal after the working directory, so its row
+        // said what the project row above it already said. The harness's own
+        // name is what tells one row from the next.
+        let repeats_the_project = self
+            .state
+            .pane(id)
+            .and_then(|pane| {
+                self.state
+                    .projects()
+                    .iter()
+                    .find(|project| project.id == pane.project)
+            })
+            .is_some_and(|project| project.name == title);
+
+        if !title.is_empty() && !repeats_the_project {
+            let _ = self.state.set_pane_title(id, title);
+            return;
+        }
+
+        let Some(harness) = self.state.pane(id).map(|pane| pane.harness.clone()) else {
+            return;
+        };
+        let name = self.harnesses.get(harness.as_str()).map_or_else(
+            || harness.as_str().to_string(),
+            |def| def.display_name.clone(),
+        );
+
+        let _ = self.state.set_pane_title(id, name);
     }
 
     /// Keeps the list of opened projects in `dir`, so it outlives the process.
@@ -607,7 +667,7 @@ impl App {
                 // it.
                 let title = target.titles.scan(&bytes);
                 if let Some(title) = title {
-                    let _ = self.state.set_pane_title(pane, &title);
+                    self.rename(pane, &title);
                 }
 
                 true
@@ -624,7 +684,10 @@ impl App {
 
                     self.state.set_pane_status(pane, status).is_ok()
                 }
-                PaneUpdate::Title { title } => self.state.set_pane_title(pane, &title).is_ok(),
+                PaneUpdate::Title { title } => {
+                    self.rename(pane, &title);
+                    true
+                }
                 // A newer daemon's update this build has no name for. The
                 // protocol's promise is that it lands somewhere ignorable
                 // rather than failing the frame and taking the connection with
@@ -824,7 +887,7 @@ impl App {
         }
 
         for (id, title) in renamed {
-            let _ = self.state.set_pane_title(id, &title);
+            self.rename(id, &title);
         }
 
         for (id, code) in exited {
@@ -2455,6 +2518,79 @@ mod tests {
         assert!(
             rendered_text(&terminal).contains('\u{f0e7}'),
             "the harness icon reaches the sidebar"
+        );
+    }
+
+    /// An app with one project and one pane of `harness`, named `display`.
+    fn app_with_a_pane(root: &str, harness: &str, display: &str) -> (App, PaneId) {
+        let def = dispatch_config::HarnessDef {
+            id: harness.to_string(),
+            display_name: display.to_string(),
+            ..dispatch_config::HarnessDef::default()
+        };
+        let mut app = App::new([def].into_iter().collect());
+
+        let project = app
+            .state
+            .add_project(Project::new(root, ProjectSource::LocalDir));
+        let pane = app
+            .state
+            .spawn_pane(project, HarnessId::new(harness))
+            .expect("the project exists");
+
+        (app, pane)
+    }
+
+    #[test]
+    fn an_agents_own_mark_is_stripped_from_the_title_it_sets() {
+        // Claude Code announces itself as "✳ Claude Code". The sidebar draws
+        // the harness icon beside the row already, so the row showed two marks
+        // for one agent.
+        let (mut app, pane) = app_with_a_pane("/tmp/one", "claude", "Claude Code");
+
+        app.rename(pane, "✳ Claude Code");
+
+        assert_eq!(
+            app.state.pane(pane).map(|p| p.title.as_str()),
+            Some("Claude Code")
+        );
+    }
+
+    #[test]
+    fn a_title_that_only_repeats_the_project_names_the_harness_instead() {
+        // Codex titles its terminal after the working directory, so every one
+        // of its panes was called the same thing as the project above it.
+        let (mut app, pane) = app_with_a_pane("/tmp/Dispatch", "codex", "Codex");
+
+        app.rename(pane, "Dispatch");
+
+        assert_eq!(
+            app.state.pane(pane).map(|p| p.title.as_str()),
+            Some("Codex")
+        );
+    }
+
+    #[test]
+    fn a_title_an_agent_actually_chose_is_left_alone() {
+        let (mut app, pane) = app_with_a_pane("/tmp/one", "claude", "Claude Code");
+
+        app.rename(pane, "fixing the sidebar");
+
+        assert_eq!(
+            app.state.pane(pane).map(|p| p.title.as_str()),
+            Some("fixing the sidebar")
+        );
+    }
+
+    #[test]
+    fn a_title_with_nothing_left_in_it_names_the_harness() {
+        let (mut app, pane) = app_with_a_pane("/tmp/one", "claude", "Claude Code");
+
+        app.rename(pane, "✳ ");
+
+        assert_eq!(
+            app.state.pane(pane).map(|p| p.title.as_str()),
+            Some("Claude Code")
         );
     }
 
