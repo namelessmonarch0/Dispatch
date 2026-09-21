@@ -20,6 +20,7 @@ use dispatch_pty::{
 
 use crate::approval::Approval;
 use crate::backend::{Backend, RemotePane};
+use dispatch_tui::browser::Browser;
 use dispatch_tui::input::{
     Action, Direction, Event, InputRouter, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseEventKind,
@@ -204,6 +205,8 @@ enum Overlay {
     Project(Picker),
     /// A harness to register, found on PATH.
     Register(Picker),
+    /// A directory to open as a project.
+    Browse(Browser),
     /// A delegation request, shown from the front of `App::pending`.
     Approval {
         /// First line of the task text on screen, for a long one.
@@ -218,7 +221,7 @@ impl Overlay {
             Overlay::Harness(picker) | Overlay::Project(picker) | Overlay::Register(picker) => {
                 Some(picker)
             }
-            Overlay::Approval { .. } => None,
+            Overlay::Browse(_) | Overlay::Approval { .. } => None,
         }
     }
 
@@ -228,7 +231,7 @@ impl Overlay {
             Overlay::Harness(picker) | Overlay::Project(picker) | Overlay::Register(picker) => {
                 Some(picker)
             }
-            Overlay::Approval { .. } => None,
+            Overlay::Browse(_) | Overlay::Approval { .. } => None,
         }
     }
 
@@ -239,7 +242,7 @@ impl Overlay {
             Overlay::Harness(_) => Some(OverlayKind::Harness),
             Overlay::Project(_) => Some(OverlayKind::Project),
             Overlay::Register(_) => Some(OverlayKind::Register),
-            Overlay::Approval { .. } => None,
+            Overlay::Browse(_) | Overlay::Approval { .. } => None,
         }
     }
 }
@@ -263,11 +266,18 @@ pub struct App {
     generation: u64,
     /// The project roots this client asked for, so a reconnection can ask again.
     opened: Vec<PathBuf>,
+    /// Where the directory browser starts, when it has not been opened yet.
+    ///
+    /// The working directory Dispatch was started in, which is the directory
+    /// the user is already thinking about.
+    browse_from: PathBuf,
     /// Where the kept-projects file lives, when this client keeps one.
     ///
     /// `None` in a test, and in any client told to keep nothing: the list is a
     /// convenience, and a client that cannot write it still runs.
     kept: Option<PathBuf>,
+    /// The browser as it was last closed, so reopening it lands where it was.
+    browser: Option<Browser>,
     overlay: Option<Overlay>,
     state: AppState,
     panes: HashMap<PaneId, Pane>,
@@ -341,7 +351,9 @@ impl App {
             mode,
             generation,
             opened: Vec::new(),
+            browse_from: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             kept: None,
+            browser: None,
             overlay: None,
             state: AppState::new(),
             panes: HashMap::new(),
@@ -422,6 +434,12 @@ impl App {
         );
 
         let _ = self.state.set_pane_title(id, name);
+    }
+
+    /// Starts the directory browser at `dir` rather than the working
+    /// directory.
+    pub fn browse_from(&mut self, dir: impl Into<PathBuf>) {
+        self.browse_from = dir.into();
     }
 
     /// Keeps the list of opened projects in `dir`, so it outlives the process.
@@ -995,7 +1013,7 @@ impl App {
             Action::Scrollback => self.scroll_focused(-10),
             Action::Approvals => self.open_next_approval(),
             Action::ToggleFold => self.toggle_fold(),
-            Action::OpenProject => {}
+            Action::OpenProject => self.open_browser(),
             Action::ExpandChild => self.expand_child(),
             Action::CollapseChild => self.collapse_child(),
         }
@@ -1125,6 +1143,14 @@ impl App {
             return Ok(());
         }
 
+        // The browser takes every plain key: what is typed is a filter, and a
+        // filter that reached the focused pane would be running commands in
+        // an agent.
+        if matches!(self.overlay, Some(Overlay::Browse(_))) {
+            self.handle_browser_key(key);
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.overlay = None;
@@ -1168,6 +1194,56 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Acts on one key while the directory browser is open.
+    ///
+    /// Plain letters are the filter, so every command here is an arrow, Enter,
+    /// Tab, Escape or a Ctrl chord — there are no letters left to spend.
+    fn handle_browser_key(&mut self, key: &KeyEvent) {
+        let Some(Overlay::Browse(browser)) = &mut self.overlay else {
+            return;
+        };
+
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        match key.code {
+            KeyCode::Esc => self.overlay = None,
+            KeyCode::Down => browser.next(),
+            KeyCode::Up => browser.previous(),
+            KeyCode::Right => browser.descend(),
+            KeyCode::Left => browser.ascend(),
+            // Completing a typed path, or walking into the highlighted
+            // directory: the same "finish what I started" key either way.
+            KeyCode::Tab => {
+                if browser.is_path() {
+                    browser.complete();
+                } else {
+                    browser.descend();
+                }
+            }
+            KeyCode::Backspace => browser.backspace(),
+            KeyCode::Char('g') if ctrl => browser.toggle_scan(),
+            KeyCode::Enter => {
+                // A typed path names the project directly; otherwise it is the
+                // row the user is sitting on.
+                let chosen = if browser.is_path() {
+                    let typed = browser.typed_dir();
+                    if typed.is_none() {
+                        self.status = format!("no such directory: {}", browser.input());
+                    }
+                    typed
+                } else {
+                    browser.selected().map(|entry| entry.path.clone())
+                };
+
+                if let Some(root) = chosen {
+                    self.open_browsed(root);
+                }
+            }
+            KeyCode::Char(c) if !ctrl => browser.push(c),
+            _ => {}
+        }
     }
 
     /// Modifiers that disqualify a key from being an approval action.
@@ -1439,6 +1515,43 @@ impl App {
         }
 
         self.open_project_picker();
+    }
+
+    /// Opens the directory browser.
+    ///
+    /// Picks up where it was left: walking back to the same directory every
+    /// time is the tax on adding a second project from the same tree.
+    fn open_browser(&mut self) {
+        let browser = match self.browser.take() {
+            Some(browser) => browser,
+            None => Browser::new(&self.browse_from),
+        };
+
+        self.overlay = Some(Overlay::Browse(browser));
+    }
+
+    /// Opens `root` as a project, from the browser.
+    fn open_browsed(&mut self, root: PathBuf) {
+        self.add_project(root.clone());
+
+        // Attached, the project arrives when the daemon answers, so there is
+        // nothing to select here yet.
+        if let Some(project) = self
+            .state
+            .projects()
+            .iter()
+            .find(|project| project.root == root)
+            .map(|project| project.id)
+        {
+            let _ = self.state.select_project(project);
+        }
+
+        self.status = format!("opened {}", root.display());
+
+        if let Some(Overlay::Browse(browser)) = self.overlay.take() {
+            // Kept for the next `^a o`, which is usually in the same tree.
+            self.browser = Some(browser);
+        }
     }
 
     fn open_project_picker(&mut self) {
@@ -1721,6 +1834,11 @@ impl App {
 
         if let Some(picker) = overlay.picker() {
             frame.render_widget(picker, panes_area);
+            return;
+        }
+
+        if let Overlay::Browse(browser) = overlay {
+            frame.render_widget(browser, panes_area);
             return;
         }
 
@@ -2647,6 +2765,180 @@ mod tests {
         )
         .expect("a keystroke is handled");
         press(app, KeyCode::Char(key));
+    }
+
+    /// A directory holding `dirs`, cleaned up when the test ends.
+    struct Tree(PathBuf);
+
+    impl Tree {
+        fn new(label: &str, dirs: &[&str]) -> Self {
+            let root = scratch(label);
+            for dir in dirs {
+                std::fs::create_dir_all(root.join(dir)).expect("temp dir is writable");
+            }
+            Self(root)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn the_browser_opens_on_a_directory_and_closes_on_escape() {
+        let tree = Tree::new("browse-escape", &["alpha"]);
+        let mut app = App::new(HarnessRegistry::default());
+        app.browse_from(tree.path());
+
+        command(&mut app, 'o');
+        assert!(
+            matches!(app.overlay, Some(Overlay::Browse(_))),
+            "the browser is open"
+        );
+
+        press(&mut app, KeyCode::Esc);
+        assert!(app.overlay.is_none(), "and escape closes it");
+    }
+
+    #[test]
+    fn choosing_a_directory_in_the_browser_opens_it_as_a_project() {
+        let dir = scratch("browse-open-kept");
+        let tree = Tree::new("browse-open", &["alpha"]);
+        let mut app = App::new(HarnessRegistry::default());
+        app.keep_projects_in(&dir);
+        app.browse_from(tree.path());
+
+        command(&mut app, 'o');
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.state
+                .projects()
+                .iter()
+                .map(|p| p.root.clone())
+                .collect::<Vec<_>>(),
+            [tree.path().join("alpha")],
+            "the directory is a project now"
+        );
+        assert_eq!(
+            dispatch_config::projects::load(&dir).expect("it reads back"),
+            [tree.path().join("alpha")],
+            "and it is kept like any other"
+        );
+        assert!(app.overlay.is_none(), "the browser is done");
+    }
+
+    #[test]
+    fn the_open_browser_is_drawn_over_the_grid() {
+        let tree = Tree::new("browse-drawn", &["alpha"]);
+        let mut app = App::new(HarnessRegistry::default());
+        app.state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        app.browse_from(tree.path());
+
+        command(&mut app, 'o');
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+
+        let text = rendered_text(&terminal);
+        assert!(text.contains("Open project"), "{text}");
+        assert!(text.contains("alpha"), "{text}");
+    }
+
+    #[test]
+    fn typing_in_the_browser_filters_rather_than_reaching_a_pane() {
+        // Every plain letter belongs to the browser while it is open, or a
+        // filter would run commands in whatever pane was focused.
+        let tree = Tree::new("browse-filter", &["alpha", "beta"]);
+        let mut app = App::new(HarnessRegistry::default());
+        app.browse_from(tree.path());
+
+        command(&mut app, 'o');
+        press(&mut app, KeyCode::Char('b'));
+
+        let Some(Overlay::Browse(browser)) = &app.overlay else {
+            panic!("the browser is open");
+        };
+        assert_eq!(browser.input(), "b");
+        assert_eq!(
+            browser.selected().map(|entry| entry.label.clone()),
+            Some("beta".into())
+        );
+    }
+
+    #[test]
+    fn the_browser_walks_into_a_directory_and_back_out() {
+        let tree = Tree::new("browse-walk", &["outer/inner"]);
+        let mut app = App::new(HarnessRegistry::default());
+        app.browse_from(tree.path());
+
+        command(&mut app, 'o');
+        press(&mut app, KeyCode::Right);
+
+        let Some(Overlay::Browse(browser)) = &app.overlay else {
+            panic!("the browser is open");
+        };
+        assert_eq!(browser.dir(), tree.path().join("outer"));
+
+        press(&mut app, KeyCode::Left);
+        let Some(Overlay::Browse(browser)) = &app.overlay else {
+            panic!("the browser is open");
+        };
+        assert_eq!(browser.dir(), tree.path());
+    }
+
+    #[test]
+    fn a_typed_path_opens_that_directory_as_the_project() {
+        let dir = scratch("browse-typed-kept");
+        let tree = Tree::new("browse-typed", &["outer/inner"]);
+        let mut app = App::new(HarnessRegistry::default());
+        app.keep_projects_in(&dir);
+        app.browse_from(tree.path());
+
+        command(&mut app, 'o');
+        for c in tree.path().join("outer").display().to_string().chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.state
+                .projects()
+                .iter()
+                .map(|p| p.root.clone())
+                .collect::<Vec<_>>(),
+            [tree.path().join("outer")]
+        );
+    }
+
+    #[test]
+    fn a_typed_path_that_is_not_there_says_so_and_stays_open() {
+        let tree = Tree::new("browse-typed-bad", &["alpha"]);
+        let mut app = App::new(HarnessRegistry::default());
+        app.browse_from(tree.path());
+
+        command(&mut app, 'o');
+        for c in "/nowhere/at/all".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert!(app.state.projects().is_empty());
+        assert!(
+            matches!(app.overlay, Some(Overlay::Browse(_))),
+            "the browser stays open to fix the path"
+        );
+        assert!(app.status.contains("no such directory"), "{:?}", app.status);
     }
 
     #[test]

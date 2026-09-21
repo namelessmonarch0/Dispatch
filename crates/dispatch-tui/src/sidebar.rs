@@ -63,13 +63,13 @@ const LEAF: &str = " ";
 ///
 /// Its own column, blank on a project that is a plain directory, so both kinds
 /// of row line their names up with each other.
-const REPOSITORY: &str = "\u{e725}";
+pub const REPOSITORY: &str = "\u{e725}";
 
 /// A project whose panes are listed below it.
-const OPEN_FOLDER: &str = "\u{f115}";
+pub const OPEN_FOLDER: &str = "\u{f115}";
 
 /// A project whose panes are folded away, or which has none.
-const SHUT_FOLDER: &str = "\u{f07b}";
+pub const SHUT_FOLDER: &str = "\u{f07b}";
 
 /// How far a row's text sits from the start of that row.
 ///

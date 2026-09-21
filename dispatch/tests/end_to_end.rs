@@ -600,6 +600,30 @@ fn a_project_opened_once_is_listed_on_the_next_start() {
 
 #[test]
 #[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn the_browser_opens_beside_the_project_dispatch_was_started_in() {
+    // A second project usually lives next to the first, so that is where
+    // browsing starts rather than at whatever directory the shell was in.
+    let fixture = Fixture::new("browse");
+    // Both under a tree of their own, so the working directory Dispatch was
+    // started in -- the config directory -- does not list the sibling.
+    let tree = fixture.config.path().join("tree");
+    let project = tree.join("opened");
+    std::fs::create_dir_all(tree.join("sibling")).expect("temp dir is writable");
+    std::fs::create_dir_all(&project).expect("temp dir is writable");
+
+    let mut app = Harness::spawn_in(&fixture, &project, Size::new(100, 30));
+    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+
+    app.send(b"\x01o");
+
+    assert!(
+        app.wait_for(|lines| contains(lines, "Open project") && contains(lines, "sibling")),
+        "the browser lists the project's neighbours"
+    );
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
 fn quitting_restores_the_terminal() {
     // A Dispatch that exits without restoring leaves the user with a shell
     // that does not echo.

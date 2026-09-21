@@ -73,7 +73,9 @@ what it printed — `^a x` is what removes it for good.
 The project list is framed on the left. It is a tree: each project carries a
 twisty, and so does any pane running subagents. Clicking a project's row moves
 the view to it and folds its panes away; clicking a pane's twisty folds its
-subagents, and clicking anywhere else on a pane's row focuses it. The project
+subagents, and clicking anywhere else on a pane's row focuses it. `^a f` folds
+from the keyboard, for a terminal with no mouse reporting: the focused pane's
+subagents, or the project above it when that pane has none. The project
 the grid is showing is highlighted across the full width of the row.
 
 A row is marked on both sides. On the left, a project shows a folder -- open
@@ -93,6 +95,13 @@ The sidebar is the list of projects you keep, not the one directory Dispatch
 was started in. Opening Dispatch in a directory adds it to that list, and it is
 there on every later start, whichever directory you started in. The list lives
 in `projects.toml` beside the rest of the configuration.
+
+`^a o` opens a directory browser: arrows walk it, `→` steps into a directory
+and `←` back out, typing filters the listing, and a typed path with a `/` in it
+is read as a path instead -- Tab completes it. `^g` lists every git repository
+under the current directory, three levels deep, so a directory of checkouts
+answers in one keystroke. `Enter` opens what is highlighted, or the path you
+typed, as a project.
 
 `^a p` opens the list; `d` on a row drops that project for good. A project with
 panes is not dropped -- close them first, or its agents would carry on running

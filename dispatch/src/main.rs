@@ -164,6 +164,13 @@ fn main() -> Result<ExitCode> {
     // Set before the projects are added, so opening one is what keeps it.
     app.keep_projects_in(&config_dir);
 
+    // Browsing starts next to the project Dispatch was pointed at: a second
+    // project usually lives beside the first, not in whatever directory the
+    // shell happened to be in.
+    if let Some(parent) = roots.last().and_then(|root| root.parent()) {
+        app.browse_from(parent);
+    }
+
     for root in roots {
         app.add_project(root);
     }
