@@ -584,3 +584,34 @@ fn a_built_in_without_an_icon_still_gets_its_own() {
 
     assert_eq!(def.icon(), shipped.icon());
 }
+
+#[test]
+fn each_built_in_wears_the_mark_its_agent_is_known_by() {
+    // Pinned by codepoint: these are the glyphs the user picked out of their
+    // Nerd Font, and a silent change to one is a row that stops being
+    // recognisable at a glance.
+    let expected = [
+        ("claude", '\u{ec82}'),
+        ("codex", '\u{ec81}'),
+        ("agy", '\u{e7f0}'),
+        ("opencode", '\u{f121}'),
+    ];
+
+    for (id, glyph) in expected {
+        let built_in = defaults::BUILT_INS
+            .iter()
+            .find(|b| b.id == id)
+            .unwrap_or_else(|| panic!("{id} ships"));
+        let def: HarnessDef = toml::from_str(built_in.toml).expect("built-ins parse");
+
+        assert_eq!(def.icon(), glyph.to_string(), "{id}'s icon in its file");
+
+        // And the same mark for an installation made before icons existed,
+        // whose file has no `icon` key to read.
+        let bare: HarnessDef = toml::from_str(&format!(
+            "id = \"{id}\"\ndisplay_name = \"x\"\ncommand = \"x\""
+        ))
+        .expect("it parses");
+        assert_eq!(bare.icon(), glyph.to_string(), "{id}'s fallback");
+    }
+}

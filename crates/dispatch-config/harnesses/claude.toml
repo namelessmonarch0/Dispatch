@@ -1,5 +1,5 @@
 id = "claude"
-icon = ""
+icon = ""
 display_name = "Claude Code"
 command = "claude"
 args = []

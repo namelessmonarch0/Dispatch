@@ -1,5 +1,5 @@
 id = "codex"
-icon = ""
+icon = ""
 display_name = "Codex"
 command = "codex"
 args = []

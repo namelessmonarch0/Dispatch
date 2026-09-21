@@ -102,9 +102,9 @@ pub const DEFAULT_ICON: &str = "\u{f120}";
 /// The mark a harness Dispatch ships is drawn with, by id.
 fn built_in_icon(id: &str) -> Option<&'static str> {
     match id {
-        "claude" => Some("\u{f069}"),
-        "codex" => Some("\u{f544}"),
-        "agy" => Some("\u{f135}"),
+        "claude" => Some("\u{ec82}"),
+        "codex" => Some("\u{ec81}"),
+        "agy" => Some("\u{e7f0}"),
         "opencode" => Some("\u{f121}"),
         _ => None,
     }
