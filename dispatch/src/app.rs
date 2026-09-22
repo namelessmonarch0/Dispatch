@@ -520,8 +520,10 @@ impl App {
     ///
     /// A focused pane with subagents folds those; a pane with none folds the
     /// project above it, which is the common case and would otherwise leave
-    /// the key doing nothing. With no pane focused there is only the selected
-    /// project to fold.
+    /// the key doing nothing. Past that, the project's machine — reached only
+    /// once the project itself is already folded, so the key climbs the tree
+    /// one rung at a time rather than skipping straight to the top. With no
+    /// pane focused there is only the selected project to fold.
     fn toggle_fold(&mut self) {
         if let Some(pane) = self.state.focused_pane() {
             if !self.state.children_of(pane).is_empty() {
@@ -530,8 +532,24 @@ impl App {
             }
 
             if let Some(project) = self.state.pane(pane).map(|pane| pane.project) {
-                self.state.toggle_project_collapsed(project);
-                return;
+                // The ladder: a pane's subagents, then its project, then the
+                // machine that project is on. Each rung is reached by folding
+                // the one below it first.
+                if !self.state.is_project_collapsed(project) {
+                    self.state.toggle_project_collapsed(project);
+                    return;
+                }
+
+                if let Some(device) = self
+                    .state
+                    .projects()
+                    .iter()
+                    .find(|candidate| candidate.id == project)
+                    .map(|candidate| candidate.device)
+                {
+                    self.state.toggle_device_collapsed(device);
+                    return;
+                }
             }
         }
 
@@ -2429,10 +2447,13 @@ impl App {
             && !matches!(self.overlay, Some(Overlay::Approval { .. })))
         .then(|| format!("{} delegation(s) waiting — ^a a", self.pending.len()));
 
-        // Asked now, not remembered: a connection can come back on another
-        // thread at any moment, and a notice that outlives the disconnection
-        // says the agents are unreachable when they are not. Named, because on
-        // a fleet "the daemon" says nothing about which machine went.
+        // Read from the `Device.reachable` `sync_attachment` stamps each poll,
+        // not asked live: this runs every frame, and re-checking the
+        // connection here would mean answering the same question twice — the
+        // sidebar and the refusal path already read this same field, and
+        // disagreeing with them is worse than being a tick stale. Named,
+        // because on a fleet "the daemon" says nothing about which machine
+        // went.
         let unreachable: Vec<String> = self
             .state
             .devices()
@@ -3352,6 +3373,30 @@ mod tests {
         command(&mut app, 'f');
 
         assert!(app.state.is_project_collapsed(project));
+    }
+
+    #[test]
+    fn folding_past_a_folded_project_folds_its_machine() {
+        // The ladder: subagents, then the project, then the machine it is on.
+        let mut app = App::new(HarnessRegistry::default());
+        let device = app.state.add_device(Device::new("laptop"));
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir).with_device(device));
+        let pane = app
+            .state
+            .spawn_pane(project, HarnessId::new("shell"))
+            .expect("the project exists");
+        let _ = app.state.focus(pane);
+
+        command(&mut app, 'f');
+        assert!(app.state.is_project_collapsed(project));
+
+        command(&mut app, 'f');
+        assert!(
+            app.state.is_device_collapsed(device),
+            "and then the machine"
+        );
     }
 
     #[test]

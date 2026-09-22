@@ -110,6 +110,17 @@ too, since it is the daemon that hands a client its projects on every connect.
 
 Nothing scans your disk, and nothing is kept that you did not open.
 
+## More than one machine
+
+Each machine runs its own `dispatchd`, and one client can hold several of them:
+`--daemon <endpoint>`, repeatable, attaches to another alongside the usual one.
+Every project is drawn under the machine it is on, and a machine whose daemon
+goes down keeps its rows -- dimmed and labelled `unreachable` -- because its
+agents are still running. Keystrokes aimed at an unreachable machine are
+refused rather than swallowed.
+
+Reaching a machine over SSH, and `dispatch machine add`, are the next slice.
+
 ## Running the daemon
 
 Dispatch works on its own, with the agents as its children. Started that way,

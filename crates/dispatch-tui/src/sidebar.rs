@@ -1,8 +1,9 @@
 //! The project sidebar.
 //!
-//! Lists projects and, under each, its panes. The status column on the left of
-//! every project is reserved for the federation slice, which lights it green
-//! or red per device; in Slice 1 every project is local and the dot is dim.
+//! A tree: machines, the projects on each, and the panes in each project with
+//! their subagents beneath them. The machine level is drawn only when there is
+//! more than one, because a lone row naming this machine costs a line and
+//! indents everything under it to say what the user already knows.
 
 use dispatch_config::HarnessRegistry;
 use dispatch_config::harness::DEFAULT_ICON;
