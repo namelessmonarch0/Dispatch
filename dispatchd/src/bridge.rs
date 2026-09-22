@@ -50,7 +50,15 @@ fn pump(mut reader: impl Read, mut writer: impl Write) {
     let mut buf = [0u8; 8192];
     loop {
         let read = match reader.read(&mut buf) {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return,
+            // A signal caught mid-syscall, not the other side closing: the
+            // pump's whole job is to keep carrying bytes until a side
+            // actually ends the stream, and `std::io::copy` -- what this
+            // loop replaced -- retried here too. Treating it as EOF would
+            // tear down the pump, and with it the whole bridge, on a stray
+            // EINTR.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
             Ok(read) => read,
         };
         if writer.write_all(&buf[..read]).is_err() || writer.flush().is_err() {
