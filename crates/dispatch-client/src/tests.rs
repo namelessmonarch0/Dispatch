@@ -219,7 +219,7 @@ fn serve_one(
 
             let handler = std::thread::spawn(move || {
                 let (mut reader, writer) = connection.split();
-                let mut writer: Writer = Box::new(writer);
+                let mut writer: Writer = writer;
 
                 let Ok(hello) = Frame::read::<_, ClientMessage>(&mut reader) else {
                     return;

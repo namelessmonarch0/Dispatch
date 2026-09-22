@@ -457,7 +457,7 @@ fn connect(name: &str, role: Role, endpoint: &Path) -> Result<Connected, ClientE
         Err(error) => return Err(ClientError::Handshake(error.to_string())),
     };
 
-    Ok((Box::new(reader), Box::new(writer), device))
+    Ok((reader, writer, device))
 }
 
 /// Moves messages from the socket into the queue, until the socket ends.

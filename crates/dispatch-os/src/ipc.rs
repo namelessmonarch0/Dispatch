@@ -55,12 +55,18 @@ pub fn endpoint() -> Result<PathBuf, IpcError> {
 
 /// A connected client or server end.
 ///
-/// Two transport connections, one per direction, paired by [`pairing`]. They
-/// are separate so that a thread parked reading cannot hold up a thread
-/// writing -- which one connection cannot promise on Windows.
+/// Two transport connections, one per direction, paired by [`pairing`] when
+/// the transport is a socket. They are separate so that a thread parked
+/// reading cannot hold up a thread writing -- which one connection cannot
+/// promise on Windows.
+///
+/// Boxed rather than naming `imp::Stream`: a later transport builds a
+/// connection from a child process's stdout and stdin, which are a different
+/// concrete type on every platform this already varies by, and the two must
+/// still fit in one field each.
 pub struct Connection {
-    reader: imp::Stream,
-    writer: imp::Stream,
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -82,14 +88,30 @@ impl Connection {
     /// daemon than the one its panes are on.
     pub fn connect_to(endpoint: &std::path::Path) -> Result<Self, IpcError> {
         let (reader, writer) = pairing::dial(|| imp::connect(endpoint))?;
-        Ok(Self { reader, writer })
+        Ok(Self {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+        })
+    }
+
+    /// A connection over halves the caller already holds.
+    ///
+    /// The pairing dance that [`Self::connect_to`] runs exists to turn one
+    /// dialable address into two one-way streams, which is what Windows needs
+    /// and what a child process's pipes already are. A caller holding both
+    /// halves has nothing left to pair.
+    #[must_use]
+    pub fn from_halves(reader: Box<dyn Read + Send>, writer: Box<dyn Write + Send>) -> Self {
+        Self { reader, writer }
     }
 
     /// Splits into a reader and a writer.
     ///
     /// The loop reads on one thread and writes from another, so neither
-    /// blocks the other.
-    pub fn split(self) -> (impl Read + Send, impl Write + Send) {
+    /// blocks the other. Boxed rather than `impl Trait`: a connection's
+    /// transport is chosen at runtime, and the type cannot be named at the
+    /// boundary.
+    pub fn split(self) -> (Box<dyn Read + Send>, Box<dyn Write + Send>) {
         (self.reader, self.writer)
     }
 }
@@ -176,7 +198,10 @@ impl Listener {
                 .offer(token, role, stream);
 
             if let Some((reader, writer)) = paired {
-                return Ok(Connection { reader, writer });
+                return Ok(Connection {
+                    reader: Box::new(reader),
+                    writer: Box::new(writer),
+                });
             }
         }
     }
@@ -810,6 +835,30 @@ mod tests {
             .mode();
 
         assert_eq!(mode & 0o077, 0, "group and others must have no access");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_connection_can_be_built_from_halves_the_caller_already_has() {
+        // Federation's transports are not all sockets: one of them is a child
+        // process's two pipes. A connection has to be assemblable from
+        // whatever the caller has.
+        use std::os::unix::net::UnixStream;
+
+        let (mine, theirs) = UnixStream::pair().expect("a socket pair");
+        let reader = theirs.try_clone().expect("a reader half");
+
+        let connection = Connection::from_halves(Box::new(reader), Box::new(mine));
+        let (mut reader, mut writer) = connection.split();
+
+        writer.write_all(b"ping").expect("writing succeeds");
+        writer.flush().expect("flushing succeeds");
+
+        let mut buf = [0u8; 4];
+        reader.read_exact(&mut buf).expect("reading succeeds");
+        assert_eq!(&buf, b"ping");
+
+        drop(theirs);
     }
 
     #[test]
