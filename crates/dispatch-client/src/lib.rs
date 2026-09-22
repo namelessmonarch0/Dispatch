@@ -207,6 +207,18 @@ impl Handle {
     pub fn is_connected(&self) -> bool {
         self.wire.connected.load(Ordering::Relaxed)
     }
+
+    /// Counts a reconnection that no socket performed.
+    ///
+    /// The companion to [`Client::for_test`]: a real reconnection is a
+    /// supervisor thread and a daemon restarting, so what an interface *does*
+    /// with one — rebuilding that machine's rows, asking again for its roots —
+    /// is otherwise only reachable by standing a real daemon up around it and
+    /// killing it.
+    #[doc(hidden)]
+    pub fn reconnect_for_test(&self) {
+        self.wire.generation.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// An attached daemon connection.

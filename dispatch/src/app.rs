@@ -405,8 +405,12 @@ impl App {
     pub fn attach(&mut self, client: Client) {
         // The agents are no longer this process's to run, so the machine it
         // was standing in for goes with them: from here on what is on screen
-        // belongs to a daemon.
+        // belongs to a daemon. Through `forget_device` rather than
+        // `AppState::remove_device` alone, because this client is holding the
+        // children it started — dropping only the rows would leave a shell
+        // running with no row, no reader and nobody left to stop it.
         if let Some(local) = self.local.take() {
+            self.forget_device(local);
             self.state.remove_device(local);
         }
 
@@ -621,13 +625,22 @@ impl App {
             ProjectSource::LocalDir
         };
 
-        // Stamped with this machine, like any other project: a project whose
-        // device is registered nowhere has no row to be drawn under.
-        let project = match self.local {
-            Some(device) => Project::new(root, source).with_device(device),
-            None => Project::new(root, source),
-        };
-        self.state.add_project(project);
+        // Stamped with this machine, like any other project: the sidebar draws
+        // a project under its machine's row, so one naming a device that was
+        // never registered is drawn nowhere at all — open, invisible and
+        // unreachable.
+        //
+        // `local` is `Some` exactly while the mode is `Standalone`, which is
+        // the only way to reach this line: `attach` takes it and leaves behind
+        // an attachment the branch above always finds. Said out loud rather
+        // than papered over with a nil device, because a project nobody can
+        // see is the harder bug of the two.
+        let device = self
+            .local
+            .expect("a standalone client registers its own machine in `App::new`");
+
+        self.state
+            .add_project(Project::new(root, source).with_device(device));
     }
 
     /// Adds `root` to the kept list, if this client keeps one.
@@ -866,8 +879,28 @@ impl App {
         // Whatever the state dropped with those projects is dropped here too.
         // A view kept for a pane that is gone draws output nothing can reach
         // and takes keystrokes nothing would answer.
-        self.panes.retain(|id, _| self.state.pane(*id).is_some());
-        self.expanded.retain(|id| self.state.pane(*id).is_some());
+        let dropped: Vec<PaneId> = self
+            .panes
+            .keys()
+            .copied()
+            .filter(|id| self.state.pane(*id).is_none())
+            .collect();
+
+        for id in dropped {
+            if let Some(mut pane) = self.panes.remove(&id) {
+                // A local pane's process is this one's child: dropped without
+                // being told, it keeps running with nothing left pointing at
+                // it. A remote pane's is not — the daemon still has it, its
+                // new connection announces it again, and a `ClosePane` here
+                // would kill the very agent this rebuild is protecting.
+                if matches!(pane.backend, Backend::Local(_)) {
+                    pane.backend.terminate();
+                }
+            }
+
+            self.expanded.remove(&id);
+        }
+
         self.layout.retain(|(id, _)| self.state.pane(*id).is_some());
 
         // A request from a pane that no longer exists would be answered into a
@@ -4559,14 +4592,26 @@ mod tests {
 
     #[test]
     fn one_daemon_restarting_rebuilds_only_its_own_rows() {
-        let (mut app, alpha, beta, _, _) = two_daemons();
-        let device = device_of(&app, alpha).expect("the project is on a machine");
+        // Driven the way the real thing arrives: the first machine's
+        // connection counts a new generation, and `poll_daemon` is what
+        // notices. Everything that daemon described belongs to a socket that
+        // is gone, and nothing the other one described does.
+        let (mut app, alpha, beta, first_sent, second_sent) = two_daemons();
 
-        app.state.forget_device_projects(device);
+        // A root this client asked the first daemon for, so its reconnect has
+        // something of its own to ask again.
+        app.add_project(PathBuf::from("/tmp/alpha"));
+        // Whatever the setup and that request already sent: the assertions
+        // below are about what the *reconnection* sends.
+        while first_sent.try_recv().is_ok() {}
+        while second_sent.try_recv().is_ok() {}
+
+        app.attachments()[0].client.handle().reconnect_for_test();
+        assert!(app.poll_daemon(), "a reattach is worth a frame");
 
         assert!(
             !app.state.projects().iter().any(|p| p.id == alpha),
-            "that machine's project is gone"
+            "that machine's project is gone until it announces it again"
         );
         assert!(
             app.state.projects().iter().any(|p| p.id == beta),
@@ -4576,6 +4621,84 @@ mod tests {
             app.state.devices().len(),
             2,
             "both machines keep their rows"
+        );
+        assert!(
+            app.status.contains("reattached"),
+            "and the user is told: {:?}",
+            app.status
+        );
+
+        assert!(
+            std::iter::from_fn(|| first_sent.try_recv().ok()).any(
+                |m| matches!(m, ClientMessage::OpenProject { root } if root == Path::new("/tmp/alpha"))
+            ),
+            "the restarted machine is asked for its roots again"
+        );
+        assert!(
+            std::iter::from_fn(|| second_sent.try_recv().ok())
+                .next()
+                .is_none(),
+            "and the machine that never went is asked for nothing"
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_is_still_up_is_not_taken_for_a_restart() {
+        // Each connection carries its own generation, so polling a fleet that
+        // has not changed must rebuild nothing and ask for no frame — this
+        // runs every tick.
+        let (mut app, alpha, beta, _, _) = two_daemons();
+
+        assert!(!app.poll_daemon(), "nothing changed, so nothing to draw");
+        assert!(app.state.projects().iter().any(|p| p.id == alpha));
+        assert!(app.state.projects().iter().any(|p| p.id == beta));
+    }
+
+    #[test]
+    fn attaching_takes_down_the_agents_this_process_started() {
+        // `attach` is public and a standalone client can have been running
+        // agents of its own for an hour before it ever reaches a daemon.
+        // Dropping that machine's rows while keeping its panes would leave a
+        // real child process running with nothing on screen pointing at it,
+        // nothing reading it and nobody left to stop it.
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            launch: Launch {
+                command: "sh".to_string(),
+                args: Vec::new(),
+                env: Default::default(),
+            },
+            ..Default::default()
+        };
+
+        let dir = scratch("attach-local");
+        let mut app = App::new([def].into_iter().collect());
+        app.add_project(dir.clone());
+        let project = app.state.projects()[0].id;
+        let _ = app.state.select_project(project);
+        app.spawn_pane("shell", Size::new(80, 24))
+            .expect("a shell starts");
+
+        assert_eq!(app.panes.len(), 1, "the client is holding the child");
+
+        let (client, _daemon, _sent) = Client::for_test();
+        app.attach(client);
+
+        // Taken down through the same `terminate` `^a x` uses, and then
+        // dropped: what is left is a client holding nothing of its own.
+        assert!(
+            app.panes.is_empty(),
+            "the child this process started is not left running unseen"
+        );
+        assert!(
+            app.state.visible_panes().is_empty(),
+            "and its row is gone with it"
+        );
+        assert_eq!(
+            app.state.devices().len(),
+            1,
+            "the daemon's machine is the only one left"
         );
     }
 
