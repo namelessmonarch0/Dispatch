@@ -280,6 +280,21 @@ enum Mode {
     Attached(Vec<Attachment>),
 }
 
+/// Which way the project/machine half of the fold ladder is walking.
+///
+/// Boolean collapse state alone cannot tell a ladder that is climbing from
+/// one that is descending: "project folded, machine not" is visited once on
+/// the way in (about to fold the machine) and once on the way out (about to
+/// unfold the project), and the two calls for opposite next steps. This is
+/// the bit that tells them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoldDirection {
+    /// Still folding inward: the project, then its machine.
+    Inward,
+    /// Everything reachable is folded; walking back out the same way.
+    Outward,
+}
+
 /// The application.
 pub struct App {
     mode: Mode,
@@ -345,6 +360,13 @@ pub struct App {
     /// title is known one message before there is a row to put it on.
     child_titles: HashMap<PaneId, String>,
     status: String,
+    /// Which project the project/machine fold ladder last stepped, and which
+    /// way it was walking.
+    ///
+    /// Keyed by project rather than kept as a bare direction: switching to a
+    /// project the ladder has not touched should always start by folding, not
+    /// resume outward because some other project was mid-unfold.
+    fold_ladder: Option<(ProjectId, FoldDirection)>,
     quit: bool,
     /// Every `ClientMessage` a decision would have sent, kept only so tests
     /// can tell `a` and `A` apart without a real daemon to send it to.
@@ -380,6 +402,7 @@ impl App {
             answered: HashMap::new(),
             child_titles: HashMap::new(),
             status: String::new(),
+            fold_ladder: None,
             quit: false,
             #[cfg(test)]
             sent: Vec::new(),
@@ -518,12 +541,15 @@ impl App {
 
     /// Folds or unfolds whatever the focus is in.
     ///
-    /// A focused pane with subagents folds those; a pane with none folds the
-    /// project above it, which is the common case and would otherwise leave
-    /// the key doing nothing. Past that, the project's machine — reached only
-    /// once the project itself is already folded, so the key climbs the tree
-    /// one rung at a time rather than skipping straight to the top. With no
-    /// pane focused there is only the selected project to fold.
+    /// A focused pane with subagents toggles those on their own -- a
+    /// subagent list has nothing further to walk into, so folding and
+    /// unfolding it is the same press in reverse. Past that, the project a
+    /// pane is in and the machine that project is on form a ladder: the key
+    /// walks in, folding the project then the machine, and once both are
+    /// folded the next press walks back out the same way, unfolding the
+    /// machine then the project, so nothing it folds is ever left
+    /// unreachable from the keyboard. With no pane focused, the ladder runs
+    /// the same way over the selected project and its machine.
     fn toggle_fold(&mut self) {
         if let Some(pane) = self.state.focused_pane() {
             if !self.state.children_of(pane).is_empty() {
@@ -532,30 +558,56 @@ impl App {
             }
 
             if let Some(project) = self.state.pane(pane).map(|pane| pane.project) {
-                // The ladder: a pane's subagents, then its project, then the
-                // machine that project is on. Each rung is reached by folding
-                // the one below it first.
-                if !self.state.is_project_collapsed(project) {
-                    self.state.toggle_project_collapsed(project);
-                    return;
-                }
-
-                if let Some(device) = self
-                    .state
-                    .projects()
-                    .iter()
-                    .find(|candidate| candidate.id == project)
-                    .map(|candidate| candidate.device)
-                {
-                    self.state.toggle_device_collapsed(device);
-                    return;
-                }
+                self.toggle_project_and_device_fold(project);
+                return;
             }
         }
 
         if let Some(project) = self.state.selected_project() {
-            self.state.toggle_project_collapsed(project);
+            self.toggle_project_and_device_fold(project);
         }
+    }
+
+    /// Steps the project/machine half of the fold ladder one rung, in
+    /// whichever direction it was last walking for this project.
+    ///
+    /// Boolean collapse state alone cannot say which direction that is (see
+    /// [`FoldDirection`]), so [`App::fold_ladder`] remembers it, per project,
+    /// across calls.
+    fn toggle_project_and_device_fold(&mut self, project: ProjectId) {
+        let device = self
+            .state
+            .projects()
+            .iter()
+            .find(|candidate| candidate.id == project)
+            .map(|candidate| candidate.device);
+
+        let direction = match self.fold_ladder {
+            Some((remembered, direction)) if remembered == project => direction,
+            _ => FoldDirection::Inward,
+        };
+
+        let next = if direction == FoldDirection::Inward {
+            if !self.state.is_project_collapsed(project) {
+                self.state.toggle_project_collapsed(project);
+                FoldDirection::Inward
+            } else if let Some(device) = device.filter(|d| !self.state.is_device_collapsed(*d)) {
+                self.state.toggle_device_collapsed(device);
+                FoldDirection::Outward
+            } else {
+                FoldDirection::Outward
+            }
+        } else if let Some(device) = device.filter(|d| self.state.is_device_collapsed(*d)) {
+            self.state.toggle_device_collapsed(device);
+            FoldDirection::Outward
+        } else {
+            if self.state.is_project_collapsed(project) {
+                self.state.toggle_project_collapsed(project);
+            }
+            FoldDirection::Inward
+        };
+
+        self.fold_ladder = Some((project, next));
     }
 
     /// Records a title an agent set for one of its panes.
@@ -3376,8 +3428,11 @@ mod tests {
     }
 
     #[test]
-    fn folding_past_a_folded_project_folds_its_machine() {
-        // The ladder: subagents, then the project, then the machine it is on.
+    fn folding_past_a_folded_project_folds_its_machine_and_back_out_again() {
+        // The ladder: fold the project, then the machine it is on. The same
+        // key then walks back out the way it came -- unfold the machine,
+        // then the project -- landing on fully expanded rather than
+        // stranding either fold with no way back from the keyboard.
         let mut app = App::new(HarnessRegistry::default());
         let device = app.state.add_device(Device::new("laptop"));
         let project = app
@@ -3389,13 +3444,45 @@ mod tests {
             .expect("the project exists");
         let _ = app.state.focus(pane);
 
-        command(&mut app, 'f');
-        assert!(app.state.is_project_collapsed(project));
+        let states = |app: &App| {
+            (
+                app.state.is_pane_collapsed(pane),
+                app.state.is_project_collapsed(project),
+                app.state.is_device_collapsed(device),
+            )
+        };
+
+        assert_eq!(
+            states(&app),
+            (false, false, false),
+            "fully expanded to start"
+        );
 
         command(&mut app, 'f');
-        assert!(
-            app.state.is_device_collapsed(device),
-            "and then the machine"
+        assert_eq!(states(&app), (false, true, false), "fold the project");
+
+        command(&mut app, 'f');
+        assert_eq!(states(&app), (false, true, true), "and then the machine");
+
+        command(&mut app, 'f');
+        assert_eq!(
+            states(&app),
+            (false, true, false),
+            "unfold the machine first, outward before inward"
+        );
+
+        command(&mut app, 'f');
+        assert_eq!(
+            states(&app),
+            (false, false, false),
+            "and the project -- back to fully expanded"
+        );
+
+        command(&mut app, 'f');
+        assert_eq!(
+            states(&app),
+            (false, true, false),
+            "and the ladder starts over"
         );
     }
 
