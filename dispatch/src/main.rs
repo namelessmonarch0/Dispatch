@@ -53,6 +53,15 @@ struct Args {
     #[arg(long = "daemon", value_name = "ENDPOINT")]
     daemons: Vec<PathBuf>,
 
+    /// Also attach to the daemon a command speaks for. Repeatable.
+    ///
+    /// Split on whitespace, with no shell: every command this is for —
+    /// `ssh user@host dispatchd --stdio`, a wrapper, an absolute path — is
+    /// whitespace-separated. A program whose path contains a space needs the
+    /// machine registry, which holds the program and its arguments apart.
+    #[arg(long = "daemon-command", value_name = "COMMAND")]
+    daemon_commands: Vec<String>,
+
     /// Subcommands. Absent means run the interface.
     #[command(subcommand)]
     command: Option<Command>,
@@ -197,6 +206,40 @@ fn main() -> Result<ExitCode> {
                 app.set_status(format!(
                     "{} is unreachable — not retried; restart Dispatch once it answers",
                     endpoint.display()
+                ));
+            }
+        }
+    }
+
+    for command in &args.daemon_commands {
+        use dispatch_client::{Client, Liveness};
+        use dispatch_proto::Role;
+
+        let mut words = command.split_whitespace().map(std::ffi::OsString::from);
+        let Some(program) = words.next() else {
+            app.set_status("--daemon-command was empty".to_string());
+            continue;
+        };
+        let rest: Vec<std::ffi::OsString> = words.collect();
+
+        match Client::attach_over(
+            Role::Interface,
+            CLIENT_NAME,
+            Liveness::default(),
+            program,
+            rest,
+        ) {
+            Ok(client) => {
+                client.subscribe();
+                app.attach(client);
+            }
+            // One machine being unreachable is not a reason to refuse to
+            // start: the others are why the user opened Dispatch. Not retried
+            // until the machine registry supervises them.
+            Err(error) => {
+                tracing::warn!(%error, %command, "could not attach over a command");
+                app.set_status(format!(
+                    "{command} did not answer; not retried — restart Dispatch once it does"
                 ));
             }
         }

@@ -346,6 +346,17 @@ pub struct App {
     child_titles: HashMap<PaneId, String>,
     status: String,
     quit: bool,
+    /// A project to reselect once its `ProjectOpened` comes back, because a
+    /// reconnect forgot it out from under a selection that was pointed at it.
+    ///
+    /// `forget_device` clears the selection before the replay that would
+    /// otherwise restore it has arrived, and by the time it does,
+    /// `add_project` sees a selection already pointing elsewhere and leaves it
+    /// there. Without this, reattaching to a machine mid-session silently
+    /// moves the view to whichever project happens to be first — and moves
+    /// keystrokes with it, since a pane only gets focus while its project is
+    /// selected.
+    reopening_selection: Option<ProjectId>,
     /// Every `ClientMessage` a decision would have sent, kept only so tests
     /// can tell `a` and `A` apart without a real daemon to send it to.
     #[cfg(test)]
@@ -381,6 +392,7 @@ impl App {
             child_titles: HashMap::new(),
             status: String::new(),
             quit: false,
+            reopening_selection: None,
             #[cfg(test)]
             sent: Vec::new(),
         }
@@ -933,6 +945,19 @@ impl App {
             client.send(ClientMessage::OpenProject { root: root.clone() });
         }
 
+        // Remembered before it is forgotten: if what is on screen right now
+        // belongs to this machine, its `ProjectOpened` is already on the way
+        // back and should be selected again rather than left to the fallback
+        // `forget_device` is about to trigger.
+        if self.state.selected_project().is_some_and(|selected| {
+            self.state
+                .projects()
+                .iter()
+                .any(|p| p.id == selected && p.device == device)
+        }) {
+            self.reopening_selection = self.state.selected_project();
+        }
+
         self.forget_device(device);
         self.status = format!("reattached to {name}");
 
@@ -1004,7 +1029,20 @@ impl App {
                 // Stamped here, the one place a project enters this client
                 // from a daemon: the daemon knows nothing of the other
                 // machines, so which one it is, is this client's to say.
+                let id = project.id;
                 self.state.add_project(project.with_device(device));
+
+                // The other half of the reconnect fix in `sync_attachment`:
+                // this is the project a reconnect forgot out from under the
+                // selection, back again. Its panes have not replayed yet, so
+                // this only recovers the selection itself — `adopt_pane`
+                // picks up the focus once they do, the same way it would for
+                // a project selected for the first time.
+                if self.reopening_selection == Some(id) {
+                    self.reopening_selection = None;
+                    let _ = self.state.select_project(id);
+                }
+
                 true
             }
 
@@ -1926,12 +1964,31 @@ impl App {
         }
     }
 
+    /// Offers every known project, naming the machine alongside the path once
+    /// more than one is attached.
+    ///
+    /// A path alone does not tell two projects apart when a checkout is
+    /// mirrored at the same path on two machines — or, as in a federation
+    /// reached by name rather than by filesystem, when nothing ties the
+    /// paths together at all. On one machine there is nothing to
+    /// disambiguate, so the row stays just the path, matching what it always
+    /// showed.
     fn open_project_picker(&mut self) {
+        let multiple_devices = self.state.devices().len() > 1;
+
         let items: Vec<Item> = self
             .state
             .projects()
             .iter()
-            .map(|p| Item::new(p.id.to_string(), &p.name).with_detail(p.root.display().to_string()))
+            .map(|p| {
+                let mut detail = p.root.display().to_string();
+                if multiple_devices {
+                    if let Some(device) = self.state.device(p.device) {
+                        detail = format!("{detail} ({})", device.name);
+                    }
+                }
+                Item::new(p.id.to_string(), &p.name).with_detail(detail)
+            })
             .collect();
 
         self.overlay = Some(Overlay::Project(Picker::new("Project", items)));

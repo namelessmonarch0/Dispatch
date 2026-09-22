@@ -1166,3 +1166,132 @@ fn two_daemons_share_one_sidebar() {
 
     first.stop();
 }
+
+/// The `dispatchd` binary beside the client binary under test.
+///
+/// Cargo only defines `CARGO_BIN_EXE_` for the package under test, so the
+/// daemon is found by path next to it rather than through its own env var.
+fn dispatchd_binary() -> std::path::PathBuf {
+    let mut path = std::path::PathBuf::from(env!("CARGO_BIN_EXE_dispatch"));
+    path.set_file_name(if cfg!(windows) {
+        "dispatchd.exe"
+    } else {
+        "dispatchd"
+    });
+    path
+}
+
+/// Kills the bridge processes talking to `endpoint`, leaving the daemon behind
+/// them running.
+///
+/// Killing the transport rather than the daemon is the point: what the test
+/// proves is that the agents were never the transport's to lose. Matched on
+/// the endpoint path so a bridge belonging to another test running in parallel
+/// is left alone.
+///
+/// A plain `pkill -f "--endpoint <path>"` is not enough here: the Dispatch
+/// client under test was itself started with `--daemon-command "dispatchd
+/// --stdio --endpoint <path>"`, so that same substring sits inside *its own*
+/// command line too, and a bare pattern match kills the client under test
+/// along with the bridge. Every matching process is checked against `ps` and
+/// only ones actually named `dispatchd` — the bridge, never the client named
+/// `dispatch` — are signalled.
+#[cfg(unix)]
+fn kill_bridge_to(endpoint: &std::path::Path) {
+    let pattern = format!("--endpoint {}", endpoint.display());
+
+    let Ok(output) = std::process::Command::new("pgrep")
+        .args(["-f", "--", &pattern])
+        .output()
+    else {
+        return;
+    };
+
+    for pid in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+    {
+        let is_bridge = std::process::Command::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .is_ok_and(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .trim()
+                    .ends_with("dispatchd")
+            });
+
+        if is_bridge {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn a_machine_reached_over_a_bridge_outlives_its_transport() {
+    // The slice's claim: the transport can die without the agents dying,
+    // because the agents were never the transport's.
+    let here = Fixture::new("stdio-a");
+    let there = Fixture::new("stdio-b");
+
+    let near = Daemon::start_named(&here, "near");
+    let far = Daemon::start_named(&there, "far");
+
+    let bridge = format!(
+        "{} --stdio --endpoint {}",
+        dispatchd_binary().display(),
+        there.config.path().join("dispatchd.sock").display()
+    );
+
+    let mut app = Harness::spawn(
+        &here,
+        Size::new(200, 30),
+        &[
+            "--attach".to_string(),
+            "--daemon-command".to_string(),
+            bridge,
+        ],
+    );
+
+    assert!(
+        app.wait_for(|lines| sidebar_contains(lines, "near") && sidebar_contains(lines, "far")),
+        "both machines are listed"
+    );
+
+    app.select_project("far");
+    app.spawn_shell();
+    app.send(b"echo over-the-bridge\r");
+    assert!(
+        app.wait_for(|lines| contains(lines, "over-the-bridge")),
+        "a pane on the far machine echoes through the bridge"
+    );
+
+    // Kill the bridge child, not the daemon behind it.
+    kill_bridge_to(&there.config.path().join("dispatchd.sock"));
+
+    assert!(
+        app.wait_for(|lines| sidebar_contains(lines, "far")),
+        "the machine is still listed after its transport died"
+    );
+
+    // A keystroke sent to a connection that is down is dropped rather than
+    // queued (out-of-order input reaching an agent minutes late is worse than
+    // input that never arrives), and the row above is on screen throughout
+    // the outage rather than only once the client has redialled. So typing
+    // has to wait for the redial to actually land, or it races a client that
+    // has not yet reconnected and is lost for good.
+    assert!(
+        app.wait_for(|lines| contains(lines, "reattached to far")),
+        "the client should redial the bridge on its own"
+    );
+    app.send(b"echo still-here\r");
+    assert!(
+        app.wait_for(|lines| contains(lines, "still-here")),
+        "and the pane still answers once the client has redialled"
+    );
+
+    near.stop();
+    far.stop();
+}
