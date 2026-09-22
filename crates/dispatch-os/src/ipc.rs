@@ -34,6 +34,16 @@ pub enum IpcError {
         #[source]
         source: std::io::Error,
     },
+
+    /// A command that was supposed to speak for a daemon could not be started.
+    #[error("cannot run {command}: {source}")]
+    Spawn {
+        /// The command line, for a message that says what was looked for.
+        command: String,
+        /// Underlying error.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl IpcError {
@@ -67,6 +77,9 @@ pub fn endpoint() -> Result<PathBuf, IpcError> {
 pub struct Connection {
     reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
+    /// The process behind a command transport, kept so it can be reaped.
+    child: Option<std::process::Child>,
+    hint: StderrHint,
 }
 
 impl std::fmt::Debug for Connection {
@@ -91,6 +104,8 @@ impl Connection {
         Ok(Self {
             reader: Box::new(reader),
             writer: Box::new(writer),
+            child: None,
+            hint: StderrHint::default(),
         })
     }
 
@@ -102,7 +117,80 @@ impl Connection {
     /// halves has nothing left to pair.
     #[must_use]
     pub fn from_halves(reader: Box<dyn Read + Send>, writer: Box<dyn Write + Send>) -> Self {
-        Self { reader, writer }
+        Self {
+            reader,
+            writer,
+            child: None,
+            hint: StderrHint::default(),
+        }
+    }
+
+    /// A connection to the daemon a command speaks for.
+    ///
+    /// The command's stdout is the reader and its stdin is the writer. Its
+    /// stderr is drained on a thread of its own: every line goes to the log,
+    /// and the first is kept for the error that a failed handshake will
+    /// otherwise report as mere silence.
+    pub fn over_command(
+        program: &std::ffi::OsStr,
+        args: &[std::ffi::OsString],
+    ) -> Result<Self, IpcError> {
+        use std::process::{Command, Stdio};
+
+        let mut described = program.to_string_lossy().into_owned();
+        for arg in args {
+            described.push(' ');
+            described.push_str(&arg.to_string_lossy());
+        }
+
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| IpcError::Spawn {
+                command: described.clone(),
+                source,
+            })?;
+
+        let reader = child.stdout.take().expect("stdout was piped");
+        let writer = child.stdin.take().expect("stdin was piped");
+        let hint = StderrHint::default();
+
+        if let Some(stderr) = child.stderr.take() {
+            let hint = hint.clone();
+            let described = described.clone();
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stderr)
+                    .lines()
+                    .map_while(Result::ok)
+                {
+                    tracing::warn!(command = %described, "{line}");
+                    hint.remember(&line);
+                }
+            });
+        }
+
+        Ok(Self {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            child: Some(child),
+            hint,
+        })
+    }
+
+    /// What the command said on stderr, for an error that needs it.
+    #[must_use]
+    pub fn hint(&self) -> StderrHint {
+        self.hint.clone()
+    }
+
+    /// The child's process id, when the transport is a command.
+    #[must_use]
+    pub fn child_id(&self) -> Option<u32> {
+        self.child.as_ref().map(std::process::Child::id)
     }
 
     /// Splits into a reader and a writer.
@@ -111,8 +199,82 @@ impl Connection {
     /// blocks the other. Boxed rather than `impl Trait`: a connection's
     /// transport is chosen at runtime, and the type cannot be named at the
     /// boundary.
-    pub fn split(self) -> (Box<dyn Read + Send>, Box<dyn Write + Send>) {
-        (self.reader, self.writer)
+    ///
+    /// The child, when there is one, rides with the reader: the halves
+    /// outlive this `Connection`, and killing the process when it goes would
+    /// close the transport the caller just took.
+    pub fn split(mut self) -> (Box<dyn Read + Send>, Box<dyn Write + Send>) {
+        let child = self.child.take();
+        let reader = std::mem::replace(&mut self.reader, Box::new(std::io::empty()));
+        let writer = std::mem::replace(&mut self.writer, Box::new(std::io::sink()));
+
+        match child {
+            Some(child) => (Box::new(ChildReader { reader, child }), writer),
+            None => (reader, writer),
+        }
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // Asked to stop and then waited for: a child left unreaped is a
+        // zombie, and one left running is an `ssh` nobody can see.
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// A reader that reaps its process when it is dropped.
+///
+/// `split` hands the halves to a client that may hold them for the life of a
+/// connection; the child has to be owned by one of them or it would be killed
+/// the moment the `Connection` went out of scope.
+struct ChildReader {
+    reader: Box<dyn Read + Send>,
+    child: std::process::Child,
+}
+
+impl Read for ChildReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.read(buf)
+    }
+}
+
+impl Drop for ChildReader {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The first line a command wrote to stderr, if it wrote one.
+///
+/// A command transport fails in ways only its stderr explains — a refused SSH
+/// key, a missing binary on the far side — and by the time the handshake times
+/// out, that line is the only evidence of which happened.
+#[derive(Clone, Default)]
+pub struct StderrHint(std::sync::Arc<Mutex<Option<String>>>);
+
+impl std::fmt::Debug for StderrHint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StderrHint")
+    }
+}
+
+impl StderrHint {
+    /// The first line, once there is one.
+    #[must_use]
+    pub fn first_line(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn remember(&self, line: &str) {
+        let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_none() {
+            *held = Some(line.to_string());
+        }
     }
 }
 
@@ -201,6 +363,8 @@ impl Listener {
                 return Ok(Connection {
                     reader: Box::new(reader),
                     writer: Box::new(writer),
+                    child: None,
+                    hint: StderrHint::default(),
                 });
             }
         }
@@ -526,6 +690,7 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// Points the endpoint at a directory of this test's own.
     ///
@@ -859,6 +1024,80 @@ mod tests {
         assert_eq!(&buf, b"ping");
 
         drop(theirs);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_command_carries_bytes_both_ways() {
+        // `cat` is a byte-for-byte loopback, so this proves the pipes are
+        // wired the right way round and that nothing in between reframes.
+        let connection =
+            Connection::over_command(std::ffi::OsStr::new("cat"), &[]).expect("cat exists");
+
+        let (mut reader, mut writer) = connection.split();
+        writer.write_all(b"ping\n").expect("writing succeeds");
+        writer.flush().expect("flushing succeeds");
+
+        let mut buf = [0u8; 5];
+        reader.read_exact(&mut buf).expect("reading succeeds");
+        assert_eq!(&buf, b"ping\n");
+    }
+
+    #[test]
+    fn a_command_that_is_not_there_names_itself() {
+        // Over SSH this is the common failure — the far side has no dispatchd
+        // — and a bare "not found" would not say what was looked for.
+        let error = Connection::over_command(std::ffi::OsStr::new("dispatch-no-such-program"), &[])
+            .expect_err("it does not exist");
+
+        assert!(
+            error.to_string().contains("dispatch-no-such-program"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dropping_a_command_connection_reaps_its_child() {
+        // A client reconnects by dialling again. A transport that left its
+        // child running would leak one per attempt, invisibly.
+        let connection =
+            Connection::over_command(std::ffi::OsStr::new("cat"), &[]).expect("cat exists");
+        let pid = connection
+            .child_id()
+            .expect("a command transport has a child");
+
+        drop(connection);
+
+        // A reaped child's pid answers no signal; an unreaped one does.
+        // SAFETY: signal 0 sends nothing and only probes whether the pid
+        // exists, which is safe to ask about any pid, alive or not.
+        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        assert!(!alive, "the child is gone");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_commands_stderr_is_kept_for_the_error_that_needs_it() {
+        // "Permission denied (publickey)" only exists on stderr, and without
+        // it a failed attach is indistinguishable from a silent one.
+        let connection = Connection::over_command(
+            std::ffi::OsStr::new("sh"),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("echo nope 1>&2; sleep 5"),
+            ],
+        )
+        .expect("sh exists");
+
+        let hint = connection.hint();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while hint.first_line().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(hint.first_line().as_deref(), Some("nope"));
     }
 
     #[test]
