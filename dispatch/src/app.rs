@@ -250,11 +250,11 @@ impl Overlay {
 /// What to call the machine Dispatch is running on.
 ///
 /// The hostname, because a fleet of rows all saying "local" names nothing.
+/// Asked of the operating system rather than the environment: `$HOSTNAME` is
+/// a bash-only convention that bash itself does not export, so zsh, fish and
+/// most CI runners never see it.
 fn this_machine() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "this machine".to_string())
+    dispatch_os::host::hostname()
 }
 
 /// One daemon this client is holding.

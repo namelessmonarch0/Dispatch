@@ -1101,5 +1101,17 @@ fn two_daemons_share_one_sidebar() {
         "and the other one is still there"
     );
 
+    // "Still there" in the sidebar is not proof of much: that text was
+    // painted before `second.stop()` too, and nothing would have removed it.
+    // Running a real round trip through fed-a's own connection is the proof
+    // that survives a dead sibling: a keystroke reaching a shell and its
+    // output coming back, the same shape as every other pane test.
+    app.spawn_shell();
+    app.send(b"echo fed-a-survives\r");
+    assert!(
+        app.wait_for(|lines| contains(lines, "fed-a-survives")),
+        "the surviving machine should still run real work"
+    );
+
     first.stop();
 }

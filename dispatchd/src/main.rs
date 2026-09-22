@@ -27,17 +27,11 @@ struct Args {
     /// Name this daemon reports to clients, so two can be told apart.
     ///
     /// The hostname by default: a fleet whose rows all say "local" is a fleet
-    /// you cannot read.
-    #[arg(long, default_value_t = default_device_name())]
+    /// you cannot read. Asked of the operating system rather than the
+    /// environment, because `$HOSTNAME` is a bash-only convention that most
+    /// shells and most CI runners never set.
+    #[arg(long, default_value_t = dispatch_os::host::hostname())]
     device: String,
-}
-
-/// The hostname, or a plain fallback when the environment does not say.
-fn default_device_name() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "local".to_string())
 }
 
 fn main() -> Result<()> {
