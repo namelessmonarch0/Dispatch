@@ -7,6 +7,7 @@
 
 use super::*;
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -692,4 +693,85 @@ fn a_client_attaches_to_an_endpoint_it_is_given() {
     drop(client);
     drop(heard);
     let _ = std::fs::remove_dir_all(&elsewhere);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_client_dialling_a_command_reports_what_the_command_said() {
+    // The dial plumbing, without a bridge: a command that refuses and exits
+    // must fail the attach with its own words rather than a bare timeout.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let error = Client::attach_over(
+        Role::Interface,
+        "test",
+        Liveness::default(),
+        std::ffi::OsString::from("sh"),
+        vec![
+            std::ffi::OsString::from("-c"),
+            std::ffi::OsString::from("echo 'dispatchd: command not found' 1>&2; exit 127"),
+        ],
+    )
+    .expect_err("the command refuses");
+
+    assert!(
+        error.to_string().contains("command not found"),
+        "the command's own words reach the caller: {error}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_command_that_dies_is_respawned() {
+    // The supervisor reconnects by repeating the dial. For a command that
+    // means running it again, which is the whole reason `Dial` is remembered
+    // rather than resolved once.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = std::env::temp_dir().join(format!("dispatch-client-{}-respawn", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir is writable");
+    let counter = dir.join("runs");
+
+    // A canned Hello, written exactly as `Frame` writes one, so the client's
+    // handshake completes without a daemon behind it. Then the command exits,
+    // which is the event under test: the reader sees EOF, the connection is
+    // lost, and the supervisor has to dial again.
+    let mut encoded = Vec::new();
+    Frame::write(&mut encoded, &welcome()).expect("writing succeeds");
+    let escaped: String = encoded.iter().map(|b| format!("\\x{b:02x}")).collect();
+
+    let program = std::ffi::OsString::from("sh");
+    let args = vec![
+        std::ffi::OsString::from("-c"),
+        std::ffi::OsString::from(format!(
+            "echo ran >> {}; printf '{}'; sleep 0.2",
+            counter.display(),
+            escaped
+        )),
+    ];
+
+    let client = Client::attach_over(Role::Interface, "test", Liveness::default(), program, args)
+        .expect("the command answers the handshake");
+
+    let deadline = Instant::now() + PATIENCE;
+    while client.generation() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(
+        client.generation() >= 2,
+        "the supervisor dialled again after the command exited"
+    );
+    assert!(
+        std::fs::read_to_string(&counter)
+            .unwrap_or_default()
+            .lines()
+            .count()
+            >= 2,
+        "the command ran more than once"
+    );
+
+    drop(client);
+    let _ = std::fs::remove_dir_all(&dir);
 }

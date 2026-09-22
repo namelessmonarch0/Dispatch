@@ -13,15 +13,49 @@
 //! Nothing here knows about panes or drawing. It connects, shakes hands, and
 //! moves messages.
 
+use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use dispatch_os::ipc::{Connection, IpcError};
+use dispatch_os::ipc::{Connection, IpcError, StderrHint};
 use dispatch_proto::{ClientMessage, Frame, ProtocolError, Role, ServerMessage};
+
+/// How a client reaches a daemon, and reaches it again after a drop.
+///
+/// Remembered rather than resolved once: a reconnection has to repeat the
+/// original dial, and for a command transport that means respawning the
+/// process. Without this a dropped connection over SSH could never come back.
+#[derive(Debug, Clone)]
+pub enum Dial {
+    /// A socket on this machine.
+    Endpoint(PathBuf),
+    /// A command that speaks for a daemon on its own machine.
+    Command {
+        /// The program to run.
+        program: OsString,
+        /// Its arguments.
+        args: Vec<OsString>,
+    },
+}
+
+impl std::fmt::Display for Dial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Dial::Endpoint(path) => write!(f, "{}", path.display()),
+            Dial::Command { program, args } => {
+                write!(f, "{}", program.to_string_lossy())?;
+                for arg in args {
+                    write!(f, " {}", arg.to_string_lossy())?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
 
 /// How long to wait before the first reconnection attempt.
 const FIRST_RETRY: Duration = Duration::from_millis(100);
@@ -117,8 +151,8 @@ struct Wire {
     /// which would start the fleet's output flowing to a call that only waits
     /// on one request.
     role: Role,
-    /// The endpoint first reached, which every reconnection uses.
-    endpoint: PathBuf,
+    /// How the daemon was first reached, which every reconnection repeats.
+    dial: Dial,
     /// When anything last arrived, for deciding a silent socket is dead.
     last_heard: Mutex<Instant>,
     /// When the last question was asked, so one goes out per interval rather
@@ -302,7 +336,36 @@ impl Client {
         liveness: Liveness,
         endpoint: PathBuf,
     ) -> Result<Self, ClientError> {
-        let (reader, writer, device) = connect_within(name, role, &endpoint, HANDSHAKE_TIMEOUT)?;
+        Self::attach_dialling(role, name, liveness, Dial::Endpoint(endpoint))
+    }
+
+    /// Connects and shakes hands with the daemon a command speaks for.
+    ///
+    /// The command is respawned on every reconnection, so it has to be one
+    /// that can be run again — `ssh host dispatchd --stdio` is the case this
+    /// exists for.
+    pub fn attach_over(
+        role: Role,
+        name: &str,
+        liveness: Liveness,
+        program: OsString,
+        args: Vec<OsString>,
+    ) -> Result<Self, ClientError> {
+        Self::attach_dialling(role, name, liveness, Dial::Command { program, args })
+    }
+
+    /// Connects and shakes hands by whichever dial was given.
+    ///
+    /// The one place that turns a [`Dial`] into a live connection and the
+    /// state that supervises it: `attach_at` and `attach_over` differ only in
+    /// which [`Dial`] they build.
+    fn attach_dialling(
+        role: Role,
+        name: &str,
+        liveness: Liveness,
+        dial: Dial,
+    ) -> Result<Self, ClientError> {
+        let (reader, writer, device) = connect_within(name, role, &dial, HANDSHAKE_TIMEOUT)?;
 
         let wire = Arc::new(Wire {
             writer: Mutex::new(Some(writer)),
@@ -313,7 +376,7 @@ impl Client {
             device: Mutex::new(device),
             name: name.to_string(),
             role,
-            endpoint,
+            dial,
             last_heard: Mutex::new(Instant::now()),
             last_asked: Mutex::new(Instant::now()),
             liveness,
@@ -406,33 +469,44 @@ type Connected = (Box<dyn Read + Send>, Box<dyn Write + Send>, String);
 fn connect_within(
     name: &str,
     role: Role,
-    endpoint: &Path,
+    dial: &Dial,
     patience: Duration,
 ) -> Result<Connected, ClientError> {
     let (done, answer) = channel();
     let name = name.to_string();
-    let endpoint = endpoint.to_path_buf();
+    let for_thread = dial.clone();
 
     std::thread::spawn(move || {
-        let _ = done.send(connect(&name, role, &endpoint));
+        let _ = done.send(connect(&name, role, &for_thread));
     });
 
     match answer.recv_timeout(patience) {
         Ok(result) => result,
+        // Raised here rather than by the thread: the thread may still be
+        // waiting on a peer that never answers, so the timeout has to come
+        // from the caller's side and cannot carry a stderr hint that only the
+        // thread holds.
         Err(_) => Err(ClientError::Handshake(format!(
-            "the daemon did not answer within {patience:?}"
+            "{dial} did not answer within {patience:?}"
         ))),
     }
 }
 
 /// Connects and shakes hands, returning the two halves and the daemon's name.
-fn connect(name: &str, role: Role, endpoint: &Path) -> Result<Connected, ClientError> {
-    let connection = match Connection::connect_to(endpoint) {
-        Ok(connection) => connection,
-        Err(IpcError::NotRunning(_)) => {
-            return Err(ClientError::NotRunning(endpoint.display().to_string()));
+fn connect(name: &str, role: Role, dial: &Dial) -> Result<Connected, ClientError> {
+    let (connection, hint) = match dial {
+        Dial::Endpoint(endpoint) => match Connection::connect_to(endpoint) {
+            Ok(connection) => (connection, None),
+            Err(IpcError::NotRunning(_)) => {
+                return Err(ClientError::NotRunning(endpoint.display().to_string()));
+            }
+            Err(error) => return Err(error.into()),
+        },
+        Dial::Command { program, args } => {
+            let connection = Connection::over_command(program, args)?;
+            let hint = connection.hint();
+            (connection, Some(hint))
         }
-        Err(error) => return Err(error.into()),
     };
 
     let (mut reader, mut writer) = connection.split();
@@ -445,19 +519,39 @@ fn connect(name: &str, role: Role, endpoint: &Path) -> Result<Connected, ClientE
             role,
         },
     )
-    .map_err(|e| ClientError::Handshake(e.to_string()))?;
+    .map_err(|e| with_hint(ClientError::Handshake(e.to_string()), hint.as_ref()))?;
 
     // Read the answer before starting any thread: a refused connection should
     // fail attaching rather than arrive later as a message the caller has to
     // know to look for.
     let device = match Frame::read::<_, ServerMessage>(&mut reader) {
         Ok(ServerMessage::Welcome { device, .. }) => device,
-        Ok(ServerMessage::Error { error }) => return Err(ClientError::Refused(error)),
+        Ok(ServerMessage::Error { error }) => {
+            return Err(with_hint(ClientError::Refused(error), hint.as_ref()));
+        }
         Ok(other) => return Err(ClientError::Unexpected(format!("{other:?}"))),
-        Err(error) => return Err(ClientError::Handshake(error.to_string())),
+        Err(error) => {
+            return Err(with_hint(
+                ClientError::Handshake(error.to_string()),
+                hint.as_ref(),
+            ));
+        }
     };
 
     Ok((reader, writer, device))
+}
+
+/// The command's own words, folded into a failure that would otherwise read
+/// as silence.
+///
+/// A command transport's real reason lives on its stderr: an SSH key refused,
+/// a binary missing on the far side. Neither reaches the protocol, so neither
+/// reaches the caller unless it is carried here.
+fn with_hint(error: ClientError, hint: Option<&StderrHint>) -> ClientError {
+    match hint.and_then(StderrHint::first_line) {
+        Some(line) => ClientError::Handshake(format!("{error}: {line}")),
+        None => error,
+    }
 }
 
 /// Moves messages from the socket into the queue, until the socket ends.
@@ -524,7 +618,7 @@ fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
             std::thread::sleep(backoff);
             backoff = (backoff * 2).min(MAX_RETRY);
 
-            match connect_within(&wire.name, wire.role, &wire.endpoint, HANDSHAKE_TIMEOUT) {
+            match connect_within(&wire.name, wire.role, &wire.dial, HANDSHAKE_TIMEOUT) {
                 Ok((reader, writer, device)) => {
                     *wire.device.lock().unwrap_or_else(|e| e.into_inner()) = device;
                     *wire.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(writer);
@@ -611,7 +705,7 @@ impl Client {
             device: Mutex::new("test-device".to_string()),
             name: "test".to_string(),
             role: Role::Interface,
-            endpoint: PathBuf::new(),
+            dial: Dial::Endpoint(PathBuf::new()),
             last_heard: Mutex::new(Instant::now()),
             last_asked: Mutex::new(Instant::now()),
             liveness: Liveness::default(),
