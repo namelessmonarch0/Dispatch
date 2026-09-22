@@ -310,6 +310,7 @@ dependencies = [
  "dispatch-core",
  "dispatch-os",
  "dispatch-proto",
+ "libc",
  "thiserror 2.0.20",
  "tracing",
 ]

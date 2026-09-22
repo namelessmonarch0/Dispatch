@@ -363,14 +363,18 @@ impl Drop for Daemon {
 }
 
 /// Stops the daemon a cold-started bridge left running, by the pid it
-/// recorded.
+/// recorded in `config_dir`.
 ///
 /// A bridge-started daemon outlives the bridge on purpose -- that is the
 /// point of Task 4 -- so a test that triggers one has to kill it by hand, the
 /// way `dispatch/tests/end_to_end.rs`'s `stop_recorded_daemon` does, or it
 /// leaks a `dispatchd` per run.
-fn stop_recorded_daemon(fixture: &Fixture) {
-    let pid_file = fixture.dir.join("dispatchd.pid");
+///
+/// Takes the directory rather than the fixture: a bridge given an
+/// `--endpoint` outside its own configuration starts its daemon under *that*
+/// directory, which is where the pid file then lands.
+fn stop_recorded_daemon(config_dir: &Path) {
+    let pid_file = config_dir.join("dispatchd.pid");
 
     let Ok(contents) = std::fs::read_to_string(&pid_file) else {
         return;
@@ -451,7 +455,7 @@ fn a_bridge_starts_a_daemon_when_none_is_listening() {
     assert!(client.is_connected());
 
     drop(client);
-    stop_recorded_daemon(&fixture);
+    stop_recorded_daemon(&fixture.dir);
 }
 
 #[test]
@@ -768,4 +772,56 @@ fn a_delegate_caller_and_an_interface_client_share_one_daemon() {
             .any(|m| matches!(m, ServerMessage::PaneOutput { .. })),
         "a delegate caller is spared the fleet's output"
     );
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the bridge test drives a POSIX pipeline")]
+fn a_bridge_starts_the_daemon_on_the_endpoint_it_was_given() {
+    // `--endpoint` names a daemon that is not this configuration's own, which
+    // is the whole reason the flag exists. A bridge that started one from its
+    // own configuration directory would bind a socket nobody is waiting on:
+    // the poll loop would time out, the attach would fail, and a daemon
+    // nobody asked for would be left running on the wrong endpoint.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new("brdg-env");
+
+    let elsewhere =
+        std::env::temp_dir().join(format!("dispatchd-it-{}-brdg-at", std::process::id()));
+    let _ = std::fs::remove_dir_all(&elsewhere);
+    std::fs::create_dir_all(&elsewhere).expect("temp dir is writable");
+    let endpoint = elsewhere.join("dispatchd.sock");
+    assert_ne!(
+        endpoint,
+        fixture.endpoint(),
+        "the endpoint under test must not be this configuration's own"
+    );
+
+    let client = dispatch_client::Client::attach_over(
+        dispatch_proto::Role::Interface,
+        "bridge-test",
+        dispatch_client::Liveness::default(),
+        dispatchd_binary().into(),
+        vec![
+            "--stdio".into(),
+            "--endpoint".into(),
+            endpoint.clone().into(),
+            fixture.project().into(),
+        ],
+    )
+    .expect("the bridge starts a daemon on the endpoint it was given");
+
+    assert!(client.is_connected());
+    assert!(
+        Connection::connect_to(&endpoint).is_ok(),
+        "a daemon should be listening on {}",
+        endpoint.display()
+    );
+    assert!(
+        !fixture.endpoint().exists(),
+        "a daemon was started on the bridge's own endpoint instead of the one it was given"
+    );
+
+    drop(client);
+    stop_recorded_daemon(&elsewhere);
+    let _ = std::fs::remove_dir_all(&elsewhere);
 }

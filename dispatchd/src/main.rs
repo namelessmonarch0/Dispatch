@@ -150,11 +150,31 @@ fn main() -> Result<()> {
 /// The bridge is not the daemon: it exits with its SSH session, and agents
 /// that died with it would make a remote machine useless for the one thing
 /// the daemon exists to provide.
+///
+/// The daemon is started under the endpoint's own configuration directory.
+/// A daemon resolves where to listen from its configuration, and `--endpoint`
+/// exists precisely to name a daemon that is *not* this process's own: one
+/// started with this process's configuration would bind a different socket,
+/// leave the poll below waiting on one nobody was ever going to listen on,
+/// and go on running afterwards.
 fn start_daemon_for(endpoint: &Path, projects: &[PathBuf]) -> Result<()> {
     let program = std::env::current_exe().context("failed to locate this binary")?;
     let args: Vec<std::ffi::OsString> = projects.iter().map(Into::into).collect();
 
-    let pid = dispatch_os::process::spawn_detached(&program, &args)
+    // `ipc::endpoint` builds the path as `<config dir>/dispatchd.sock`, so the
+    // parent of any endpoint is by construction the configuration directory a
+    // daemon must run under to listen there.
+    let env: Vec<(std::ffi::OsString, std::ffi::OsString)> = endpoint
+        .parent()
+        .map(|dir| {
+            vec![(
+                dispatch_os::paths::CONFIG_DIR_ENV.into(),
+                dir.as_os_str().to_owned(),
+            )]
+        })
+        .unwrap_or_default();
+
+    let pid = dispatch_os::process::spawn_detached_with_env(&program, &args, &env)
         .with_context(|| format!("failed to start {}", program.display()))?;
     tracing::info!(pid, "started a daemon to bridge to");
 
@@ -164,6 +184,14 @@ fn start_daemon_for(endpoint: &Path, projects: &[PathBuf]) -> Result<()> {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Nothing else will ever stop it: this process is about to exit with the
+    // error below, and a daemon nobody can reach is one nobody knows to kill.
+    if let Err(error) =
+        dispatch_os::process::terminate_tree(pid, dispatch_os::process::DEFAULT_GRACE)
+    {
+        tracing::warn!(%error, pid, "failed to stop the daemon that never listened");
     }
 
     anyhow::bail!(

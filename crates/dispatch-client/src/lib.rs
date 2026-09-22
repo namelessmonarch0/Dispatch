@@ -86,12 +86,43 @@ impl Default for Liveness {
     }
 }
 
-/// How long to wait for a daemon to answer the handshake.
+/// How long to wait for a daemon on a socket to answer the handshake.
 ///
 /// A peer that accepts a connection and then says nothing would otherwise stop
 /// the client for good: the handshake is read before anything else happens, so
 /// without a limit one unanswering socket ends both attaching and reconnecting.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+///
+/// Short because the peer is a daemon on this machine: it answers in
+/// microseconds, or something is genuinely wrong with it.
+const SOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long to wait for a daemon a command speaks for to answer the handshake.
+///
+/// Far longer than [`SOCKET_HANDSHAKE_TIMEOUT`], because it is not the same
+/// question. That one is a socket on this machine. This one may be
+/// `ssh host dispatchd --stdio`, and the budget has to cover a TCP handshake,
+/// an authentication, a remote exec, and `--stdio`'s own connect -- which
+/// cold-starts a daemon on the far side and waits up to ten seconds for it to
+/// listen. A local socket's patience loses that race on every cold host and
+/// every `ProxyJump`, and the reconnect would then repeat the loss forever.
+const COMMAND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long this dial is given to answer.
+fn patience_for(dial: &Dial) -> Duration {
+    match dial {
+        Dial::Endpoint(_) => SOCKET_HANDSHAKE_TIMEOUT,
+        Dial::Command { .. } => COMMAND_HANDSHAKE_TIMEOUT,
+    }
+}
+
+/// How long a dialled process tree is given to exit before it is killed
+/// outright.
+///
+/// Shorter than [`process::DEFAULT_GRACE`](dispatch_os::process::DEFAULT_GRACE):
+/// that grace waits on an agent being asked to close a pane, this one on a
+/// transport that has already been replaced or given up on, and nothing --
+/// least of all a reconnection -- should wait on it.
+const DIAL_TEARDOWN_GRACE: Duration = Duration::from_millis(50);
 
 /// The longest gap between reconnection attempts.
 ///
@@ -99,6 +130,47 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 /// is gone for good should not cost more than a connect attempt every couple of
 /// seconds.
 const MAX_RETRY: Duration = Duration::from_secs(2);
+
+/// Where a dial leaves its child's pid, for whoever may have to kill it.
+///
+/// [`Connection::split`] hands the process to the reader half, so nothing but
+/// that reader being dropped reaps it -- and the reader is exactly what stays
+/// blocked when a peer accepts and then never speaks. Two callers walk away
+/// from a reader in that state: a handshake that times out, and a connection
+/// liveness has declared dead. Both would leave an `ssh` running for as long
+/// as the kernel takes to give up on it, while the supervisor dials another.
+///
+/// Recorded before the handshake begins rather than after it succeeds: the
+/// handshake is the part that may never finish.
+#[derive(Clone, Default)]
+struct DialledChild(Arc<Mutex<Option<u32>>>);
+
+impl DialledChild {
+    /// Remembers the process this dial started, if it started one.
+    fn record(&self, pid: Option<u32>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = pid;
+    }
+
+    /// Takes the pid, leaving nothing behind.
+    ///
+    /// Taking rather than reading: whoever takes it owns the killing, and a
+    /// pid killed twice could by then belong to somebody else's process.
+    fn take(&self) -> Option<u32> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+/// Kills what a command dial started, if it started anything.
+///
+/// A socket dial has no process of its own, which is why this takes an
+/// `Option` rather than making every caller ask first.
+fn reap_dialled(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+
+    if let Err(error) = dispatch_os::process::terminate_tree(pid, DIAL_TEARDOWN_GRACE) {
+        tracing::warn!(%error, pid, "failed to stop the process behind a dial");
+    }
+}
 
 /// Failures attaching to a daemon.
 #[derive(Debug, thiserror::Error)]
@@ -160,6 +232,8 @@ struct Wire {
     last_asked: Mutex<Instant>,
     /// How patient to be with silence.
     liveness: Liveness,
+    /// The process behind the current connection, when the dial is a command.
+    child: DialledChild,
 }
 
 impl Wire {
@@ -175,8 +249,13 @@ impl Wire {
         };
 
         if Frame::write(writer, message).is_err() {
+            let child = self.child.take();
             *guard = None;
             self.connected.store(false, Ordering::Relaxed);
+            drop(guard);
+            // The writer going is only half of it: a command whose stdin
+            // closes need not exit, and `ssh` does not.
+            reap_dialled(child);
             return false;
         }
 
@@ -197,10 +276,23 @@ impl Wire {
             .elapsed()
     }
 
-    /// Records that the connection has broken.
+    /// Records that the connection has broken, and ends the process behind it.
+    ///
+    /// Dropping the writer closes a command's stdin, which is not enough:
+    /// `ssh` does not exit on it, and the reader that owns the process is
+    /// parked on a peer that has stopped speaking -- the very case liveness
+    /// declares dead. Left alone it would sit there for the kernel's own TCP
+    /// timeout, a quarter of an hour, while the supervisor dialled a second
+    /// one beside it.
+    ///
+    /// The pid is taken *before* the connection is marked down, because down
+    /// is what lets the supervisor dial again: taking second could hand this
+    /// call the fresh connection's child and kill that instead.
     fn lost(&self) {
+        let child = self.child.take();
         *self.writer.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.connected.store(false, Ordering::Relaxed);
+        reap_dialled(child);
     }
 }
 
@@ -365,27 +457,31 @@ impl Client {
         liveness: Liveness,
         dial: Dial,
     ) -> Result<Self, ClientError> {
-        let (reader, writer, device) = connect_within(name, role, &dial, HANDSHAKE_TIMEOUT)?;
+        let connected = connect_within(name, role, &dial, patience_for(&dial))?;
+
+        let child = DialledChild::default();
+        child.record(connected.child);
 
         let wire = Arc::new(Wire {
-            writer: Mutex::new(Some(writer)),
+            writer: Mutex::new(Some(connected.writer)),
             connected: AtomicBool::new(true),
             generation: AtomicU64::new(1),
             subscribed: AtomicBool::new(false),
             closed: AtomicBool::new(false),
-            device: Mutex::new(device),
+            device: Mutex::new(connected.device),
             name: name.to_string(),
             role,
             dial,
             last_heard: Mutex::new(Instant::now()),
             last_asked: Mutex::new(Instant::now()),
             liveness,
+            child,
         });
 
         let (outbox, outgoing) = channel::<ClientMessage>();
         let (incoming, inbox) = channel::<ServerMessage>();
 
-        read_from(reader, &incoming, &wire);
+        read_from(connected.reader, &incoming, &wire);
         write_to(outgoing, &wire);
         supervise(incoming, &wire);
 
@@ -459,13 +555,30 @@ impl Client {
 }
 
 /// What one successful connection hands back.
-type Connected = (Box<dyn Read + Send>, Box<dyn Write + Send>, String);
+struct Connected {
+    /// The half everything arriving is read from.
+    reader: Box<dyn Read + Send>,
+    /// The half everything sent is written to.
+    writer: Box<dyn Write + Send>,
+    /// What the daemon calls itself.
+    device: String,
+    /// The process behind a command dial, so whatever supervises this
+    /// connection can end it without waiting on the reader that owns it.
+    child: Option<u32>,
+}
 
 /// Connects and shakes hands, giving up if the peer does not answer in time.
 ///
 /// The handshake runs on a thread of its own so a peer that accepts and then
 /// says nothing costs one abandoned thread — which ends when that peer finally
 /// closes — rather than the client's ability to connect at all.
+///
+/// Abandoning the thread is not abandoning what it started: a command dial
+/// records its process before shaking hands, and giving up on the handshake
+/// kills it. Without that, the thread stays blocked in the read forever
+/// holding both halves, so the command's stdin is never even closed — and the
+/// supervisor, which repeats the dial every couple of seconds, would start a
+/// fresh one each time.
 fn connect_within(
     name: &str,
     role: Role,
@@ -475,9 +588,11 @@ fn connect_within(
     let (done, answer) = channel();
     let name = name.to_string();
     let for_thread = dial.clone();
+    let started = DialledChild::default();
+    let recording = started.clone();
 
     std::thread::spawn(move || {
-        let _ = done.send(connect(&name, role, &for_thread));
+        let _ = done.send(connect(&name, role, &for_thread, &recording));
     });
 
     match answer.recv_timeout(patience) {
@@ -486,14 +601,25 @@ fn connect_within(
         // waiting on a peer that never answers, so the timeout has to come
         // from the caller's side and cannot carry a stderr hint that only the
         // thread holds.
-        Err(_) => Err(ClientError::Handshake(format!(
-            "{dial} did not answer within {patience:?}"
-        ))),
+        Err(_) => {
+            reap_dialled(started.take());
+            Err(ClientError::Handshake(format!(
+                "{dial} did not answer within {patience:?}"
+            )))
+        }
     }
 }
 
 /// Connects and shakes hands, returning the two halves and the daemon's name.
-fn connect(name: &str, role: Role, dial: &Dial) -> Result<Connected, ClientError> {
+///
+/// `started` is filled in before the handshake, so a caller that stops waiting
+/// still has something to kill; see [`DialledChild`].
+fn connect(
+    name: &str,
+    role: Role,
+    dial: &Dial,
+    started: &DialledChild,
+) -> Result<Connected, ClientError> {
     let (connection, hint) = match dial {
         Dial::Endpoint(endpoint) => match Connection::connect_to(endpoint) {
             Ok(connection) => (connection, None),
@@ -508,6 +634,9 @@ fn connect(name: &str, role: Role, dial: &Dial) -> Result<Connected, ClientError
             (connection, Some(hint))
         }
     };
+
+    let child = connection.child_id();
+    started.record(child);
 
     let (mut reader, mut writer) = connection.split();
 
@@ -538,8 +667,23 @@ fn connect(name: &str, role: Role, dial: &Dial) -> Result<Connected, ClientError
         }
     };
 
-    Ok((reader, writer, device))
+    Ok(Connected {
+        reader,
+        writer,
+        device,
+        child,
+    })
 }
+
+/// How long to wait for a hint that has not arrived yet.
+///
+/// Bounded because a hint is worth a moment and never a hang: the caller is
+/// already holding a failure to report, and a command that says nothing more
+/// must not turn that failure into a wait.
+const HINT_PATIENCE: Duration = Duration::from_millis(50);
+
+/// How often to look while waiting for one.
+const HINT_POLL: Duration = Duration::from_millis(5);
 
 /// The command's own words, folded into a failure that would otherwise read
 /// as silence.
@@ -547,10 +691,25 @@ fn connect(name: &str, role: Role, dial: &Dial) -> Result<Connected, ClientError
 /// A command transport's real reason lives on its stderr: an SSH key refused,
 /// a binary missing on the far side. Neither reaches the protocol, so neither
 /// reaches the caller unless it is carried here.
+///
+/// Waited for, briefly, rather than read once: stderr is drained on a thread
+/// of its own, so a command that dies the instant it starts can fail the
+/// handshake while its own explanation is still in flight. Reading
+/// immediately makes reporting `ssh: Permission denied (publickey)` instead
+/// of nothing at all a race — one the caller loses exactly when the command
+/// failed fastest.
 fn with_hint(error: ClientError, hint: Option<&StderrHint>) -> ClientError {
-    match hint.and_then(StderrHint::first_line) {
-        Some(line) => ClientError::Handshake(format!("{error}: {line}")),
-        None => error,
+    let Some(hint) = hint else { return error };
+
+    let deadline = Instant::now() + HINT_PATIENCE;
+    loop {
+        if let Some(line) = hint.first_line() {
+            return ClientError::Handshake(format!("{error}: {line}"));
+        }
+        if Instant::now() >= deadline {
+            return error;
+        }
+        std::thread::sleep(HINT_POLL);
     }
 }
 
@@ -618,14 +777,16 @@ fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
             std::thread::sleep(backoff);
             backoff = (backoff * 2).min(MAX_RETRY);
 
-            match connect_within(&wire.name, wire.role, &wire.dial, HANDSHAKE_TIMEOUT) {
-                Ok((reader, writer, device)) => {
-                    *wire.device.lock().unwrap_or_else(|e| e.into_inner()) = device;
-                    *wire.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(writer);
+            let patience = patience_for(&wire.dial);
+            match connect_within(&wire.name, wire.role, &wire.dial, patience) {
+                Ok(connected) => {
+                    *wire.device.lock().unwrap_or_else(|e| e.into_inner()) = connected.device;
+                    *wire.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(connected.writer);
+                    wire.child.record(connected.child);
                     wire.generation.fetch_add(1, Ordering::Relaxed);
                     wire.heard();
                     wire.connected.store(true, Ordering::Relaxed);
-                    read_from(reader, &incoming, &wire);
+                    read_from(connected.reader, &incoming, &wire);
 
                     // Sent directly rather than through the queue: the queue's
                     // writer may be mid-message, and a subscribe that arrives
@@ -709,6 +870,7 @@ impl Client {
             last_heard: Mutex::new(Instant::now()),
             last_asked: Mutex::new(Instant::now()),
             liveness: Liveness::default(),
+            child: DialledChild::default(),
         });
 
         let (outbox, outgoing) = channel::<ClientMessage>();
@@ -734,6 +896,11 @@ impl Drop for Client {
         // Otherwise the supervisor would keep reconnecting to a daemon nobody
         // is listening to, for as long as the process lives.
         self.wire.closed.store(true, Ordering::Relaxed);
+
+        // And the command the last dial started would outlive the client that
+        // wanted it: the reader that owns it is parked, and nothing else is
+        // ever going to wake it.
+        reap_dialled(self.wire.child.take());
     }
 }
 

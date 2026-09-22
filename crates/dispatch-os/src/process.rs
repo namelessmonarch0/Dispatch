@@ -49,7 +49,23 @@ pub fn spawn_detached(
     program: &std::path::Path,
     args: &[std::ffi::OsString],
 ) -> Result<u32, ProcessError> {
-    imp::spawn_detached(program, args)
+    imp::spawn_detached(program, args, &[])
+}
+
+/// Starts `program` detached, with `env` set on top of what it inherits.
+///
+/// The variable this exists for is `DISPATCH_CONFIG_DIR`: a daemon started
+/// for an endpoint that is not the starter's own resolves that endpoint from
+/// its configuration directory, so it has to be told which one. Set on the
+/// child rather than on this process, because the parent is still using its
+/// own configuration -- and because `set_var` is unsound beside other
+/// threads, which every caller here has.
+pub fn spawn_detached_with_env(
+    program: &std::path::Path,
+    args: &[std::ffi::OsString],
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<u32, ProcessError> {
+    imp::spawn_detached(program, args, env)
 }
 
 /// Terminates `pid` and every process in its group or job.
@@ -68,12 +84,14 @@ mod imp {
     pub(super) fn spawn_detached(
         program: &std::path::Path,
         args: &[std::ffi::OsString],
+        env: &[(std::ffi::OsString, std::ffi::OsString)],
     ) -> Result<u32, ProcessError> {
         use std::os::unix::process::CommandExt;
 
         let mut command = std::process::Command::new(program);
         command
             .args(args)
+            .envs(env.iter().map(|(key, value)| (key, value)))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -195,11 +213,13 @@ mod imp {
     pub(super) fn spawn_detached(
         program: &std::path::Path,
         args: &[std::ffi::OsString],
+        env: &[(std::ffi::OsString, std::ffi::OsString)],
     ) -> Result<u32, ProcessError> {
         use std::os::windows::process::CommandExt;
 
         std::process::Command::new(program)
             .args(args)
+            .envs(env.iter().map(|(key, value)| (key, value)))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -291,6 +311,45 @@ mod tests {
 
         assert!(pid > 0);
         terminate_tree(pid, DEFAULT_GRACE).expect("the child can be killed");
+    }
+
+    #[test]
+    fn a_detached_child_is_given_the_environment_it_was_started_with() {
+        // How a bridge tells the daemon it starts which configuration
+        // directory to listen under. Proven by the child reporting the
+        // variable back, because a variable the parent set on itself would
+        // read the same either way.
+        let dir = std::env::temp_dir().join(format!("dispatch-os-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir is writable");
+        let answer = dir.join("answer");
+
+        let pid = spawn_detached_with_env(
+            &std::path::PathBuf::from("/bin/sh"),
+            &[
+                "-c".into(),
+                format!("printf '%s' \"$DISPATCH_TEST_DIR\" > {}", answer.display()).into(),
+            ],
+            &[("DISPATCH_TEST_DIR".into(), "/somewhere/else".into())],
+        )
+        .expect("the child starts");
+        assert!(pid > 0);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(&answer)
+                && !contents.is_empty()
+            {
+                assert_eq!(contents, "/somewhere/else");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never reported its environment"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

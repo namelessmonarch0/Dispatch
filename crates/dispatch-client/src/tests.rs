@@ -775,3 +775,214 @@ fn a_command_that_dies_is_respawned() {
     drop(client);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Reports whether `pid` names a live process.
+///
+/// The same probe `dispatch-os`'s reaping test uses: a signal of zero is
+/// delivered to nobody and only asks whether the pid exists.
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 sends nothing and only performs the kernel's own
+    // existence check, which is safe to ask about any pid.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// A directory of this test's own, emptied first.
+#[cfg(unix)]
+fn scratch(label: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("dispatch-client-{}-{label}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir is writable");
+    dir
+}
+
+/// The first pid a shell recorded, once it has recorded one.
+///
+/// Polled rather than read once: the shell forks and writes on its own
+/// schedule, and a test that read too early would prove nothing.
+#[cfg(unix)]
+fn first_recorded_pid(path: &Path) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path)
+            && let Some(first) = contents.lines().next()
+            && let Ok(pid) = first.trim().parse::<u32>()
+        {
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the shell never recorded a pid in {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A shell that forks a child, records its pid, and then never speaks.
+///
+/// The grandchild is what makes an assertion about it worth making: killing
+/// the shell alone would leave the process it forked running and holding the
+/// transport's pipes, which is exactly what `ssh` does.
+#[cfg(unix)]
+fn mute_command(pid_file: &Path, then: &str) -> (OsString, Vec<OsString>) {
+    (
+        OsString::from("sh"),
+        vec![
+            OsString::from("-c"),
+            OsString::from(format!(
+                "sleep 10 & echo $! >> {}; {then}sleep 10",
+                pid_file.display()
+            )),
+        ],
+    )
+}
+
+#[test]
+#[cfg(unix)]
+fn a_dial_that_never_answers_leaves_no_process_behind() {
+    // `ssh` prompting for a passphrase on the terminal rather than stdin, or
+    // a host that accepts the connection and then stalls: the command runs,
+    // says nothing, and never exits. The handshake gives up -- and the
+    // supervisor repeats the dial every couple of seconds, so a command left
+    // running is not one orphan but one per attempt, forever.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = scratch("mute");
+    let pid_file = dir.join("grandchild.pid");
+    let (program, args) = mute_command(&pid_file, "");
+
+    // Matched rather than `expect_err`: what a successful dial hands back is
+    // a pair of boxed streams, which cannot be printed.
+    let dialled = connect_within(
+        "test",
+        Role::Interface,
+        &Dial::Command { program, args },
+        Duration::from_millis(500),
+    );
+    let Err(error) = dialled else {
+        panic!("a command that never speaks cannot be handshaken");
+    };
+
+    assert!(
+        matches!(error, ClientError::Handshake(_)),
+        "expected the handshake to time out, got {error:?}"
+    );
+
+    let grandchild = first_recorded_pid(&pid_file);
+    assert!(
+        !pid_is_alive(grandchild),
+        "the dial's process tree outlived the handshake that walked away from it"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_connection_given_up_on_leaves_no_process_behind() {
+    // Liveness declares a silent connection dead, but the reader thread that
+    // owns the command is still parked on a peer that will never speak, so
+    // nothing it holds can be dropped. Over SSH that leaves one `ssh` alive
+    // for the fifteen minutes the kernel takes to give up on the TCP
+    // connection -- while the supervisor has already dialled a second one.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = scratch("wedged");
+    let pid_file = dir.join("grandchildren.pid");
+
+    // A canned Welcome, written exactly as `Frame` writes one, so the
+    // handshake completes and the connection is up before it goes quiet.
+    let mut encoded = Vec::new();
+    Frame::write(&mut encoded, &welcome()).expect("writing succeeds");
+    let escaped: String = encoded.iter().map(|b| format!("\\x{b:02x}")).collect();
+
+    let (program, args) = mute_command(&pid_file, &format!("printf '{escaped}'; "));
+
+    let client = Client::attach_over(
+        Role::Interface,
+        "test",
+        // Far shorter than a real client's patience, which is tens of
+        // seconds: what is under test is what happens once silence has been
+        // declared, not how long it takes to declare it.
+        Liveness {
+            interval: Duration::from_millis(50),
+            silence: Duration::from_millis(200),
+        },
+        program,
+        args,
+    )
+    .expect("the command answers the handshake");
+
+    let grandchild = first_recorded_pid(&pid_file);
+    assert!(
+        pid_is_alive(grandchild),
+        "the dial's process tree should be running while the connection is up"
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while pid_is_alive(grandchild) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(
+        !pid_is_alive(grandchild),
+        "a connection declared dead left its command running"
+    );
+
+    drop(client);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_hint_that_arrives_late_still_reaches_the_caller() {
+    // The stderr drain runs on a thread of its own, so a command that dies
+    // the instant it starts can lose the race: stdout closes, the handshake
+    // fails, and the reason is still in flight. Closing stdout first makes
+    // that ordering certain rather than occasional -- which is the same
+    // ordering that makes reading the hint immediately a flaky test.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let error = Client::attach_over(
+        Role::Interface,
+        "test",
+        Liveness::default(),
+        OsString::from("sh"),
+        vec![
+            OsString::from("-c"),
+            OsString::from(
+                "exec 1>&-; sleep 0.02; echo 'dispatchd: command not found' 1>&2; exit 127",
+            ),
+        ],
+    )
+    .expect_err("the command refuses");
+
+    assert!(
+        error.to_string().contains("command not found"),
+        "the command's own words reach the caller even when they arrive last: {error}"
+    );
+}
+
+#[test]
+fn a_command_dial_is_given_longer_to_answer_than_a_socket() {
+    // The two dials are not the same question. A socket is a daemon on this
+    // machine: it answers at once or it is broken. A command may be
+    // `ssh host dispatchd --stdio`, which has a network, an authentication,
+    // a remote exec and a possible cold daemon start in front of it -- and
+    // `--stdio` alone waits ten seconds for that daemon to listen.
+    let socket = patience_for(&Dial::Endpoint(PathBuf::from("/tmp/dispatchd.sock")));
+    let command = patience_for(&Dial::Command {
+        program: "ssh".into(),
+        args: vec!["host".into(), "dispatchd".into(), "--stdio".into()],
+    });
+
+    assert_eq!(
+        socket, SOCKET_HANDSHAKE_TIMEOUT,
+        "a socket keeps the short budget"
+    );
+    assert!(
+        command >= Duration::from_secs(30),
+        "a cold `--stdio` start alone may take ten seconds, got {command:?}"
+    );
+}
