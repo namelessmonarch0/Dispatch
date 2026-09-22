@@ -108,10 +108,11 @@ is a daemon.
 ## The far side: `dispatchd --stdio`
 
 ```
-dispatchd --stdio [projects…]
+dispatchd --stdio [--endpoint <path>] [projects…]
 ```
 
-Does not listen. It connects to *its own machine's* endpoint and pumps bytes:
+Does not listen. It connects to an endpoint — `--endpoint` when given, its own
+configuration's otherwise — and pumps bytes:
 stdin into the socket, the socket into stdout, until either end closes. Two
 threads, no framing — it is a pipe, and it must never parse what it carries, or
 a protocol version it does not know would break a client the daemon could have
@@ -124,10 +125,19 @@ connection dropping costs the view and nothing else. That is the whole reason
 the daemon exists, and a `--stdio` that owned the agents itself would give it
 away.
 
+`--endpoint` exists for the same reason the client has `--daemon`: a test, and
+later a wrapper, needs to name the socket rather than inherit it from an
+environment variable it would have to set on a child process it does not spawn
+itself.
+
 Exit status says what happened: 0 when either side closed cleanly, non-zero
-with a message on stderr when the daemon could not be reached or started. The
-client surfaces that stderr, so `dispatchd: command not found` reaches the user
-rather than a bare timeout.
+with a message on stderr when the daemon could not be reached or started.
+
+The client keeps the child's stderr rather than discarding it: every line goes
+to the log, and the first line is attached to the `ClientError` when the
+handshake fails. Without that, `ssh: Permission denied (publickey)` and
+`dispatchd: command not found` are both just a timeout, and the user has no way
+to tell them apart.
 
 ## Reaching it from the command line
 
@@ -173,13 +183,15 @@ exists.
 - **`dispatchd`** — `--stdio` bridges to a listening daemon: frames written to
   its stdin reach the daemon and its answers come back on stdout. A second test
   covers no daemon listening: the bridge starts one, then bridges.
-- **End to end** — `dispatch --attach --daemon-command "<dispatchd path>
-  --stdio"` against a temporary config directory: both machines listed (the
-  local socket and the bridged one, which is the same daemon reached two ways
-  — so the test uses a second config directory for the bridge), a pane spawned
-  through the bridge that echoes what is typed, then the bridge child killed
-  and the pane still there after the client respawns it. That last step is the
-  slice's claim: the transport can die without the agents dying.
+- **End to end** — two temporary configuration directories, each with its own
+  daemon, and one client:
+  `dispatch --attach --daemon-command "<dispatchd path> --stdio --endpoint
+  <second config>/dispatchd.sock"`. The client reaches the first daemon over a
+  socket and the second over a bridged child, so the sidebar lists two
+  machines. Then: a pane spawned on the bridged machine echoes what is typed at
+  it; the bridge child is killed; the client respawns it and the pane is still
+  there. That last step is the slice's claim — the transport can die without
+  the agents dying, because the agents were never the transport's.
 
 ## Follow-ups this slice creates
 
