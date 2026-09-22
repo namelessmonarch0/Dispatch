@@ -143,16 +143,18 @@ impl Connection {
             described.push_str(&arg.to_string_lossy());
         }
 
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| IpcError::Spawn {
-                command: described.clone(),
-                source,
-            })?;
+            .stderr(Stdio::piped());
+        put_in_its_own_group(&mut command);
+
+        let mut child = command.spawn().map_err(|source| IpcError::Spawn {
+            command: described.clone(),
+            source,
+        })?;
 
         let reader = child.stdout.take().expect("stdout was piped");
         let writer = child.stdin.take().expect("stdin was piped");
@@ -220,10 +222,65 @@ impl Drop for Connection {
         // Asked to stop and then waited for: a child left unreaped is a
         // zombie, and one left running is an `ssh` nobody can see.
         if let Some(child) = &mut self.child {
-            let _ = child.kill();
-            let _ = child.wait();
+            reap(child);
         }
     }
+}
+
+/// How long a command transport's process tree is given to exit on its own.
+///
+/// Shorter than [`process::DEFAULT_GRACE`](crate::process::DEFAULT_GRACE):
+/// that one waits for an agent closing a pane, this one for a transport
+/// tearing down, which should not make a reconnect wait on it.
+const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Terminates a command transport's whole process tree, then reaps its
+/// immediate child.
+///
+/// `ssh` and `sh -c` both fork; killing only the process this crate spawned
+/// would leave those orphaned and holding the pipes this `Connection` reads
+/// and writes, which is what [`put_in_its_own_group`] and
+/// [`process::terminate_tree`](crate::process::terminate_tree) are for.
+fn reap(child: &mut std::process::Child) {
+    let _ = crate::process::terminate_tree(child.id(), TEARDOWN_GRACE);
+    let _ = child.wait();
+}
+
+/// Puts `command`'s child in a process group or job of its own, so
+/// [`process::terminate_tree`](crate::process::terminate_tree) can reach
+/// everything it forks rather than only the child itself.
+///
+/// The same treatment [`process::spawn_detached`](crate::process::spawn_detached)
+/// gives the daemon it starts, for the same reason: a command transport's
+/// child is not necessarily a leaf either.
+#[cfg(unix)]
+fn put_in_its_own_group(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: setsid is async-signal-safe and is the documented way to leave
+    // the parent's session and become a process group leader, which is what
+    // lets `killpg` reach every descendant later. The closure allocates
+    // nothing and touches no shared state.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+fn put_in_its_own_group(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+
+    /// Starts the child as the root of its own process group, so a signal
+    /// meant for it does not also reach this process, and so it can be
+    /// addressed as a group later.
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
 }
 
 /// A reader that reaps its process when it is dropped.
@@ -244,8 +301,7 @@ impl Read for ChildReader {
 
 impl Drop for ChildReader {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        reap(&mut self.child);
     }
 }
 
@@ -1061,19 +1117,67 @@ mod tests {
     fn dropping_a_command_connection_reaps_its_child() {
         // A client reconnects by dialling again. A transport that left its
         // child running would leak one per attempt, invisibly.
-        let connection =
-            Connection::over_command(std::ffi::OsStr::new("cat"), &[]).expect("cat exists");
+        //
+        // `cat` exits the moment its stdin pipe closes -- which happens by
+        // ordinary field drop regardless of what `Connection::drop` does --
+        // so it would pass this test even with the reap deleted. `sleep`
+        // does not exit on EOF; only an actual kill ends it. Its
+        // grandchild -- a second `sleep` the shell backgrounds and records
+        // the pid of -- is what proves the whole tree is reached and not
+        // just the immediate child: a fix that kills only `sh` would still
+        // leave the grandchild running.
+        fn pid_is_alive(pid: u32) -> bool {
+            // SAFETY: signal 0 sends nothing and only probes whether the pid
+            // exists, which is safe to ask about any pid, alive or not.
+            unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("dispatch-ipc-test-{}-reap", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir is writable");
+        let pid_file = dir.join("grandchild.pid");
+
+        let connection = Connection::over_command(
+            std::ffi::OsStr::new("sh"),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from(format!(
+                    "sleep 30 & echo $! > {}; wait",
+                    pid_file.display()
+                )),
+            ],
+        )
+        .expect("sh exists");
+
         let pid = connection
             .child_id()
             .expect("a command transport has a child");
 
+        // Wait for the shell to record its background child's pid.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let grandchild = loop {
+            if let Ok(contents) = std::fs::read_to_string(&pid_file)
+                && let Ok(grandchild) = contents.trim().parse::<u32>()
+            {
+                break grandchild;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell never wrote the grandchild's pid"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
         drop(connection);
 
-        // A reaped child's pid answers no signal; an unreaped one does.
-        // SAFETY: signal 0 sends nothing and only probes whether the pid
-        // exists, which is safe to ask about any pid, alive or not.
-        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
-        assert!(!alive, "the child is gone");
+        // A reaped process's pid answers no signal; an unreaped one does.
+        assert!(!pid_is_alive(pid), "the shell is gone");
+        assert!(
+            !pid_is_alive(grandchild),
+            "the grandchild outlived the process group"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
