@@ -346,8 +346,9 @@ pub struct App {
     child_titles: HashMap<PaneId, String>,
     status: String,
     quit: bool,
-    /// A project to reselect once its `ProjectOpened` comes back, because a
-    /// reconnect forgot it out from under a selection that was pointed at it.
+    /// A project to reselect once its `ProjectOpened` comes back, keyed by
+    /// the device it belongs to, because a reconnect forgot it out from
+    /// under a selection that was pointed at it.
     ///
     /// `forget_device` clears the selection before the replay that would
     /// otherwise restore it has arrived, and by the time it does,
@@ -356,7 +357,17 @@ pub struct App {
     /// moves the view to whichever project happens to be first — and moves
     /// keystrokes with it, since a pane only gets focus while its project is
     /// selected.
-    reopening_selection: Option<ProjectId>,
+    ///
+    /// A remembered intention, not a fact, so it has to stop being true
+    /// before what it names does: consumed the moment a matching
+    /// `ProjectOpened` restores it; overwritten the next time this same
+    /// device reconnects, so a daemon that keeps restarting and minting
+    /// fresh `ProjectId`s cannot leave this naming one that will never come
+    /// back; cleared by `remove_device`, which took the device away it was
+    /// promised to; and cleared by any explicit selection, because the
+    /// user's own choice of where to look always outranks a stale one of
+    /// ours.
+    reopening_selection: Option<(DeviceId, ProjectId)>,
     /// Every `ClientMessage` a decision would have sent, kept only so tests
     /// can tell `a` and `A` apart without a real daemon to send it to.
     #[cfg(test)]
@@ -423,7 +434,7 @@ impl App {
         // running with no row, no reader and nobody left to stop it.
         if let Some(local) = self.local.take() {
             self.forget_device(local);
-            self.state.remove_device(local);
+            self.remove_device(local);
         }
 
         let device = self.state.add_device(Device::new(client.device()));
@@ -945,6 +956,17 @@ impl App {
             client.send(ClientMessage::OpenProject { root: root.clone() });
         }
 
+        // Dropped first, regardless of what is on screen now: an entry left
+        // over from this same device's last reconnect never got consumed
+        // (the daemon behind it minted fresh ids on the way back, say), and
+        // a second reconnect is no more likely to see it answered. Without
+        // this a daemon that keeps restarting would pile up an intention
+        // this device can never fulfil.
+        self.reopening_selection = self
+            .reopening_selection
+            .take()
+            .filter(|(d, _)| *d != device);
+
         // Remembered before it is forgotten: if what is on screen right now
         // belongs to this machine, its `ProjectOpened` is already on the way
         // back and should be selected again rather than left to the fallback
@@ -955,13 +977,42 @@ impl App {
                 .iter()
                 .any(|p| p.id == selected && p.device == device)
         }) {
-            self.reopening_selection = self.state.selected_project();
+            self.reopening_selection = self
+                .state
+                .selected_project()
+                .map(|selected| (device, selected));
         }
 
         self.forget_device(device);
         self.status = format!("reattached to {name}");
 
         true
+    }
+
+    /// Removes a device for good, rather than a connection that might come
+    /// back.
+    ///
+    /// A promise to reselect one of this device's projects cannot be kept
+    /// once the device it was made for is gone, so it is dropped here rather
+    /// than left to sit unconsumed.
+    fn remove_device(&mut self, device: DeviceId) {
+        self.state.remove_device(device);
+        self.reopening_selection = self
+            .reopening_selection
+            .take()
+            .filter(|(d, _)| *d != device);
+    }
+
+    /// Selects a project by the user's own action, rather than by a
+    /// reconnect restoring what was already on screen.
+    ///
+    /// The user's own choice of where to look always outranks a reconnect
+    /// that is still waiting to put the view back where it was: without
+    /// this, looking somewhere else during an outage would be undone the
+    /// moment that machine's replay caught up.
+    fn select_project(&mut self, project: ProjectId) {
+        self.reopening_selection = None;
+        let _ = self.state.select_project(project);
     }
 
     /// Forgets what one machine told us over a connection that has ended.
@@ -1038,7 +1089,7 @@ impl App {
                 // this only recovers the selection itself — `adopt_pane`
                 // picks up the focus once they do, the same way it would for
                 // a project selected for the first time.
-                if self.reopening_selection == Some(id) {
+                if self.reopening_selection == Some((device, id)) {
                     self.reopening_selection = None;
                     let _ = self.state.select_project(id);
                 }
@@ -1375,7 +1426,7 @@ impl App {
                 // project's: a click both moves the view there and folds the
                 // panes away.
                 sidebar::Hit::Project(id) => {
-                    let _ = self.state.select_project(id);
+                    self.select_project(id);
                     self.state.toggle_project_collapsed(id);
                 }
                 sidebar::Hit::Twisty(id) => self.state.toggle_pane_collapsed(id),
@@ -1821,7 +1872,7 @@ impl App {
                     .find(|p| p.id.to_string() == id)
                     .map(|p| p.id)
                 {
-                    let _ = self.state.select_project(project);
+                    self.select_project(project);
                 }
             }
             OverlayKind::Register => {
@@ -1953,7 +2004,7 @@ impl App {
             .find(|project| project.root == root)
             .map(|project| project.id)
         {
-            let _ = self.state.select_project(project);
+            self.select_project(project);
         }
 
         self.status = format!("opened {}", root.display());
@@ -3664,6 +3715,77 @@ mod tests {
         );
     }
 
+    /// The detail text of every row the project picker is currently showing.
+    fn picker_details(app: &App) -> Vec<String> {
+        let Some(Overlay::Project(picker)) = &app.overlay else {
+            panic!("the project picker should be open");
+        };
+
+        picker
+            .items()
+            .iter()
+            .map(|item| item.detail.clone().unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn two_devices_with_a_same_named_project_get_distinguishable_rows() {
+        // The same path on purpose -- a checkout mirrored at an identical
+        // location on two machines -- so nothing but the device tells the two
+        // rows apart. Two different paths would pass this test even without
+        // the fix, since the paths alone would already differ.
+        let (first, first_daemon, _first_sent) = Client::for_test();
+        first.handle().rename_for_test("near");
+        let (second, second_daemon, _second_sent) = Client::for_test();
+        second.handle().rename_for_test("far");
+
+        let mut app = App::new(HarnessRegistry::default());
+        app.attach(first);
+        app.attach(second);
+
+        first_daemon
+            .send(ServerMessage::ProjectOpened {
+                project: Project::new("/checkout/project", ProjectSource::LocalDir),
+            })
+            .expect("the app is listening");
+        second_daemon
+            .send(ServerMessage::ProjectOpened {
+                project: Project::new("/checkout/project", ProjectSource::LocalDir),
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        open_project_picker(&mut app);
+        let details = picker_details(&app);
+
+        assert_eq!(details.len(), 2, "one row per project: {details:?}");
+        assert_ne!(
+            details[0], details[1],
+            "two identically-rooted projects on different machines must read differently: {details:?}"
+        );
+        assert!(
+            details[0].contains("near") && details[1].contains("far"),
+            "and each row should say which machine it is: {details:?}"
+        );
+    }
+
+    #[test]
+    fn one_device_leaves_the_project_picker_unchanged() {
+        // The common case, unaffected: with nothing to tell apart, the row is
+        // just the path, exactly as it was before a second device existed.
+        let mut app = App::new(HarnessRegistry::default());
+        app.add_project(PathBuf::from("/tmp/alpha"));
+
+        open_project_picker(&mut app);
+        let details = picker_details(&app);
+
+        assert_eq!(
+            details,
+            ["/tmp/alpha".to_string()],
+            "one machine's row should carry nothing but the path"
+        );
+    }
+
     #[test]
     fn dropping_a_project_from_the_picker_forgets_it_for_good() {
         let dir = scratch("dropped");
@@ -4712,14 +4834,22 @@ mod tests {
         );
     }
 
-    /// Two attached daemons, each with a project of its own.
-    fn two_daemons() -> (
+    /// What [`two_daemons`] hands back: the app, each daemon's project id, the
+    /// `Sender<ServerMessage>` half of each fake daemon (for replaying a
+    /// reconnect, which needs to speak as the daemon), and the outbox
+    /// `Receiver` most callers already used, one pair per daemon.
+    type TwoDaemons = (
         App,
         ProjectId,
         ProjectId,
+        Sender<ServerMessage>,
+        Sender<ServerMessage>,
         Receiver<ClientMessage>,
         Receiver<ClientMessage>,
-    ) {
+    );
+
+    /// Two attached daemons, each with a project of its own.
+    fn two_daemons() -> TwoDaemons {
         let (first, first_daemon, first_sent) = Client::for_test();
         let (second, second_daemon, second_sent) = Client::for_test();
 
@@ -4739,7 +4869,15 @@ mod tests {
             .expect("the app is listening");
         app.poll_daemon();
 
-        (app, alpha_id, beta_id, first_sent, second_sent)
+        (
+            app,
+            alpha_id,
+            beta_id,
+            first_daemon,
+            second_daemon,
+            first_sent,
+            second_sent,
+        )
     }
 
     /// The device a project is on, as the sidebar would read it.
@@ -4753,7 +4891,7 @@ mod tests {
 
     #[test]
     fn each_daemons_projects_are_attributed_to_its_own_device() {
-        let (app, alpha, beta, _, _) = two_daemons();
+        let (app, alpha, beta, _, _, _, _) = two_daemons();
 
         assert_eq!(app.state.devices().len(), 2);
         assert_ne!(device_of(&app, alpha), device_of(&app, beta));
@@ -4766,7 +4904,7 @@ mod tests {
         // was never registered is drawn nowhere at all — open, invisible and
         // unreachable. `attach` registers the machine before its connection
         // can announce anything, which is what makes that impossible.
-        let (app, alpha, beta, _, _) = two_daemons();
+        let (app, alpha, beta, _, _, _, _) = two_daemons();
 
         for project in [alpha, beta] {
             let device = device_of(&app, project).expect("the project is registered");
@@ -4781,7 +4919,7 @@ mod tests {
     fn a_keystroke_reaches_the_daemon_the_pane_is_on() {
         // The whole point of the slice: one screen, two machines, and no
         // chance of typing into the wrong one.
-        let (mut app, _alpha, beta, first_sent, second_sent) = two_daemons();
+        let (mut app, _alpha, beta, _, _, first_sent, second_sent) = two_daemons();
         let pane = PaneId::new();
         // The pane belongs to the second daemon's project.
         app.apply(spawned(pane, beta, "shell", None, false));
@@ -4810,7 +4948,7 @@ mod tests {
         // connection counts a new generation, and `poll_daemon` is what
         // notices. Everything that daemon described belongs to a socket that
         // is gone, and nothing the other one described does.
-        let (mut app, alpha, beta, first_sent, second_sent) = two_daemons();
+        let (mut app, alpha, beta, _, _, first_sent, second_sent) = two_daemons();
 
         // A root this client asked the first daemon for, so its reconnect has
         // something of its own to ask again.
@@ -4857,6 +4995,75 @@ mod tests {
     }
 
     #[test]
+    fn a_reconnect_restores_the_project_that_was_selected() {
+        // The other half of `one_daemon_restarting_rebuilds_only_its_own_rows`:
+        // the reconnect does not just rebuild the rows it forgot, it has to
+        // put the view back where it was, rather than leaving it on whichever
+        // project the interim fallback happened to land on -- and moving
+        // keystrokes with it, since a pane only gets focus while its project
+        // is selected.
+        let (mut app, alpha, beta, first_daemon, _second_daemon, _, _) = two_daemons();
+
+        let _ = app.state.select_project(alpha);
+
+        app.attachments()[0].client.handle().reconnect_for_test();
+        app.poll_daemon();
+
+        assert_eq!(
+            app.state.selected_project(),
+            Some(beta),
+            "while the reconnect is in flight the fallback lands on whatever is left"
+        );
+
+        // The replay: the same daemon, so the same id.
+        let mut replayed = Project::new("/tmp/alpha", ProjectSource::LocalDir);
+        replayed.id = alpha;
+        first_daemon
+            .send(ServerMessage::ProjectOpened { project: replayed })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        assert_eq!(
+            app.state.selected_project(),
+            Some(alpha),
+            "the view returns to the project the user was looking at"
+        );
+    }
+
+    #[test]
+    fn a_selection_made_during_the_outage_is_not_undone_by_the_replay() {
+        // The other side of restoring the selection: a reconnect's replay is
+        // not the only thing that can happen while a machine is away, and the
+        // user looking somewhere else on purpose has to outrank a promise
+        // this client made to itself before the outage started.
+        let (mut app, alpha, beta, first_daemon, _second_daemon, _, _) = two_daemons();
+
+        let _ = app.state.select_project(alpha);
+
+        app.attachments()[0].client.handle().reconnect_for_test();
+        app.poll_daemon();
+
+        // The user looks at the other project during the outage -- through
+        // `App::select_project`, the same path a click on the sidebar or the
+        // project picker takes, which is what is supposed to let go of the
+        // reconnect's own intention.
+        app.select_project(beta);
+
+        let mut replayed = Project::new("/tmp/alpha", ProjectSource::LocalDir);
+        replayed.id = alpha;
+        first_daemon
+            .send(ServerMessage::ProjectOpened { project: replayed })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        assert_eq!(
+            app.state.selected_project(),
+            Some(beta),
+            "the replay must not yank the view back to a project the user left on purpose"
+        );
+    }
+
+    #[test]
     fn a_reattached_daemon_that_renamed_itself_updates_its_row() {
         // sync_attachment reads client.device() every poll and used it only
         // for the "reattached to {name}" status -- the row in state kept
@@ -4885,7 +5092,7 @@ mod tests {
         // Each connection carries its own generation, so polling a fleet that
         // has not changed must rebuild nothing and ask for no frame — this
         // runs every tick.
-        let (mut app, alpha, beta, _, _) = two_daemons();
+        let (mut app, alpha, beta, _, _, _, _) = two_daemons();
 
         assert!(!app.poll_daemon(), "nothing changed, so nothing to draw");
         assert!(app.state.projects().iter().any(|p| p.id == alpha));
@@ -4950,7 +5157,7 @@ mod tests {
 
     #[test]
     fn a_keystroke_for_an_unreachable_machine_is_refused_out_loud() {
-        let (mut app, _alpha, beta, _, second_sent) = two_daemons();
+        let (mut app, _alpha, beta, _, _, _, second_sent) = two_daemons();
         let pane = PaneId::new();
         app.apply(spawned(pane, beta, "shell", None, false));
         let _ = app.state.select_project(beta);

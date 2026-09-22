@@ -1211,13 +1211,15 @@ fn kill_bridge_to(endpoint: &std::path::Path) {
         .lines()
         .filter_map(|line| line.trim().parse::<u32>().ok())
     {
+        // The file name rather than a suffix match: `ends_with("dispatchd")`
+        // would just as happily kill a `my-dispatchd` on the same box.
         let is_bridge = std::process::Command::new("ps")
             .args(["-o", "comm=", "-p", &pid.to_string()])
             .output()
             .is_ok_and(|out| {
-                String::from_utf8_lossy(&out.stdout)
-                    .trim()
-                    .ends_with("dispatchd")
+                std::path::Path::new(String::from_utf8_lossy(&out.stdout).trim())
+                    .file_name()
+                    .is_some_and(|name| name == "dispatchd")
             });
 
         if is_bridge {
