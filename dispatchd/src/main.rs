@@ -5,13 +5,16 @@
 //! demand — decides how the process is detached, and a daemon that forks
 //! itself cannot be debugged by running it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use dispatch_config::HarnessRegistry;
 use dispatch_daemon::{Daemon, Shutdown};
 use dispatch_os::ipc::Listener;
+
+mod bridge;
 
 /// The process that owns Dispatch's agents.
 #[derive(Debug, Parser)]
@@ -32,11 +35,39 @@ struct Args {
     /// shells and most CI runners never set.
     #[arg(long, default_value_t = dispatch_os::host::hostname())]
     device: String,
+
+    /// Carry one client's frames to this machine's daemon over stdin and
+    /// stdout instead of listening on a socket.
+    ///
+    /// What `ssh host dispatchd --stdio` runs. The agents stay with the
+    /// long-lived daemon, so the SSH connection dropping costs the view and
+    /// nothing else.
+    #[arg(long)]
+    stdio: bool,
+
+    /// The daemon to bridge to, when it is not this configuration's own.
+    #[arg(long, value_name = "PATH")]
+    endpoint: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     init_logging(args.log_file.clone())?;
+
+    if args.stdio {
+        let endpoint = match args.endpoint.clone() {
+            Some(endpoint) => endpoint,
+            None => dispatch_os::ipc::endpoint().context("failed to locate the endpoint")?,
+        };
+
+        // Nothing listening yet: start a daemon the way a client does, then
+        // bridge to it. The agents have to outlive this pipe.
+        if dispatch_os::ipc::Connection::connect_to(&endpoint).is_err() {
+            start_daemon_for(&endpoint, &args.projects)?;
+        }
+
+        return bridge::run(&endpoint);
+    }
 
     // Written on first run and never overwritten, so local edits survive. The
     // daemon is the process that starts agents, so it is the one that needs
@@ -112,6 +143,33 @@ fn main() -> Result<()> {
     drop(pid_file);
     tracing::info!("stopped");
     Ok(())
+}
+
+/// Starts a daemon for `endpoint` and waits until it answers.
+///
+/// The bridge is not the daemon: it exits with its SSH session, and agents
+/// that died with it would make a remote machine useless for the one thing
+/// the daemon exists to provide.
+fn start_daemon_for(endpoint: &Path, projects: &[PathBuf]) -> Result<()> {
+    let program = std::env::current_exe().context("failed to locate this binary")?;
+    let args: Vec<std::ffi::OsString> = projects.iter().map(Into::into).collect();
+
+    let pid = dispatch_os::process::spawn_detached(&program, &args)
+        .with_context(|| format!("failed to start {}", program.display()))?;
+    tracing::info!(pid, "started a daemon to bridge to");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if dispatch_os::ipc::Connection::connect_to(endpoint).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    anyhow::bail!(
+        "a daemon was started but never listened on {}",
+        endpoint.display()
+    )
 }
 
 /// The daemon's process id on disk, removed when the daemon stops.

@@ -414,6 +414,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dispatch-client",
  "dispatch-config",
  "dispatch-core",
  "dispatch-daemon",

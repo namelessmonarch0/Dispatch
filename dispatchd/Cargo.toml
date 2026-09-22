@@ -20,6 +20,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+dispatch-client = { workspace = true }
 dispatch-core = { workspace = true }
 dispatch-os = { workspace = true }
 dispatch-proto = { workspace = true }

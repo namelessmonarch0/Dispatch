@@ -219,6 +219,241 @@ fn output_of(messages: &[ServerMessage], pane: dispatch_core::PaneId) -> String 
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// A configuration directory for a bridge test, with the environment set
+/// process-wide rather than passed to one child's `envs()`.
+///
+/// `dispatch_client::Client::attach_over` respawns its command on every
+/// reconnect and gives it no environment of its own -- it just inherits this
+/// process's -- so a test that reaches `dispatchd --stdio` through it has to
+/// point the whole test process at its directory, the way [`Endpoint`] above
+/// does, rather than the per-child [`Fixture::env`]-style scoping that
+/// `dispatch/tests/end_to_end.rs` uses for daemons it starts directly.
+struct Fixture {
+    dir: PathBuf,
+    previous: Option<std::ffi::OsString>,
+    project: PathBuf,
+}
+
+impl Fixture {
+    /// The label is short because a Unix socket address is limited to about a
+    /// hundred bytes, and the daemon's endpoint lives in here.
+    fn new(label: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("dispatchd-it-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir is writable");
+
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).expect("temp dir is writable");
+
+        let previous = std::env::var_os(dispatch_os::paths::CONFIG_DIR_ENV);
+
+        // SAFETY: callers hold `LOCK` for the fixture's whole lifetime, so no
+        // other test observes this process's environment mid-change.
+        unsafe { std::env::set_var(dispatch_os::paths::CONFIG_DIR_ENV, &dir) };
+
+        Self {
+            dir,
+            previous,
+            project,
+        }
+    }
+
+    /// Where a daemon serving this fixture listens.
+    fn endpoint(&self) -> PathBuf {
+        self.dir.join("dispatchd.sock")
+    }
+
+    /// The project a daemon started for this fixture should serve.
+    fn project(&self) -> PathBuf {
+        self.project.clone()
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // SAFETY: as above.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(dispatch_os::paths::CONFIG_DIR_ENV, value),
+                None => std::env::remove_var(dispatch_os::paths::CONFIG_DIR_ENV),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The daemon binary, as a path `Client::attach_over` can respawn.
+fn dispatchd_binary() -> &'static str {
+    env!("CARGO_BIN_EXE_dispatchd")
+}
+
+/// A running `dispatchd`, started directly rather than through a bridge.
+///
+/// Separate from [`RunningDaemon`]: the bridge tests need a `stop` that waits
+/// for a graceful exit, the way an operator's `kill` would, so that the
+/// daemon it started for a cold bridge is not still shutting down when the
+/// next test claims the same temp directory.
+struct Daemon(Child);
+
+impl Daemon {
+    /// Starts a daemon named `"local"`, serving `fixture`'s project.
+    fn start(fixture: &Fixture) -> Self {
+        let child = Command::new(dispatchd_binary())
+            .arg(fixture.project())
+            .arg("--device")
+            .arg("local")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the built dispatchd runs");
+
+        let daemon = Self(child);
+        daemon.wait_until_listening(fixture);
+        daemon
+    }
+
+    /// Blocks until the daemon accepts a connection, or explains why it
+    /// never did.
+    fn wait_until_listening(&self, fixture: &Fixture) {
+        let deadline = Instant::now() + PATIENCE;
+        while Instant::now() < deadline {
+            if Connection::connect_to(&fixture.endpoint()).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!(
+            "the daemon never listened on {}",
+            fixture.endpoint().display()
+        );
+    }
+
+    /// Stops the daemon the way an operator would, so it takes its panes
+    /// with it rather than orphaning them.
+    fn stop(mut self) {
+        #[cfg(unix)]
+        let asked = Command::new("kill")
+            .arg("-TERM")
+            .arg(self.0.id().to_string())
+            .status()
+            .is_ok_and(|s| s.success());
+        #[cfg(not(unix))]
+        let asked = false;
+
+        if asked {
+            let deadline = Instant::now() + PATIENCE;
+            while Instant::now() < deadline {
+                if matches!(self.0.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Stops the daemon a cold-started bridge left running, by the pid it
+/// recorded.
+///
+/// A bridge-started daemon outlives the bridge on purpose -- that is the
+/// point of Task 4 -- so a test that triggers one has to kill it by hand, the
+/// way `dispatch/tests/end_to_end.rs`'s `stop_recorded_daemon` does, or it
+/// leaks a `dispatchd` per run.
+fn stop_recorded_daemon(fixture: &Fixture) {
+    let pid_file = fixture.dir.join("dispatchd.pid");
+
+    let Ok(contents) = std::fs::read_to_string(&pid_file) else {
+        return;
+    };
+    let Ok(pid) = contents.trim().parse::<u32>() else {
+        return;
+    };
+
+    if cfg!(windows) {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status();
+    } else {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the bridge test drives a POSIX pipeline")]
+fn a_bridge_carries_a_clients_hello_to_the_daemon() {
+    // The bridge is a byte pump: what a client writes to its stdin has to
+    // reach the daemon, and the daemon's answer has to come back on stdout.
+    // It must never parse the frames -- a bridge that understood the protocol
+    // would break a client this daemon could otherwise serve.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new("bridge");
+    let daemon = Daemon::start(&fixture);
+
+    let client = dispatch_client::Client::attach_over(
+        dispatch_proto::Role::Interface,
+        "bridge-test",
+        dispatch_client::Liveness::default(),
+        dispatchd_binary().into(),
+        vec![
+            "--stdio".into(),
+            "--endpoint".into(),
+            fixture.endpoint().into(),
+        ],
+    )
+    .expect("the bridge reaches the daemon");
+
+    assert!(client.is_connected());
+    assert_eq!(
+        client.device(),
+        "local",
+        "the daemon named itself through the pipe"
+    );
+
+    drop(client);
+    daemon.stop();
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the bridge test drives a POSIX pipeline")]
+fn a_bridge_starts_a_daemon_when_none_is_listening() {
+    // A machine nobody has used yet still has to answer: the bridge starts
+    // the daemon it needs, rather than failing and leaving the user to ssh in
+    // and do it by hand.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new("bridge-cold");
+
+    let client = dispatch_client::Client::attach_over(
+        dispatch_proto::Role::Interface,
+        "bridge-test",
+        dispatch_client::Liveness::default(),
+        dispatchd_binary().into(),
+        vec![
+            "--stdio".into(),
+            "--endpoint".into(),
+            fixture.endpoint().into(),
+            fixture.project().into(),
+        ],
+    )
+    .expect("the bridge starts a daemon and reaches it");
+
+    assert!(client.is_connected());
+
+    drop(client);
+    stop_recorded_daemon(&fixture);
+}
+
 #[test]
 fn a_second_connection_is_replayed_what_a_pane_printed() {
     // What a reattaching client depends on, at the socket rather than through
