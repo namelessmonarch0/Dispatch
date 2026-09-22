@@ -151,7 +151,15 @@ fn stop_recorded_daemon(fixture: &Fixture) {
 struct Daemon(std::process::Child);
 
 impl Daemon {
+    /// Starts a daemon named `"local"`, as the existing single-daemon tests
+    /// expect: unnamed because until federation there was only ever one.
     fn start(fixture: &Fixture) -> Self {
+        Self::start_named(fixture, "local")
+    }
+
+    /// Starts a daemon that reports itself as `device`, so more than one can
+    /// be told apart in a sidebar that lists them side by side.
+    fn start_named(fixture: &Fixture, device: &str) -> Self {
         // A sibling of the client binary. Cargo only defines CARGO_BIN_EXE_ for
         // the package under test, so the daemon is found by path — and it is
         // whatever the last build left there. Run these against the workspace
@@ -171,6 +179,8 @@ impl Daemon {
 
         let child = std::process::Command::new(&path)
             .arg(&fixture.project)
+            .arg("--device")
+            .arg(device)
             .envs(fixture.env())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1047,4 +1057,49 @@ fn a_denied_delegation_runs_nothing_and_says_so() {
         1,
         "and nothing should have been started"
     );
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn two_daemons_share_one_sidebar() {
+    // The slice in one test: two machines, one screen, and one of them going
+    // down without taking the other with it.
+    let here = Fixture::new("fed-a");
+    let there = Fixture::new("fed-b");
+
+    let first = Daemon::start_named(&here, "fed-a");
+    let second = Daemon::start_named(&there, "fed-b");
+
+    let mut app = Harness::spawn(
+        &here,
+        Size::new(120, 30),
+        &[
+            "--attach".to_string(),
+            "--daemon".to_string(),
+            there
+                .config
+                .path()
+                .join("dispatchd.sock")
+                .display()
+                .to_string(),
+        ],
+    );
+
+    assert!(
+        app.wait_for(|lines| sidebar_contains(lines, "fed-a") && sidebar_contains(lines, "fed-b")),
+        "both machines are listed"
+    );
+
+    second.stop();
+
+    assert!(
+        app.wait_for(|lines| sidebar_contains(lines, "unreachable")),
+        "the machine that went down says so"
+    );
+    assert!(
+        app.wait_for(|lines| sidebar_contains(lines, "fed-a")),
+        "and the other one is still there"
+    );
+
+    first.stop();
 }

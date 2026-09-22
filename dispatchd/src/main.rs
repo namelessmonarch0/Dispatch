@@ -25,8 +25,19 @@ struct Args {
     log_file: Option<PathBuf>,
 
     /// Name this daemon reports to clients, so two can be told apart.
-    #[arg(long, default_value = "local")]
+    ///
+    /// The hostname by default: a fleet whose rows all say "local" is a fleet
+    /// you cannot read.
+    #[arg(long, default_value_t = default_device_name())]
     device: String,
+}
+
+/// The hostname, or a plain fallback when the environment does not say.
+fn default_device_name() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "local".to_string())
 }
 
 fn main() -> Result<()> {

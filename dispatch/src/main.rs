@@ -46,6 +46,13 @@ struct Args {
     #[arg(long, requires = "attach")]
     no_start: bool,
 
+    /// Also attach to a daemon listening on this endpoint. Repeatable.
+    ///
+    /// The plumbing federation is built on: `machine add` will fill these in
+    /// from the machine list once it can reach another host.
+    #[arg(long = "daemon", value_name = "ENDPOINT")]
+    daemons: Vec<PathBuf>,
+
     /// Subcommands. Absent means run the interface.
     #[command(subcommand)]
     command: Option<Command>,
@@ -160,6 +167,28 @@ fn main() -> Result<ExitCode> {
     } else {
         App::new(harnesses)
     };
+
+    for endpoint in &args.daemons {
+        use dispatch_client::{Client, Liveness};
+        use dispatch_proto::Role;
+
+        match Client::attach_at(
+            Role::Interface,
+            CLIENT_NAME,
+            Liveness::default(),
+            endpoint.clone(),
+        ) {
+            Ok(client) => {
+                client.subscribe();
+                app.attach(client);
+            }
+            // One machine being down is not a reason to refuse to start: the
+            // others are the reason the user opened Dispatch.
+            Err(error) => {
+                tracing::warn!(%error, endpoint = %endpoint.display(), "could not attach")
+            }
+        }
+    }
 
     // Set before the projects are added, so opening one is what keeps it.
     app.keep_projects_in(&config_dir);
