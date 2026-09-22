@@ -147,6 +147,17 @@ impl AppState {
         }
     }
 
+    /// Records what a machine now calls itself.
+    ///
+    /// A daemon can come back under a different name after a restart; the id
+    /// a client mints for it does not change, so this is what keeps the row
+    /// naming the machine the client is actually talking to.
+    pub fn set_device_name(&mut self, id: DeviceId, name: impl Into<String>) {
+        if let Some(device) = self.devices.iter_mut().find(|device| device.id == id) {
+            device.name = name.into();
+        }
+    }
+
     /// Forgets everything a machine was showing, keeping the machine itself.
     ///
     /// What a reconnect needs: that daemon's `Subscribe` replay describes its

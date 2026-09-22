@@ -219,6 +219,19 @@ impl Handle {
     pub fn reconnect_for_test(&self) {
         self.wire.generation.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Changes what `Client::device` reports, as if the daemon on the other
+    /// end had come back under a different name.
+    ///
+    /// The companion to [`Handle::reconnect_for_test`]: a real reconnection's
+    /// handshake can rename the device in the same beat that bumps the
+    /// generation (see `supervise`), and covering an interface's reaction to
+    /// that rename is otherwise only reachable by restarting a real daemon
+    /// under a different `--device`.
+    #[doc(hidden)]
+    pub fn rename_for_test(&self, name: &str) {
+        *self.wire.device.lock().unwrap_or_else(|e| e.into_inner()) = name.to_string();
+    }
 }
 
 /// An attached daemon connection.

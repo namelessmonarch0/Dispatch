@@ -356,6 +356,48 @@ impl Harness {
         panes_shown(&self.lines())
     }
 
+    /// Selects, from the project picker, the project whose path names
+    /// `machine`.
+    ///
+    /// Both fixtures' projects are literally named "project" -- only the
+    /// path says which machine one is on -- so `spawn_shell` alone spawns on
+    /// whichever project's `ProjectOpened` happened to be applied first, a
+    /// race a federation test cannot let decide what it is proving. The
+    /// picker draws its items in the pane area, to the right of the sidebar
+    /// column, so slicing each line past that column keeps a device's own
+    /// name in the sidebar from being mistaken for a picker row.
+    fn select_project(&mut self, machine: &str) {
+        self.send(b"\x01p");
+        // " Project " (singular, spaced) rather than "Project": the sidebar's
+        // own frame is titled "Projects" and would otherwise satisfy the
+        // wait before the picker ever opened.
+        assert!(
+            self.wait_for(|lines| contains(lines, " Project ")),
+            "the project picker should open"
+        );
+
+        let width = dispatch_tui::sidebar::WIDTH as usize;
+        let lines = self.lines();
+        let target = lines
+            .iter()
+            .map(|line| line.chars().skip(width).collect::<String>())
+            .filter(|row| row.contains("project"))
+            .position(|row| row.contains(machine))
+            .unwrap_or_else(|| {
+                panic!("the picker does not list a project on {machine}: {lines:?}")
+            });
+
+        for _ in 0..target {
+            self.send(b"j");
+        }
+        self.send(b"\r");
+
+        assert!(
+            self.wait_for(|lines| !contains(lines, " Project ")),
+            "choosing a project should close the picker"
+        );
+    }
+
     /// Waits until the screen satisfies `predicate`, returning whether it did.
     fn wait_for(&mut self, predicate: impl Fn(&[String]) -> bool) -> bool {
         let deadline = Instant::now() + SETTLE;
@@ -1070,9 +1112,13 @@ fn two_daemons_share_one_sidebar() {
     let first = Daemon::start_named(&here, "fed-a");
     let second = Daemon::start_named(&there, "fed-b");
 
+    // Wide enough that the project picker, used below to select fed-a
+    // explicitly, draws each item's full path rather than clipping it before
+    // reaching the "fed-a"/"fed-b" that tells the two apart -- both fixtures'
+    // projects are literally named "project", so the path is all a row has.
     let mut app = Harness::spawn(
         &here,
-        Size::new(120, 30),
+        Size::new(200, 30),
         &[
             "--attach".to_string(),
             "--daemon".to_string(),
@@ -1105,7 +1151,12 @@ fn two_daemons_share_one_sidebar() {
     // painted before `second.stop()` too, and nothing would have removed it.
     // Running a real round trip through fed-a's own connection is the proof
     // that survives a dead sibling: a keystroke reaching a shell and its
-    // output coming back, the same shape as every other pane test.
+    // output coming back, the same shape as every other pane test. Selected
+    // explicitly rather than left to whatever `spawn_shell` would otherwise
+    // spawn on: the selection follows whichever machine's `ProjectOpened`
+    // happened to arrive first, and fed-b's landing first would spawn this
+    // shell on the very machine just killed.
+    app.select_project("fed-a");
     app.spawn_shell();
     app.send(b"echo fed-a-survives\r");
     assert!(

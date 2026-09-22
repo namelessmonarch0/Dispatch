@@ -430,6 +430,16 @@ impl App {
         }
     }
 
+    /// Writes to the status line.
+    ///
+    /// Its own method rather than a public field: a `--daemon` endpoint that
+    /// never answers at startup has to say so somewhere the user is actually
+    /// looking, and the status line is the one place that survives to the
+    /// first draw with no sidebar row and no attachment to hang a warning on.
+    pub fn set_status(&mut self, status: impl Into<String>) {
+        self.status = status.into();
+    }
+
     /// The daemons this client is holding, or nothing when it holds none.
     fn attachments(&self) -> &[Attachment] {
         match &self.mode {
@@ -525,7 +535,9 @@ impl App {
     /// the project, then fold the machine, then the next press drops both
     /// at once, back to fully expanded -- so nothing it folds is ever left
     /// unreachable from the keyboard. With no pane focused, the same cycle
-    /// runs over the selected project and its machine.
+    /// runs over the selected project and its machine. On one machine there
+    /// is no device rung to step -- the sidebar draws no row for it -- so
+    /// the cycle is a plain fold, then unfold.
     fn toggle_fold(&mut self) {
         if let Some(pane) = self.state.focused_pane() {
             if !self.state.children_of(pane).is_empty() {
@@ -561,6 +573,15 @@ impl App {
             .iter()
             .find(|candidate| candidate.id == project)
             .map(|candidate| candidate.device);
+
+        // On one machine the sidebar draws no device row, so a folded device
+        // is invisible: stepping that rung anyway would spend a press on
+        // nothing, leaving the second press of `^a f` looking like a no-op
+        // and a third one needed to unfold. Dropping the device out of the
+        // ladder here, rather than trying to skip an invisible rung further
+        // down, keeps the two branches below this in the same shape as the
+        // federated case.
+        let device = device.filter(|_| self.state.devices().len() > 1);
 
         if !self.state.is_project_collapsed(project) {
             self.state.toggle_project_collapsed(project);
@@ -875,7 +896,19 @@ impl App {
     ) -> bool {
         let was = self.state.device(device).is_some_and(|d| d.reachable);
         self.state.set_device_reachable(device, connected);
-        let changed = was != connected;
+        let mut changed = was != connected;
+
+        // `client.device()` is read fresh every poll, but until now only
+        // `reachable` was written back to state -- a daemon that came back
+        // under a different name left the sidebar's row naming the old one
+        // forever, with nothing past the one "reattached to {name}" status
+        // line ever saying otherwise. Compared rather than written
+        // unconditionally, so an unreachable machine's last-known name is not
+        // stamped over itself, unchanged, on every poll.
+        if self.state.device(device).is_some_and(|d| d.name != name) {
+            self.state.set_device_name(device, name);
+            changed = true;
+        }
 
         let Mode::Attached(attachments) = &mut self.mode else {
             return changed;
@@ -3447,6 +3480,38 @@ mod tests {
     }
 
     #[test]
+    fn folding_on_one_machine_is_a_straight_fold_and_unfold() {
+        // `App::new` already registers this machine as a device, so on its
+        // own that is a single-device fleet -- the sidebar draws no device
+        // row for it and never consults `is_device_collapsed` when deciding
+        // what to draw. Stepping the device rung anyway, as the federated
+        // ladder does, folds something invisible: the second press changes
+        // nothing on screen and the cycle needs a third press to unfold.
+        // Before federation `^a f` was a plain fold/unfold, and that is what
+        // one machine has to keep being.
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let pane = app
+            .state
+            .spawn_pane(project, HarnessId::new("shell"))
+            .expect("the project exists");
+        let _ = app.state.focus(pane);
+
+        assert_eq!(app.state.devices().len(), 1, "one machine, to start");
+
+        command(&mut app, 'f');
+        assert!(app.state.is_project_collapsed(project), "first press folds");
+
+        command(&mut app, 'f');
+        assert!(
+            !app.state.is_project_collapsed(project),
+            "second press unfolds -- there is no device rung visible to step"
+        );
+    }
+
+    #[test]
     fn a_pane_that_exits_quietly_still_redraws_the_grid() {
         // An agent's last output and its exit rarely land in the same poll:
         // `/exit` prints its goodbye, that poll redraws, and the process is
@@ -4731,6 +4796,30 @@ mod tests {
                 .next()
                 .is_none(),
             "and the machine that never went is asked for nothing"
+        );
+    }
+
+    #[test]
+    fn a_reattached_daemon_that_renamed_itself_updates_its_row() {
+        // sync_attachment reads client.device() every poll and used it only
+        // for the "reattached to {name}" status -- the row in state kept
+        // whatever name `attach` first saw, so a daemon that comes back under
+        // a different name left the sidebar naming the old one while the
+        // status line already said the new one.
+        let (mut app, alpha, _beta, ..) = two_daemons();
+        let device = device_of(&app, alpha).expect("the project is registered");
+
+        app.attachments()[0]
+            .client
+            .handle()
+            .rename_for_test("renamed");
+        app.attachments()[0].client.handle().reconnect_for_test();
+        app.poll_daemon();
+
+        assert_eq!(
+            app.state.device(device).map(|d| d.name.as_str()),
+            Some("renamed"),
+            "the sidebar's row follows the rename"
         );
     }
 

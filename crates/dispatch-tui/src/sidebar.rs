@@ -498,13 +498,20 @@ impl Sidebar<'_> {
         );
         write(buf, area, area.x + 1, y, MACHINE, style);
 
-        let name = if device.reachable {
-            device.name.clone()
-        } else {
-            format!("{} — {UNREACHABLE}", device.name)
-        };
         let room = (area.x + area.width).saturating_sub(area.x + NAME) as usize;
-        write(buf, area, area.x + NAME, y, &truncate(&name, room), style);
+
+        let name = if device.reachable {
+            truncate(&device.name, room)
+        } else {
+            // Truncating the joined string kept whichever end fit, and on a
+            // real hostname (`dispatchd --device` now defaults to one) that
+            // end is the name, not the word the row exists to show. The name
+            // gives way instead, so "unreachable" is always drawn whole.
+            let suffix = format!(" — {UNREACHABLE}");
+            let name_room = room.saturating_sub(suffix.chars().count());
+            format!("{}{suffix}", truncate(&device.name, name_room))
+        };
+        write(buf, area, area.x + NAME, y, &name, style);
     }
 
     /// Draws one pane row `indent` columns in from the sidebar's edge.

@@ -183,9 +183,21 @@ fn main() -> Result<ExitCode> {
                 app.attach(client);
             }
             // One machine being down is not a reason to refuse to start: the
-            // others are the reason the user opened Dispatch.
+            // others are the reason the user opened Dispatch. But failing
+            // silently here is worse than the single-daemon case: with one
+            // machine attached there is no device row at all yet for a
+            // second one to be missing from, so a log line nobody is
+            // tailing is the only place this ever showed up. No `Attachment`
+            // is created for this endpoint, so nothing here retries it or
+            // ever will — that is the next slice's job — and the machine
+            // cannot join this session without Dispatch being restarted once
+            // it is reachable.
             Err(error) => {
-                tracing::warn!(%error, endpoint = %endpoint.display(), "could not attach")
+                tracing::warn!(%error, endpoint = %endpoint.display(), "could not attach");
+                app.set_status(format!(
+                    "{} is unreachable — not retried; restart Dispatch once it answers",
+                    endpoint.display()
+                ));
             }
         }
     }
