@@ -119,7 +119,22 @@ goes down keeps its rows -- dimmed and labelled `unreachable` -- because its
 agents are still running. Keystrokes aimed at an unreachable machine are
 refused rather than swallowed.
 
-Reaching a machine over SSH, and `dispatch machine add`, are the next slice.
+A machine does not have to be reachable by a socket. `dispatchd --stdio` carries
+one client's frames to whatever daemon its machine is running -- starting one if
+none is listening -- so the transport can be anything that can run a command and
+pipe bytes:
+
+```sh
+dispatch --attach --daemon-command "ssh tower dispatchd --stdio"
+```
+
+The agents belong to the daemon on that machine, not to the pipe, so a dropped
+connection costs the view and nothing else: the client redials the same command
+and the panes are still there. `--daemon-command` is split on whitespace and
+runs no shell.
+
+Remembering machines between runs -- `dispatch machine add`, and retrying one
+that was asleep -- is the next slice.
 
 ## Running the daemon
 
