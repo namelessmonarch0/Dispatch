@@ -12,7 +12,8 @@ them instead so they outlive the interface.
 
 Requires:
 
-- Rust 1.85 or newer (edition 2024)
+- Rust 1.89 or newer (edition 2024). CI builds with exactly 1.89, so a
+  change that needs a newer compiler fails there first.
 - **Zig 0.16.0** — builds the vendored `libghostty-vt` terminal engine
 
 ```sh
