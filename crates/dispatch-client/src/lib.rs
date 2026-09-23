@@ -877,6 +877,17 @@ fn read_from(
         loop {
             match Frame::read::<_, ServerMessage>(&mut reader) {
                 Ok(message) => {
+                    // A connection that has been replaced says nothing more:
+                    // its peer was given up on, and whatever it says now
+                    // describes a connection the interface has already
+                    // rebuilt from its successor's replay. Nor does it count
+                    // as hearing from the daemon, which would keep a dead
+                    // successor looking alive. Returning drops the reader,
+                    // and with it anything it owns.
+                    if wire.generation.load(Ordering::Relaxed) != generation {
+                        return;
+                    }
+
                     wire.heard();
                     if incoming.send(message).is_err() {
                         return;

@@ -1295,3 +1295,84 @@ fn a_connection_given_up_on_cannot_take_its_successor_down() {
     drop(client);
     drop(server.join());
 }
+
+#[test]
+fn a_replaced_connection_cannot_speak_for_its_successor() {
+    // The other half of a stale reader: its peer, given up on for going
+    // silent, starts talking again after the replacement is up. What it says
+    // describes a connection that no longer exists, and must not reach the
+    // queue the interface reads as the replacement's.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _endpoint = Endpoint::new("stale-speaker");
+
+    let listener = Listener::bind().expect("binding succeeds");
+    let endpoint = dispatch_os::ipc::endpoint().expect("the endpoint resolves");
+    let (speak, spoken) = std::sync::mpsc::channel::<()>();
+    let stale = ServerMessage::Error {
+        error: dispatch_proto::ProtocolError::Other("from a replaced connection".into()),
+    };
+    let from_old_peer = stale.clone();
+
+    let server = std::thread::spawn(move || {
+        // The first connection is welcomed and then goes quiet.
+        let (mut first_reader, mut first_writer) =
+            listener.accept().expect("the first dial arrives").split();
+        let _ = Frame::read::<_, ClientMessage>(&mut first_reader);
+        Frame::write(&mut first_writer, &welcome()).expect("the welcome goes out");
+
+        // The replacement answers like a live daemon.
+        let (mut second_reader, mut second_writer) =
+            listener.accept().expect("the redial arrives").split();
+        let _ = Frame::read::<_, ClientMessage>(&mut second_reader);
+        Frame::write(&mut second_writer, &welcome()).expect("the welcome goes out");
+        std::thread::spawn(move || {
+            while let Ok(message) = Frame::read::<_, ClientMessage>(&mut second_reader) {
+                if let ClientMessage::Ping { token } = message
+                    && Frame::write(&mut second_writer, &ServerMessage::Pong { token }).is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        // Then the old peer wakes up and speaks.
+        let _ = spoken.recv();
+        let _ = Frame::write(&mut first_writer, &from_old_peer);
+        (listener, first_reader, first_writer)
+    });
+
+    let client = Client::attach_at(
+        Role::Interface,
+        "test",
+        Liveness {
+            interval: Duration::from_millis(50),
+            silence: Duration::from_millis(300),
+        },
+        endpoint,
+    )
+    .expect("the first connection is welcomed");
+
+    assert!(
+        wait_until(PATIENCE, || client.generation() == 2
+            && client.is_connected()),
+        "the silent connection is given up on and replaced"
+    );
+    let _ = client.poll();
+
+    speak.send(()).expect("the server is waiting");
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut heard = Vec::new();
+    while Instant::now() < deadline {
+        heard.extend(client.poll());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        !heard.contains(&stale),
+        "a replaced connection's message reached the queue: {heard:?}"
+    );
+
+    drop(client);
+    drop(server.join());
+}
