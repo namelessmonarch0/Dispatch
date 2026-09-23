@@ -131,6 +131,33 @@ const DIAL_TEARDOWN_GRACE: Duration = Duration::from_millis(50);
 /// seconds.
 const MAX_RETRY: Duration = Duration::from_secs(2);
 
+/// How long to wait before redialling a command the first time.
+///
+/// A second rather than [`FIRST_RETRY`]: every attempt is a new `ssh`, with a
+/// TCP handshake and an authentication behind it, and a host that refused one
+/// a tenth of a second ago will refuse the next.
+const COMMAND_FIRST_RETRY: Duration = Duration::from_secs(1);
+
+/// The longest gap between attempts to dial a command.
+///
+/// [`MAX_RETRY`] would respawn `ssh` against an asleep host thirty times a
+/// minute for as long as it sleeps. With `ConnectTimeout=10` in front of it,
+/// thirty seconds still has a machine that wakes joining within about forty.
+const COMMAND_MAX_RETRY: Duration = Duration::from_secs(30);
+
+/// The first gap between attempts and the longest, for this dial.
+fn retry_for(dial: &Dial) -> (Duration, Duration) {
+    match dial {
+        Dial::Endpoint(_) => (FIRST_RETRY, MAX_RETRY),
+        Dial::Command { .. } => (COMMAND_FIRST_RETRY, COMMAND_MAX_RETRY),
+    }
+}
+
+/// The gap after `current`: doubled, up to this dial's ceiling.
+fn next_backoff(current: Duration, dial: &Dial) -> Duration {
+    (current * 2).min(retry_for(dial).1)
+}
+
 /// Where a dial leaves its child's pid, for whoever may have to kill it.
 ///
 /// [`Connection::split`] hands the process to the reader half, so nothing but
@@ -234,9 +261,35 @@ struct Wire {
     liveness: Liveness,
     /// The process behind the current connection, when the dial is a command.
     child: DialledChild,
+    /// Why the last dial failed, until one succeeds.
+    ///
+    /// Kept for the interface rather than only logged: a machine that stays
+    /// down has to be able to say `Permission denied (publickey)` somewhere
+    /// the user is looking.
+    last_error: Mutex<Option<String>>,
 }
 
 impl Wire {
+    /// A wire with nothing on it yet: down, at generation 0, and nameless.
+    fn new(role: Role, name: &str, liveness: Liveness, dial: Dial) -> Self {
+        Self {
+            writer: Mutex::new(None),
+            connected: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            subscribed: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            device: Mutex::new(String::new()),
+            name: name.to_string(),
+            role,
+            dial,
+            last_heard: Mutex::new(Instant::now()),
+            last_asked: Mutex::new(Instant::now()),
+            liveness,
+            child: DialledChild::default(),
+            last_error: Mutex::new(None),
+        }
+    }
+
     /// Writes one message, or reports that the connection is gone.
     fn write(&self, message: &ClientMessage) -> bool {
         let mut guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
@@ -358,6 +411,34 @@ impl Handle {
     pub fn rename_for_test(&self, name: &str) {
         *self.wire.device.lock().unwrap_or_else(|e| e.into_inner()) = name.to_string();
     }
+
+    /// Connects as a dial would, with no dial behind it.
+    ///
+    /// The companion to [`Client::pending_for_test`]: renames the device,
+    /// bumps the generation and clears any failure, in the order the
+    /// supervisor does.
+    #[doc(hidden)]
+    pub fn connect_for_test(&self, device: &str) {
+        self.rename_for_test(device);
+        *self
+            .wire
+            .last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        self.wire.generation.fetch_add(1, Ordering::Relaxed);
+        self.wire.connected.store(true, Ordering::Relaxed);
+    }
+
+    /// Fails as a dial would, with no dial behind it.
+    #[doc(hidden)]
+    pub fn fail_for_test(&self, error: &str) {
+        self.wire.connected.store(false, Ordering::Relaxed);
+        *self
+            .wire
+            .last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(error.to_string());
+    }
 }
 
 /// An attached daemon connection.
@@ -459,40 +540,52 @@ impl Client {
     ) -> Result<Self, ClientError> {
         let connected = connect_within(name, role, &dial, patience_for(&dial))?;
 
-        let child = DialledChild::default();
-        child.record(connected.child);
+        let wire = Wire::new(role, name, liveness, dial);
+        wire.child.record(connected.child);
+        *wire.device.lock().unwrap_or_else(|e| e.into_inner()) = connected.device;
+        *wire.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(connected.writer);
+        wire.generation.store(1, Ordering::Relaxed);
+        wire.connected.store(true, Ordering::Relaxed);
 
-        let wire = Arc::new(Wire {
-            writer: Mutex::new(Some(connected.writer)),
-            connected: AtomicBool::new(true),
-            generation: AtomicU64::new(1),
-            subscribed: AtomicBool::new(false),
-            closed: AtomicBool::new(false),
-            device: Mutex::new(connected.device),
-            name: name.to_string(),
-            role,
-            dial,
-            last_heard: Mutex::new(Instant::now()),
-            last_asked: Mutex::new(Instant::now()),
-            liveness,
-            child,
-        });
+        Ok(Self::start(Arc::new(wire), Some(connected.reader)))
+    }
 
+    /// Dials in the background, and keeps dialling until it connects.
+    ///
+    /// Returns at once, down, at generation 0 and with an empty
+    /// [`Client::device`]. The first connection is generation 1, so a caller
+    /// that already rebuilds on a generation change handles a first connect
+    /// with no code of its own. Messages sent before then are dropped, as
+    /// they are during any outage; [`Client::subscribe`] is remembered and
+    /// sent on connecting.
+    ///
+    /// For a machine that may be asleep: [`Client::attach_over`] would have
+    /// nothing to hand back, and so nothing that could try again.
+    #[must_use]
+    pub fn dial(role: Role, name: &str, liveness: Liveness, dial: Dial) -> Self {
+        Self::start(Arc::new(Wire::new(role, name, liveness, dial)), None)
+    }
+
+    /// Starts the threads that serve a wire, reading from `reader` when a
+    /// connection is already up.
+    fn start(wire: Arc<Wire>, reader: Option<Box<dyn Read + Send>>) -> Self {
         let (outbox, outgoing) = channel::<ClientMessage>();
         let (incoming, inbox) = channel::<ServerMessage>();
 
-        read_from(connected.reader, &incoming, &wire);
+        if let Some(reader) = reader {
+            read_from(reader, &incoming, &wire);
+        }
         write_to(outgoing, &wire);
         supervise(incoming, &wire);
 
-        Ok(Self {
+        Self {
             handle: Handle {
                 outbox,
                 wire: Arc::clone(&wire),
             },
             inbox,
             wire,
-        })
+        }
     }
 
     /// Asks for pane events, and for what already exists.
@@ -522,6 +615,25 @@ impl Client {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.wire.generation.load(Ordering::Relaxed)
+    }
+
+    /// Why the last attempt to connect failed, while none has succeeded
+    /// since.
+    #[must_use]
+    pub fn last_error(&self) -> Option<String> {
+        self.wire
+            .last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// How this client reaches its daemon, as one line.
+    ///
+    /// What a machine with no other name is called until its daemon answers.
+    #[must_use]
+    pub fn dialled(&self) -> String {
+        self.wire.dial.to_string()
     }
 
     /// A sender for whatever needs to talk to the daemon.
@@ -755,12 +867,17 @@ fn write_to(outgoing: Receiver<ClientMessage>, wire: &Arc<Wire>) {
     });
 }
 
-/// Reconnects whenever the connection is down.
+/// Reconnects whenever the connection is down — and, for a client made by
+/// [`Client::dial`], connects in the first place.
 fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
     let wire = Arc::clone(wire);
 
     std::thread::spawn(move || {
-        let mut backoff = FIRST_RETRY;
+        let first_retry = retry_for(&wire.dial).0;
+        let mut backoff = first_retry;
+        // A client that has never connected dials at once: there is no
+        // failure yet to back off from.
+        let mut dial_now = wire.generation.load(Ordering::Relaxed) == 0;
 
         loop {
             if wire.closed.load(Ordering::Relaxed) {
@@ -770,19 +887,33 @@ fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
             if wire.connected.load(Ordering::Relaxed) {
                 check_liveness(&wire);
                 std::thread::sleep(FIRST_RETRY);
-                backoff = FIRST_RETRY;
+                backoff = first_retry;
                 continue;
             }
 
-            std::thread::sleep(backoff);
-            backoff = (backoff * 2).min(MAX_RETRY);
+            if !std::mem::take(&mut dial_now) {
+                std::thread::sleep(backoff);
+                backoff = next_backoff(backoff, &wire.dial);
+            }
 
             let patience = patience_for(&wire.dial);
             match connect_within(&wire.name, wire.role, &wire.dial, patience) {
                 Ok(connected) => {
+                    // Recorded, then checked: `Client::drop` sets `closed`
+                    // and then takes the pid, so whichever order the two
+                    // threads meet in, exactly one of them finds it. Checked
+                    // only at the top of the loop, a dial that finished after
+                    // the client was dropped left a process nobody would
+                    // ever take.
+                    wire.child.record(connected.child);
+                    if wire.closed.load(Ordering::Relaxed) {
+                        reap_dialled(wire.child.take());
+                        return;
+                    }
+
                     *wire.device.lock().unwrap_or_else(|e| e.into_inner()) = connected.device;
                     *wire.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(connected.writer);
-                    wire.child.record(connected.child);
+                    *wire.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     wire.generation.fetch_add(1, Ordering::Relaxed);
                     wire.heard();
                     wire.connected.store(true, Ordering::Relaxed);
@@ -797,12 +928,15 @@ fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
 
                     tracing::info!(
                         generation = wire.generation.load(Ordering::Relaxed),
-                        "reconnected to the daemon"
+                        dial = %wire.dial,
+                        "connected to the daemon"
                     );
-                    backoff = FIRST_RETRY;
+                    backoff = first_retry;
                 }
                 Err(error) => {
-                    tracing::debug!(%error, "the daemon is not answering yet");
+                    tracing::debug!(%error, dial = %wire.dial, "the daemon is not answering yet");
+                    *wire.last_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(error.to_string());
                 }
             }
         }
@@ -857,21 +991,45 @@ impl Client {
     #[doc(hidden)]
     #[must_use]
     pub fn for_test() -> (Self, Sender<ServerMessage>, Receiver<ClientMessage>) {
-        let wire = Arc::new(Wire {
-            writer: Mutex::new(None),
-            connected: AtomicBool::new(true),
-            generation: AtomicU64::new(1),
-            subscribed: AtomicBool::new(false),
-            closed: AtomicBool::new(true),
-            device: Mutex::new("test-device".to_string()),
-            name: "test".to_string(),
-            role: Role::Interface,
-            dial: Dial::Endpoint(PathBuf::new()),
-            last_heard: Mutex::new(Instant::now()),
-            last_asked: Mutex::new(Instant::now()),
-            liveness: Liveness::default(),
-            child: DialledChild::default(),
-        });
+        let wire = Wire::new(
+            Role::Interface,
+            "test",
+            Liveness::default(),
+            Dial::Endpoint(PathBuf::new()),
+        );
+        wire.connected.store(true, Ordering::Relaxed);
+        wire.generation.store(1, Ordering::Relaxed);
+        *wire.device.lock().unwrap_or_else(|e| e.into_inner()) = "test-device".to_string();
+        Self::without_threads(wire)
+    }
+
+    /// Creates a client with no socket behind it that has never connected.
+    ///
+    /// The companion to [`Client::for_test`] for what [`Client::dial`] hands
+    /// back: down, at generation 0, nameless, and dialled as `test-dial`.
+    /// Drive it with [`Handle::connect_for_test`] and
+    /// [`Handle::fail_for_test`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pending_for_test() -> (Self, Sender<ServerMessage>, Receiver<ClientMessage>) {
+        let dial = Dial::Command {
+            program: "test-dial".into(),
+            args: Vec::new(),
+        };
+        Self::without_threads(Wire::new(
+            Role::Interface,
+            "test",
+            Liveness::default(),
+            dial,
+        ))
+    }
+
+    /// Wraps a wire in a client whose traffic the test holds both ends of.
+    fn without_threads(wire: Wire) -> (Self, Sender<ServerMessage>, Receiver<ClientMessage>) {
+        // No supervisor runs, so nothing may try to: a dropped test client
+        // must not start dialling an empty endpoint.
+        wire.closed.store(true, Ordering::Relaxed);
+        let wire = Arc::new(wire);
 
         let (outbox, outgoing) = channel::<ClientMessage>();
         let (incoming, inbox) = channel::<ServerMessage>();

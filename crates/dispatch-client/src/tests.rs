@@ -986,3 +986,188 @@ fn a_command_dial_is_given_longer_to_answer_than_a_socket() {
         "a cold `--stdio` start alone may take ten seconds, got {command:?}"
     );
 }
+
+#[test]
+fn a_dialled_client_starts_down_and_connects_once_a_daemon_answers() {
+    // A machine asleep when Dispatch starts must still join when it wakes.
+    // Before `Client::dial` there was no client to keep trying.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _endpoint = Endpoint::new("dial-later");
+    let endpoint = dispatch_os::ipc::endpoint().expect("the endpoint resolves");
+
+    let client = Client::dial(
+        Role::Interface,
+        "test",
+        Liveness::default(),
+        Dial::Endpoint(endpoint),
+    );
+
+    assert_eq!(client.generation(), 0, "nothing has connected yet");
+    assert!(!client.is_connected());
+    assert_eq!(client.device(), "");
+    assert!(
+        wait_until(PATIENCE, || client.last_error().is_some()),
+        "a failed first dial is remembered for the interface to show"
+    );
+
+    client.subscribe();
+    let server = serve_one(welcome(), |_| {}, After::Answer);
+
+    assert!(
+        wait_until(PATIENCE, || client.generation() >= 1),
+        "the supervisor keeps dialling until a daemon answers"
+    );
+    assert_eq!(client.device(), "desktop");
+    assert!(
+        client.last_error().is_none(),
+        "connected, so nothing is wrong"
+    );
+    assert!(
+        wait_until(PATIENCE, || server.contains(&ClientMessage::Subscribe)),
+        "a subscription asked for before the first connection goes out on it"
+    );
+
+    drop(client);
+    drop(server);
+}
+
+#[test]
+fn backoff_is_measured_against_what_is_being_dialled() {
+    let socket = Dial::Endpoint(PathBuf::from("/tmp/dispatchd.sock"));
+    let command = Dial::Command {
+        program: "ssh".into(),
+        args: vec!["tower".into()],
+    };
+
+    assert_eq!(
+        retry_for(&socket),
+        (FIRST_RETRY, MAX_RETRY),
+        "a local daemon is unchanged"
+    );
+    assert_eq!(
+        retry_for(&command),
+        (Duration::from_secs(1), Duration::from_secs(30)),
+        "every attempt at a command is a new ssh"
+    );
+
+    let mut gap = retry_for(&command).0;
+    for _ in 0..10 {
+        gap = next_backoff(gap, &command);
+    }
+    assert_eq!(
+        gap,
+        Duration::from_secs(30),
+        "doubling stops at the ceiling"
+    );
+    assert_eq!(next_backoff(MAX_RETRY, &socket), MAX_RETRY);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_command_that_keeps_failing_is_not_respawned_every_moment() {
+    // A machine asleep for an hour must not cost an ssh every two seconds.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("backoff");
+    let counter = dir.join("runs");
+
+    let client = Client::dial(
+        Role::Interface,
+        "test",
+        Liveness::default(),
+        Dial::Command {
+            program: OsString::from("sh"),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from(format!("echo ran >> {}; exit 1", counter.display())),
+            ],
+        },
+    );
+
+    std::thread::sleep(Duration::from_millis(1500));
+    let runs = std::fs::read_to_string(&counter)
+        .unwrap_or_default()
+        .lines()
+        .count();
+
+    assert!(
+        (1..=2).contains(&runs),
+        "one attempt at once and one a second later, not {runs}"
+    );
+
+    drop(client);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_command_failure_is_remembered_in_its_own_words() {
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let client = Client::dial(
+        Role::Interface,
+        "test",
+        Liveness::default(),
+        Dial::Command {
+            program: OsString::from("sh"),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from("echo 'Permission denied (publickey).' 1>&2; exit 255"),
+            ],
+        },
+    );
+
+    assert!(
+        wait_until(PATIENCE, || client
+            .last_error()
+            .is_some_and(|error| error.contains("Permission denied"))),
+        "the command's own words are what the user needs to see: {:?}",
+        client.last_error()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_client_dropped_mid_dial_leaves_nothing_behind() {
+    // The supervisor checks `closed` at the top of its loop. A dial that
+    // completes after the client has gone recorded a pid nobody would ever
+    // take. The grandchild outlives `PATIENCE` on its own, so only a reap
+    // can end it in time.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("drop-mid-dial");
+    let pid_file = dir.join("grandchild.pid");
+
+    let mut encoded = Vec::new();
+    Frame::write(&mut encoded, &welcome()).expect("writing succeeds");
+    let escaped: String = encoded.iter().map(|b| format!("\\x{b:02x}")).collect();
+
+    let client = Client::dial(
+        Role::Interface,
+        "test",
+        Liveness::default(),
+        Dial::Command {
+            program: OsString::from("sh"),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from(format!(
+                    "sleep 30 & echo $! >> {}; sleep 0.3; printf '{escaped}'; sleep 30",
+                    pid_file.display()
+                )),
+            ],
+        },
+    );
+
+    let grandchild = first_recorded_pid(&pid_file);
+    drop(client);
+
+    let deadline = Instant::now() + PATIENCE;
+    while pid_is_alive(grandchild) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(
+        !pid_is_alive(grandchild),
+        "a dial that finished after its client was dropped left its command running"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
