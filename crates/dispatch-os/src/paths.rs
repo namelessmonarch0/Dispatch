@@ -108,6 +108,26 @@ pub fn resolve(path: &Path) -> std::io::Result<PathBuf> {
     }
 }
 
+/// Expands a leading `~` against the home directory of the user running this
+/// process.
+///
+/// A path typed by hand for another machine almost always starts with one,
+/// and no shell stands between the client and the daemon to expand it:
+/// without this the daemon looks for a directory literally named `~` in
+/// whatever directory it was started in. Only `~` and `~/…` are expanded;
+/// `~user` is left as typed, because another user's home is not this
+/// process's to guess.
+pub fn expand_home(path: &Path) -> PathBuf {
+    let Ok(rest) = path.strip_prefix("~") else {
+        return path.to_path_buf();
+    };
+
+    match directories::BaseDirs::new() {
+        Some(dirs) => dirs.home_dir().join(rest),
+        None => path.to_path_buf(),
+    }
+}
+
 /// Longest path a Windows program can be expected to handle unprefixed.
 const MAX_PATH: usize = 260;
 
@@ -235,5 +255,29 @@ mod tests {
         let config = config_file().expect("config_file resolves");
         let log = log_file().expect("log_file resolves");
         assert_ne!(config, log);
+    }
+
+    #[test]
+    fn a_leading_tilde_is_the_home_directory() {
+        // A path typed by hand for another machine starts with `~` more
+        // often than not, and no shell stands between the client and the
+        // daemon to expand it.
+        let home = directories::BaseDirs::new()
+            .expect("a home directory exists in the test environment")
+            .home_dir()
+            .to_path_buf();
+
+        assert_eq!(expand_home(Path::new("~/code/app")), home.join("code/app"));
+        assert_eq!(expand_home(Path::new("~")), home.join(""));
+        assert_eq!(
+            expand_home(Path::new("/srv/app")),
+            PathBuf::from("/srv/app"),
+            "an absolute path is left alone"
+        );
+        assert_eq!(
+            expand_home(Path::new("~someone/app")),
+            PathBuf::from("~someone/app"),
+            "another user's home is not ours to guess"
+        );
     }
 }

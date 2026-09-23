@@ -109,6 +109,40 @@ fn every_server_message_round_trips() {
 }
 
 #[test]
+fn a_refused_root_round_trips_and_an_older_peer_skips_it() {
+    // The root travels back exactly as it was sent, so the client can find
+    // it in its own kept list without resolving anything itself.
+    let refused = ServerMessage::ProjectRefused {
+        root: PathBuf::from("~/code/typo"),
+        reason: "No such file or directory".into(),
+    };
+    assert_eq!(round_trip(&refused), refused);
+
+    // An older client has no `project_refused`. It must land in `Unknown`
+    // rather than failing the frame: a fleet is exactly where an older
+    // client meets a newer daemon.
+    #[derive(Serialize)]
+    struct FromNewer {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        root: &'static str,
+        reason: &'static str,
+    }
+    let mut buf = Vec::new();
+    Frame::write(
+        &mut buf,
+        &FromNewer {
+            kind: "some_message_from_the_future",
+            root: "~/x",
+            reason: "no",
+        },
+    )
+    .expect("writing succeeds");
+    let read: ServerMessage = Frame::read(&mut buf.as_slice()).expect("reading succeeds");
+    assert_eq!(read, ServerMessage::Unknown);
+}
+
+#[test]
 fn arbitrary_bytes_survive_a_round_trip() {
     // Terminal output is not text. Anything that mangles a byte corrupts the
     // screen on the far side.

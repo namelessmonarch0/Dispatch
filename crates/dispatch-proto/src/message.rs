@@ -303,6 +303,21 @@ pub enum ServerMessage {
         project: ProjectId,
     },
 
+    /// A root asked for in [`ClientMessage::OpenProject`] could not be opened.
+    ///
+    /// Sent only to the client that asked. Its own message rather than an
+    /// [`ProtocolError`]: that enum has no `Unknown` to land in, so a variant
+    /// added there would fail an older client's whole frame — and a fleet is
+    /// where an older client meets a newer daemon. An older client skips this
+    /// and loses only the status line.
+    ProjectRefused {
+        /// The root exactly as the client sent it, so the client can find it
+        /// in what it keeps without resolving anything itself.
+        root: PathBuf,
+        /// Why: not a directory, no such file, permission denied.
+        reason: String,
+    },
+
     /// A pane was started.
     PaneSpawned {
         /// The new pane.

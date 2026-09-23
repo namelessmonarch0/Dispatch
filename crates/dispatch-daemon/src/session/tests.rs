@@ -723,34 +723,63 @@ fn opening_a_path_that_is_not_a_directory_is_reported() {
     let file = dir.0.join("not-a-directory");
     std::fs::write(&file, b"contents").expect("temp dir is writable");
 
-    daemon.request_for_test(1, ClientMessage::OpenProject { root: file });
+    daemon.request_for_test(1, ClientMessage::OpenProject { root: file.clone() });
     assert!(
         matches!(
             drain(&inbox).first(),
-            Some(ServerMessage::Error {
-                error: ProtocolError::Other(_)
-            })
+            Some(ServerMessage::ProjectRefused { root, .. }) if *root == file
         ),
-        "a file is not a project"
+        "a file is not a project, and the refusal names it as it was sent"
     );
 
+    let missing = dir.0.join("missing");
     daemon.request_for_test(
         1,
         ClientMessage::OpenProject {
-            root: dir.0.join("missing"),
+            root: missing.clone(),
         },
     );
     assert!(
         matches!(
             drain(&inbox).first(),
-            Some(ServerMessage::Error {
-                error: ProtocolError::Other(_)
-            })
+            Some(ServerMessage::ProjectRefused { root, .. }) if *root == missing
         ),
         "a path that does not exist is not a project"
     );
 
     assert_eq!(daemon.projects().len(), 1, "neither was registered");
+}
+
+#[test]
+fn a_root_under_home_is_opened_from_the_daemons_own_home() {
+    // The daemon is on the machine the directory is on, so its home is the
+    // one `~` means. `~` itself always exists, so this needs no scratch
+    // directory under the real home.
+    let (mut daemon, _, _dir) = daemon("open-home");
+    let inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let _ = drain(&inbox);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::OpenProject {
+            root: PathBuf::from("~"),
+        },
+    );
+
+    // Through `expand_home` rather than `directories`, which this crate does
+    // not depend on: what is under test is that the daemon expands at all.
+    let home = dispatch_os::paths::expand_home(Path::new("~"));
+    let expected = dispatch_os::paths::resolve(&home).expect("home resolves");
+
+    assert!(
+        drain(&inbox).iter().any(|message| matches!(
+            message,
+            ServerMessage::ProjectOpened { project } if project.root == expected
+        )),
+        "`~` should open the daemon's home"
+    );
 }
 
 #[test]

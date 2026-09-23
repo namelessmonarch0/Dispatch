@@ -1251,6 +1251,7 @@ impl App {
             ServerMessage::Welcome { .. }
             | ServerMessage::Pong { .. }
             | ServerMessage::DelegateFinished { .. }
+            | ServerMessage::ProjectRefused { .. }
             | ServerMessage::Unknown => false,
         }
     }

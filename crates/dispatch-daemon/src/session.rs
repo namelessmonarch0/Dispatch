@@ -519,34 +519,28 @@ impl Daemon {
         // to every client looking at this project. `resolve` rather than
         // `canonicalize` because this becomes a pane's working directory, and
         // Windows' extended-length spelling is one some programs refuse.
-        let resolved = match dispatch_os::paths::resolve(&root) {
-            Ok(resolved) if resolved.is_dir() => resolved,
-            Ok(resolved) => {
-                self.send(
-                    client,
-                    ServerMessage::Error {
-                        error: ProtocolError::Other(format!(
-                            "not a directory: {}",
-                            resolved.display()
-                        )),
-                    },
-                );
+
+        // `~` first: a root typed for this machine from another one arrives
+        // with no shell having expanded it.
+        let expanded = dispatch_os::paths::expand_home(&root);
+
+        let reason = match dispatch_os::paths::resolve(&expanded) {
+            Ok(resolved) if resolved.is_dir() => {
+                self.opened_for(resolved);
                 return;
             }
-            Err(error) => {
-                self.send(
-                    client,
-                    ServerMessage::Error {
-                        error: ProtocolError::Other(format!(
-                            "cannot open {}: {error}",
-                            root.display()
-                        )),
-                    },
-                );
-                return;
-            }
+            Ok(resolved) => format!("not a directory: {}", resolved.display()),
+            Err(error) => error.to_string(),
         };
 
+        // Named by the root as it was sent, not as it resolved: the client
+        // keeps what it typed, and has to be able to find it to forget it.
+        self.send(client, ServerMessage::ProjectRefused { root, reason });
+    }
+
+    /// Registers a root that has been resolved and checked, and tells every
+    /// subscriber.
+    fn opened_for(&mut self, resolved: PathBuf) {
         let id = self.open_project(resolved);
         let project = self.projects[&id].clone();
         tracing::info!(project = %id, root = %project.root.display(), "project opened");
