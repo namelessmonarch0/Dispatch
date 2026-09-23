@@ -1,9 +1,9 @@
 # Federation: where it stands
 
 Written 2026-09-22, at the end of the slice that made a connection able to be a
-child process. Everything below is either in git or explicitly named as not
-built. If you are picking this up cold, read this, then the two specs it points
-at.
+child process, and updated 2026-09-23 when the machines slice merged.
+Everything below is either in git or explicitly named as not built. If you are
+picking this up cold, read this, then the three specs it points at.
 
 ## The three slices
 
@@ -11,7 +11,7 @@ at.
 |---|---|---|
 | F1 — many daemons in one client | **merged** | `specs/2026-09-21-federation-many-daemons-design.md` |
 | F2a — a connection that is not a socket | **merged** | `specs/2026-09-22-federation-stdio-transport-design.md` |
-| F2b — machines: SSH, a registry, a supervisor | **built, on branch `feat/machines`** | `specs/2026-09-22-federation-machines-design.md` |
+| F2b — machines: SSH, a registry, a supervisor | **merged** | `specs/2026-09-22-federation-machines-design.md` |
 
 What works today, end to end: one client holds a connection per machine; every
 project and pane is attributed to the machine it is on; the sidebar draws a row
