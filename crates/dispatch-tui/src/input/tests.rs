@@ -108,6 +108,7 @@ fn every_command_is_bound() {
         ('c', Action::CollapseChild),
         ('f', Action::ToggleFold),
         ('o', Action::OpenProject),
+        ('m', Action::AddMachine),
         ('[', Action::Scrollback),
         ('q', Action::Quit),
         ('h', Action::FocusDirection(Direction::Left)),

@@ -18,8 +18,10 @@ use dispatch_pty::{
     Size, TitleScanner,
 };
 
+use crate::add_machine::{self, AddMachine, Checked, Step};
 use crate::approval::Approval;
 use crate::backend::{Backend, RemotePane};
+use dispatch_config::machines::{self, Machine};
 use dispatch_tui::browser::Browser;
 use dispatch_tui::input::{
     Action, Direction, Event, InputRouter, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -210,6 +212,8 @@ enum Overlay {
     Browse(Browser),
     /// A machine to open a project on, when there is more than one.
     Machine(Picker),
+    /// A machine being registered.
+    AddMachine(AddMachine),
     /// A path to open on a machine this client cannot browse.
     OpenOn {
         /// The machine it will be opened on.
@@ -232,7 +236,10 @@ impl Overlay {
             | Overlay::Project(picker)
             | Overlay::Register(picker)
             | Overlay::Machine(picker) => Some(picker),
-            Overlay::Browse(_) | Overlay::OpenOn { .. } | Overlay::Approval { .. } => None,
+            Overlay::Browse(_)
+            | Overlay::AddMachine(_)
+            | Overlay::OpenOn { .. }
+            | Overlay::Approval { .. } => None,
         }
     }
 
@@ -243,7 +250,10 @@ impl Overlay {
             | Overlay::Project(picker)
             | Overlay::Register(picker)
             | Overlay::Machine(picker) => Some(picker),
-            Overlay::Browse(_) | Overlay::OpenOn { .. } | Overlay::Approval { .. } => None,
+            Overlay::Browse(_)
+            | Overlay::AddMachine(_)
+            | Overlay::OpenOn { .. }
+            | Overlay::Approval { .. } => None,
         }
     }
 
@@ -255,7 +265,10 @@ impl Overlay {
             Overlay::Project(_) => Some(OverlayKind::Project),
             Overlay::Register(_) => Some(OverlayKind::Register),
             Overlay::Machine(_) => Some(OverlayKind::Machine),
-            Overlay::Browse(_) | Overlay::OpenOn { .. } | Overlay::Approval { .. } => None,
+            Overlay::Browse(_)
+            | Overlay::AddMachine(_)
+            | Overlay::OpenOn { .. }
+            | Overlay::Approval { .. } => None,
         }
     }
 }
@@ -335,6 +348,11 @@ pub struct App {
     /// `None` in a test, and in any client told to keep nothing: the list is a
     /// convenience, and a client that cannot write it still runs.
     kept: Option<PathBuf>,
+    /// How the add overlay proves a machine answers.
+    ///
+    /// A field so a test can answer for a machine that does not exist; the
+    /// real one dials it.
+    checker: add_machine::Checker,
     /// The browser as it was last closed, so reopening it lands where it was.
     browser: Option<Browser>,
     overlay: Option<Overlay>,
@@ -437,6 +455,7 @@ impl App {
             local: Some(local),
             browse_from: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             kept: None,
+            checker: Box::new(add_machine::check),
             browser: None,
             overlay: None,
             state,
@@ -982,8 +1001,10 @@ impl App {
     /// Returns whether anything needs redrawing. Standalone, there is nothing
     /// to hear and this does nothing.
     pub fn poll_daemon(&mut self) -> bool {
+        let added = self.poll_add_machine();
+
         let Mode::Attached(attachments) = &self.mode else {
-            return false;
+            return added;
         };
 
         // Collected first: applying a message borrows `self` mutably, and the
@@ -1013,7 +1034,7 @@ impl App {
             }
         }
 
-        changed
+        added || changed
     }
 
     /// Brings one attachment's device up to date, and rebuilds its rows when
@@ -1646,6 +1667,7 @@ impl App {
             Action::Approvals => self.open_next_approval(),
             Action::ToggleFold => self.toggle_fold(),
             Action::OpenProject => self.start_open(),
+            Action::AddMachine => self.open_add_machine(),
             Action::ExpandChild => self.expand_child(),
             Action::CollapseChild => self.collapse_child(),
         }
@@ -1789,6 +1811,11 @@ impl App {
             return Ok(());
         }
 
+        if matches!(self.overlay, Some(Overlay::AddMachine(_))) {
+            self.handle_add_machine_key(key);
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.overlay = None;
@@ -1909,6 +1936,58 @@ impl App {
             KeyCode::Char(c) if !ctrl => prompt.push(c),
             _ => {}
         }
+    }
+
+    /// Acts on one key while a machine is being added.
+    fn handle_add_machine_key(&mut self, key: &KeyEvent) {
+        let dir = self.kept.clone();
+        let host = this_machine();
+        let validate = |name: &str| match &dir {
+            Some(dir) => machines::check(dir, name, &host).map_err(|e| e.to_string()),
+            None => Ok(()),
+        };
+
+        let Some(Overlay::AddMachine(add)) = &mut self.overlay else {
+            return;
+        };
+
+        match add.key(key, validate) {
+            Step::Stay => {}
+            Step::Close => self.overlay = None,
+            Step::Check(machine) => {
+                let answer = (self.checker)(&machine);
+                add.checking(machine, answer);
+            }
+        }
+    }
+
+    /// Acts on the add overlay's check, once it answers.
+    fn poll_add_machine(&mut self) -> bool {
+        let Some(Overlay::AddMachine(add)) = &mut self.overlay else {
+            return false;
+        };
+
+        let (machine, client): (Machine, Client) = match add.poll() {
+            Checked::Waiting => return false,
+            Checked::Failed => return true,
+            Checked::Passed(machine, client) => (machine, client),
+        };
+
+        self.overlay = None;
+
+        let Some(dir) = self.kept.clone() else {
+            return true;
+        };
+        if let Err(error) = machines::add(&dir, machine.clone(), &this_machine()) {
+            self.status = format!("could not save {}: {error}", machine.name);
+            return true;
+        }
+
+        let device = client.device();
+        client.subscribe();
+        self.attach_named(client, Some(machine.name.clone()), Vec::new());
+        self.status = format!("added {} (its daemon calls itself {device})", machine.name);
+        true
     }
 
     /// Asks one machine to open `root`, and keeps it on that machine's list.
@@ -2291,6 +2370,24 @@ impl App {
             picker.next();
         }
         self.overlay = Some(Overlay::Machine(picker));
+    }
+
+    /// Opens the add overlay, when this client can take another machine.
+    fn open_add_machine(&mut self) {
+        // Attaching tears the standalone machine down, panes and all. The
+        // registry makes the next start attached; this keystroke must not
+        // make this one.
+        if matches!(self.mode, Mode::Standalone) {
+            self.status =
+                "machines need the daemon: restart Dispatch with --attach to add one".into();
+            return;
+        }
+        if self.kept.is_none() {
+            self.status = "there is no configuration directory to save a machine in".into();
+            return;
+        }
+
+        self.overlay = Some(Overlay::AddMachine(AddMachine::new()));
     }
 
     /// Asks for a path on a machine this client cannot browse.
@@ -2695,6 +2792,11 @@ impl App {
 
         if let Overlay::OpenOn { prompt, .. } = overlay {
             frame.render_widget(prompt, panes_area);
+            return;
+        }
+
+        if let Overlay::AddMachine(add) = overlay {
+            frame.render_widget(add.prompt(), panes_area);
             return;
         }
 
@@ -5801,5 +5903,107 @@ mod tests {
         open_project(&mut app);
 
         assert!(matches!(app.overlay, Some(Overlay::Browse(_))));
+    }
+
+    /// The prefix, then `m`.
+    fn add_machine(app: &mut App) {
+        app.handle(
+            &Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Size::new(100, 30),
+        )
+        .expect("a keystroke is handled");
+        press(app, KeyCode::Char('m'));
+    }
+
+    /// A checker that hands back whatever the test sends, once.
+    fn scripted_checker() -> (
+        crate::add_machine::Checker,
+        Sender<crate::add_machine::Answer>,
+    ) {
+        let (done, answer) = std::sync::mpsc::channel();
+        let answer = std::sync::Mutex::new(Some(answer));
+        (
+            Box::new(move |_| {
+                answer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                    .expect("one check per test")
+            }),
+            done,
+        )
+    }
+
+    #[test]
+    fn adding_a_machine_is_refused_while_standalone() {
+        // Attaching tears the standalone machine down, panes and all. A
+        // keystroke must never do that.
+        let mut app = App::new(HarnessRegistry::default());
+
+        add_machine(&mut app);
+
+        assert!(app.overlay.is_none());
+        assert!(app.status.contains("--attach"), "{}", app.status);
+        assert!(app.local.is_some(), "the standalone machine is untouched");
+    }
+
+    #[test]
+    fn a_machine_that_passes_its_check_is_saved_and_attached() {
+        let dir = scratch("add-machine");
+        let (mut app, _project, _daemon, _sent) = attached_app();
+        app.keep_projects_in(&dir);
+        let (checker, done) = scripted_checker();
+        app.checker = checker;
+
+        add_machine(&mut app);
+        type_text(&mut app, "me@tower.lan");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+
+        let (client, _far, _far_sent) = Client::for_test();
+        client.handle().rename_for_test("ubuntu-22");
+        done.send(Ok(client)).expect("the overlay is waiting");
+        app.poll_daemon();
+
+        assert!(app.overlay.is_none());
+        assert_eq!(
+            dispatch_config::machines::load(&dir).expect("it reads back"),
+            [Machine::new("tower", "me@tower.lan")]
+        );
+        assert!(
+            device_named(&app, "tower").reachable,
+            "attached, already connected"
+        );
+        assert!(app.status.contains("added tower"), "{}", app.status);
+    }
+
+    #[test]
+    fn closing_the_overlay_mid_check_saves_nothing() {
+        let dir = scratch("add-machine-esc");
+        let (mut app, _project, _daemon, _sent) = attached_app();
+        app.keep_projects_in(&dir);
+        let (checker, done) = scripted_checker();
+        app.checker = checker;
+        let devices = app.state.devices().len();
+
+        add_machine(&mut app);
+        type_text(&mut app, "tower");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+
+        let (client, _far, _far_sent) = Client::for_test();
+        assert!(
+            done.send(Ok(client)).is_err(),
+            "nobody is waiting: the late client is dropped with the send"
+        );
+        app.poll_daemon();
+
+        assert!(
+            dispatch_config::machines::load(&dir)
+                .expect("it reads")
+                .is_empty()
+        );
+        assert_eq!(app.state.devices().len(), devices, "no row was added");
     }
 }

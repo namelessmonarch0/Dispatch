@@ -84,6 +84,9 @@ pub enum Action {
     ToggleFold,
     /// Open the directory browser, to add a project without restarting.
     OpenProject,
+    /// Open the overlay that registers a machine, to add one without
+    /// restarting.
+    AddMachine,
     /// Quit.
     Quit,
 }
@@ -266,6 +269,7 @@ fn command_for(event: &KeyEvent) -> Action {
         KeyCode::Char('c') => Action::CollapseChild,
         KeyCode::Char('f') => Action::ToggleFold,
         KeyCode::Char('o') => Action::OpenProject,
+        KeyCode::Char('m') => Action::AddMachine,
         KeyCode::Char('[') => Action::Scrollback,
         // A grid holds four panes at most, so a fifth opens a tab rather than
         // shrinking the other four into unreadability. Digits pick one
