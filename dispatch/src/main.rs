@@ -4,6 +4,7 @@ mod app;
 mod approval;
 mod backend;
 mod delegate;
+mod machine;
 mod terminal;
 
 use std::path::PathBuf;
@@ -91,6 +92,12 @@ enum Command {
         /// What the subagent should do.
         task: String,
     },
+
+    /// Register, list or remove the machines Dispatch reaches over ssh.
+    Machine {
+        #[command(subcommand)]
+        action: machine::Action,
+    },
 }
 
 /// Parses `COLSxROWS`.
@@ -109,13 +116,14 @@ fn main() -> Result<ExitCode> {
     let args = Args::parse();
     init_logging(args.log_file.clone())?;
 
-    if let Some(Command::Delegate {
-        harness,
-        size,
-        task,
-    }) = args.command
-    {
-        return delegate::run(harness, size, &task);
+    match args.command {
+        Some(Command::Delegate {
+            harness,
+            size,
+            task,
+        }) => return delegate::run(harness, size, &task),
+        Some(Command::Machine { action }) => return machine::run(action),
+        None => {}
     }
 
     // Written on first run and never overwritten, so local edits survive.
