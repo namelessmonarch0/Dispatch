@@ -11,7 +11,7 @@ at.
 |---|---|---|
 | F1 — many daemons in one client | **merged** | `specs/2026-09-21-federation-many-daemons-design.md` |
 | F2a — a connection that is not a socket | **merged** | `specs/2026-09-22-federation-stdio-transport-design.md` |
-| F2b — machines: SSH, a registry, a supervisor | **not started** | not written |
+| F2b — machines: SSH, a registry, a supervisor | **designed** | `specs/2026-09-22-federation-machines-design.md` |
 
 What works today, end to end: one client holds a connection per machine; every
 project and pane is attributed to the machine it is on; the sidebar draws a row
