@@ -50,8 +50,11 @@ pub struct AddMachine {
 }
 
 enum Stage {
-    /// Asking where ssh should connect, remembering a name the user already
-    /// chose if a failed check brought them back here.
+    /// Asking where ssh should connect, remembering a name only when a failed
+    /// check brought them back here with one the user chose on purpose —
+    /// distinguished from what the failed target itself would have defaulted
+    /// to, so fixing a typo in the target offers *that* target's own default
+    /// rather than dragging the typo's name along with it.
     Target { name: Option<String> },
     /// Asking what to call it.
     Name { target: String },
@@ -161,8 +164,10 @@ impl AddMachine {
     /// Where the check stands.
     ///
     /// A failure goes back to the target, not the name: a dial that fails is
-    /// almost always the target's fault, and the name chosen is kept for the
-    /// next try.
+    /// almost always the target's fault. The name is kept for the next try
+    /// only when it is not just what the failed target defaulted to — a name
+    /// the user never actually chose — so correcting the target offers that
+    /// target's own default rather than the old one's.
     pub fn poll(&mut self) -> Checked {
         let Stage::Checking { answer, .. } = &self.stage else {
             return Checked::Waiting;
@@ -185,8 +190,14 @@ impl AddMachine {
             Err(reason) => {
                 self.prompt = target_prompt(&machine.target);
                 self.prompt.set_note(Some(Note::Error(reason)));
+                // Only a name that differs from what this same target would
+                // already default to was actually chosen; otherwise it is
+                // just the failed target's own default riding along, and a
+                // corrected target should get its own rather than inherit it.
+                let chosen_on_purpose = machines::default_name(&machine.target).as_deref()
+                    != Some(machine.name.as_str());
                 self.stage = Stage::Target {
-                    name: Some(machine.name),
+                    name: chosen_on_purpose.then_some(machine.name),
                 };
                 Checked::Failed
             }
@@ -299,6 +310,63 @@ mod tests {
             add.prompt().note(),
             Some(&Note::Error("ssh: Could not resolve hostname towr".into()))
         );
+    }
+
+    #[test]
+    fn a_corrected_target_after_a_failed_check_offers_its_own_default_name() {
+        // "towr" defaults to a name of "towr" too, so nothing here was chosen
+        // on purpose; fixing the typo must not carry the old typo's name
+        // along into the new target's own default.
+        let mut add = AddMachine::new();
+        type_text(&mut add, "towr");
+        let _ = add.key(&key(KeyCode::Enter), |_| Ok(()));
+        let Step::Check(machine) = add.key(&key(KeyCode::Enter), |_| Ok(())) else {
+            panic!("the check starts");
+        };
+
+        let (done, answer) = std::sync::mpsc::channel();
+        add.checking(machine, answer);
+        done.send(Err("ssh: Could not resolve hostname towr".into()))
+            .expect("the overlay is listening");
+        assert!(matches!(add.poll(), Checked::Failed));
+
+        for _ in 0.."towr".len() {
+            let _ = add.key(&key(KeyCode::Backspace), |_| Ok(()));
+        }
+        type_text(&mut add, "tower");
+        let _ = add.key(&key(KeyCode::Enter), |_| Ok(()));
+
+        assert_eq!(add.prompt().input(), "tower");
+    }
+
+    #[test]
+    fn a_name_chosen_on_purpose_survives_fixing_the_target() {
+        let mut add = AddMachine::new();
+        type_text(&mut add, "towr");
+        let _ = add.key(&key(KeyCode::Enter), |_| Ok(()));
+        // "towr" defaulted the name too; replace it with something the
+        // default would never produce.
+        for _ in 0.."towr".len() {
+            let _ = add.key(&key(KeyCode::Backspace), |_| Ok(()));
+        }
+        type_text(&mut add, "big");
+        let Step::Check(machine) = add.key(&key(KeyCode::Enter), |_| Ok(())) else {
+            panic!("the check starts");
+        };
+
+        let (done, answer) = std::sync::mpsc::channel();
+        add.checking(machine, answer);
+        done.send(Err("ssh: Could not resolve hostname towr".into()))
+            .expect("the overlay is listening");
+        assert!(matches!(add.poll(), Checked::Failed));
+
+        for _ in 0.."towr".len() {
+            let _ = add.key(&key(KeyCode::Backspace), |_| Ok(()));
+        }
+        type_text(&mut add, "tower");
+        let _ = add.key(&key(KeyCode::Enter), |_| Ok(()));
+
+        assert_eq!(add.prompt().input(), "big");
     }
 
     #[test]
