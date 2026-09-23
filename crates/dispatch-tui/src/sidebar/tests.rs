@@ -908,6 +908,25 @@ fn an_unreachable_device_with_a_long_name_still_says_so() {
 }
 
 #[test]
+fn a_pending_device_with_no_projects_still_draws_a_row() {
+    // The startup case: a registered machine is drawn before it has answered,
+    // and before it has answered it has no projects either -- `roots` only
+    // arrive on first connect. The row must not wait for either.
+    let mut state = AppState::new();
+    let laptop = state.add_device(Device::new("laptop"));
+    state.add_project(Project::new("/tmp/alpha", ProjectSource::LocalDir).with_device(laptop));
+    state.add_device(Device::pending("tower"));
+
+    let lines = render_lines(&state, WIDTH, 8);
+    let row = lines
+        .iter()
+        .find(|line| line.contains("tower"))
+        .expect("the machine has a row despite having no projects");
+
+    assert!(row.contains("unreachable"), "{row:?}");
+}
+
+#[test]
 fn a_click_on_a_device_row_finds_the_device() {
     let (state, laptop, _) = fleet();
     let area = Rect::new(0, 0, WIDTH, 10);

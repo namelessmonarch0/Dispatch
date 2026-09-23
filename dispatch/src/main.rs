@@ -146,10 +146,16 @@ fn main() -> Result<ExitCode> {
         })
         .collect::<Result<_>>()?;
 
+    let config_dir = dispatch_os::paths::config_dir().context("failed to locate the config dir")?;
+
+    // Read before deciding how to run: any registered machine means the
+    // agents belong to daemons, this machine's included.
+    let machines = dispatch_config::machines::load(&config_dir)
+        .context("failed to read the registered machines")?;
+
     // The fleet is not one directory: the projects kept from earlier runs are
     // opened alongside whatever this one names, and a directory that has since
     // been deleted or moved is skipped rather than taking the start down.
-    let config_dir = dispatch_os::paths::config_dir().context("failed to locate the config dir")?;
     let mut roots: Vec<PathBuf> = dispatch_config::projects::load(&config_dir)
         .context("failed to read the kept projects")?
         .into_iter()
@@ -168,7 +174,12 @@ fn main() -> Result<ExitCode> {
         }
     }
 
-    let mut app = if args.attach {
+    use dispatch_client::{Client, Dial, Liveness};
+    use dispatch_proto::Role;
+
+    let mut app = if args.attach || !machines.is_empty() {
+        // A registered machine implies attaching: standalone agents are this
+        // process's children and cannot share a sidebar with a daemon's.
         // Fails before the terminal is taken over, so the reason is readable.
         let client = attach(&roots, args.no_start)?;
         tracing::info!(device = client.device(), "attached to a daemon");
@@ -178,8 +189,24 @@ fn main() -> Result<ExitCode> {
         App::new(harnesses)
     };
 
-    use dispatch_client::{Client, Dial, Liveness};
-    use dispatch_proto::Role;
+    for machine in &machines {
+        // Not `args`: that is the command line's own, still read below.
+        let (program, arguments) = machine.dial();
+        let client = Client::dial(
+            Role::Interface,
+            CLIENT_NAME,
+            Liveness::default(),
+            Dial::Command {
+                program,
+                args: arguments,
+            },
+        );
+        client.subscribe();
+
+        let roots = dispatch_config::projects::load_on(&config_dir, &machine.name)
+            .context("failed to read the kept projects")?;
+        app.attach_named(client, Some(machine.name.clone()), roots);
+    }
 
     // Dialled in the background: the interface is drawn at once, and each
     // machine's row lights up when it answers. Attaching in turn cost thirty

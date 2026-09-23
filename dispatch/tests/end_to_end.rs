@@ -400,7 +400,17 @@ impl Harness {
 
     /// Waits until the screen satisfies `predicate`, returning whether it did.
     fn wait_for(&mut self, predicate: impl Fn(&[String]) -> bool) -> bool {
-        let deadline = Instant::now() + SETTLE;
+        self.wait_for_within(SETTLE, predicate)
+    }
+
+    /// As `wait_for`, for something that takes longer than a redraw: a
+    /// machine joining is gated on a backoff measured in seconds.
+    fn wait_for_within(
+        &mut self,
+        patience: Duration,
+        predicate: impl Fn(&[String]) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + patience;
         loop {
             let lines = self.lines();
             if predicate(&lines) {
@@ -1296,4 +1306,72 @@ fn a_machine_reached_over_a_bridge_outlives_its_transport() {
 
     near.stop();
     far.stop();
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn a_machine_asleep_at_startup_joins_when_it_wakes() {
+    // The slice's claim: a registered machine that does not answer at
+    // startup is drawn anyway, retried in the background, and joins — with
+    // its kept project — once it does. No `--attach`: a registered machine
+    // implies it.
+    let here = Fixture::new("wake-a");
+    let there = Fixture::new("wake-b");
+
+    // The flag stands in for the machine being asleep. `--stdio` would
+    // otherwise start the far daemon itself on the very first dial.
+    let flag = there.config.path().join("awake");
+    let script = format!(
+        "test -e {} && exec {} --stdio --endpoint {}",
+        flag.display(),
+        dispatchd_binary().display(),
+        there.config.path().join("dispatchd.sock").display()
+    );
+    std::fs::write(
+        here.config.path().join("machines.toml"),
+        format!(
+            "[[machine]]\nname = \"tower\"\ntarget = \"tower\"\n\
+             command = {{ program = \"sh\", args = [\"-c\", {script:?}] }}\n"
+        ),
+    )
+    .expect("temp dir is writable");
+    std::fs::write(
+        here.config.path().join("projects.toml"),
+        format!(
+            "[machines.tower]\nroots = [{:?}]\n",
+            there.project.display().to_string()
+        ),
+    )
+    .expect("temp dir is writable");
+
+    let mut app = Harness::spawn(&here, Size::new(200, 30), &[]);
+
+    assert!(
+        app.wait_for(
+            |lines| sidebar_contains(lines, "tower") && sidebar_contains(lines, "unreachable")
+        ),
+        "the machine is drawn before it answers"
+    );
+
+    std::fs::write(&flag, b"").expect("temp dir is writable");
+
+    assert!(
+        app.wait_for_within(Duration::from_secs(45), |lines| contains(
+            lines,
+            "connected to tower"
+        )),
+        "it joins once it wakes"
+    );
+
+    app.select_project("tower");
+    app.spawn_shell();
+    app.send(b"echo woke-up\r");
+    assert!(
+        app.wait_for(|lines| contains(lines, "woke-up")),
+        "and its kept project runs real work"
+    );
+
+    drop(app);
+    stop_recorded_daemon(&here);
+    stop_recorded_daemon(&there);
 }
