@@ -25,7 +25,7 @@ use dispatch_tui::input::{
     Action, Direction, Event, InputRouter, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseEventKind,
 };
-use dispatch_tui::{Item, PaneWidget, Picker, Sidebar, sidebar};
+use dispatch_tui::{Item, PaneWidget, Picker, Prompt, Sidebar, sidebar};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -76,6 +76,7 @@ enum OverlayKind {
     Harness,
     Project,
     Register,
+    Machine,
 }
 
 /// One delegation request waiting on a decision.
@@ -207,6 +208,15 @@ enum Overlay {
     Register(Picker),
     /// A directory to open as a project.
     Browse(Browser),
+    /// A machine to open a project on, when there is more than one.
+    Machine(Picker),
+    /// A path to open on a machine this client cannot browse.
+    OpenOn {
+        /// The machine it will be opened on.
+        device: DeviceId,
+        /// What has been typed.
+        prompt: Prompt,
+    },
     /// A delegation request, shown from the front of `App::pending`.
     Approval {
         /// First line of the task text on screen, for a long one.
@@ -218,20 +228,22 @@ impl Overlay {
     /// The picker inside, for the variants that have one.
     fn picker(&self) -> Option<&Picker> {
         match self {
-            Overlay::Harness(picker) | Overlay::Project(picker) | Overlay::Register(picker) => {
-                Some(picker)
-            }
-            Overlay::Browse(_) | Overlay::Approval { .. } => None,
+            Overlay::Harness(picker)
+            | Overlay::Project(picker)
+            | Overlay::Register(picker)
+            | Overlay::Machine(picker) => Some(picker),
+            Overlay::Browse(_) | Overlay::OpenOn { .. } | Overlay::Approval { .. } => None,
         }
     }
 
     /// The picker inside, mutably, for the variants that have one.
     fn picker_mut(&mut self) -> Option<&mut Picker> {
         match self {
-            Overlay::Harness(picker) | Overlay::Project(picker) | Overlay::Register(picker) => {
-                Some(picker)
-            }
-            Overlay::Browse(_) | Overlay::Approval { .. } => None,
+            Overlay::Harness(picker)
+            | Overlay::Project(picker)
+            | Overlay::Register(picker)
+            | Overlay::Machine(picker) => Some(picker),
+            Overlay::Browse(_) | Overlay::OpenOn { .. } | Overlay::Approval { .. } => None,
         }
     }
 
@@ -242,7 +254,8 @@ impl Overlay {
             Overlay::Harness(_) => Some(OverlayKind::Harness),
             Overlay::Project(_) => Some(OverlayKind::Project),
             Overlay::Register(_) => Some(OverlayKind::Register),
-            Overlay::Browse(_) | Overlay::Approval { .. } => None,
+            Overlay::Machine(_) => Some(OverlayKind::Machine),
+            Overlay::Browse(_) | Overlay::OpenOn { .. } | Overlay::Approval { .. } => None,
         }
     }
 }
@@ -1632,7 +1645,7 @@ impl App {
             Action::Scrollback => self.scroll_focused(-10),
             Action::Approvals => self.open_next_approval(),
             Action::ToggleFold => self.toggle_fold(),
-            Action::OpenProject => self.open_browser(),
+            Action::OpenProject => self.start_open(),
             Action::ExpandChild => self.expand_child(),
             Action::CollapseChild => self.collapse_child(),
         }
@@ -1770,6 +1783,12 @@ impl App {
             return Ok(());
         }
 
+        // Plain letters are what is being typed, so this takes every key.
+        if matches!(self.overlay, Some(Overlay::OpenOn { .. })) {
+            self.handle_open_on_key(key);
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.overlay = None;
@@ -1862,6 +1881,56 @@ impl App {
             }
             KeyCode::Char(c) if !ctrl => browser.push(c),
             _ => {}
+        }
+    }
+
+    /// Acts on one key while a remote path is being typed.
+    fn handle_open_on_key(&mut self, key: &KeyEvent) {
+        let Some(Overlay::OpenOn { device, prompt }) = &mut self.overlay else {
+            return;
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        match key.code {
+            KeyCode::Esc => self.overlay = None,
+            KeyCode::Backspace => prompt.backspace(),
+            KeyCode::Enter => {
+                let Some(answer) = prompt.answer() else {
+                    return;
+                };
+                let device = *device;
+                let root = PathBuf::from(answer);
+                let name = prompt.title().trim_start_matches("Open on ").to_string();
+
+                self.overlay = None;
+                self.add_project_on(device, root.clone());
+                self.status = format!("opening {} on {name}", root.display());
+            }
+            KeyCode::Char(c) if !ctrl => prompt.push(c),
+            _ => {}
+        }
+    }
+
+    /// Asks one machine to open `root`, and keeps it on that machine's list.
+    ///
+    /// Sent even to a machine that is down: the send is dropped, but the root
+    /// is in `opened`, and goes out when the machine connects.
+    fn add_project_on(&mut self, device: DeviceId, root: PathBuf) {
+        let list = self.kept_list(device);
+        self.keep(&list, &root);
+
+        let Mode::Attached(attachments) = &mut self.mode else {
+            return;
+        };
+        let Some(attachment) = attachments.iter_mut().find(|a| a.device == device) else {
+            return;
+        };
+
+        attachment
+            .client
+            .send(ClientMessage::OpenProject { root: root.clone() });
+        if !attachment.opened.contains(&root) {
+            attachment.opened.push(root);
         }
     }
 
@@ -2061,6 +2130,19 @@ impl App {
                     .context("failed to reload harness definitions")?;
                 self.status = format!("registered {id}");
             }
+            OverlayKind::Machine => {
+                let chosen = self
+                    .attachments()
+                    .iter()
+                    .find(|a| a.device.to_string() == id)
+                    .map(|a| (a.device, a.remote));
+
+                match chosen {
+                    Some((device, true)) => self.open_path_prompt(device),
+                    Some((_, false)) => self.open_browser(),
+                    None => {}
+                }
+            }
         }
 
         Ok(())
@@ -2158,6 +2240,74 @@ impl App {
         }
 
         self.open_project_picker();
+    }
+
+    /// Opens a project: straight to the one machine there is, or asks which.
+    fn start_open(&mut self) {
+        match self.attachments() {
+            [] => self.open_browser(),
+            [only] if !only.remote => self.open_browser(),
+            [only] => {
+                let device = only.device;
+                self.open_path_prompt(device);
+            }
+            _ => self.open_machine_picker(),
+        }
+    }
+
+    /// Offers every attached machine, starting on the one the view is in.
+    fn open_machine_picker(&mut self) {
+        let here = self.state.selected_project().and_then(|selected| {
+            self.state
+                .projects()
+                .iter()
+                .find(|p| p.id == selected)
+                .map(|p| p.device)
+        });
+
+        let items: Vec<Item> = self
+            .attachments()
+            .iter()
+            .filter_map(|attachment| {
+                let device = self.state.device(attachment.device)?;
+                let item = Item::new(attachment.device.to_string(), &device.name);
+                Some(if !attachment.remote {
+                    item.with_detail("this machine")
+                } else if !device.reachable {
+                    // Allowed: the root waits until the machine answers.
+                    item.with_detail("unreachable")
+                } else {
+                    item
+                })
+            })
+            .collect();
+
+        let start = here
+            .and_then(|device| items.iter().position(|i| i.id == device.to_string()))
+            .unwrap_or(0);
+
+        let mut picker = Picker::new("Open on", items);
+        for _ in 0..start {
+            picker.next();
+        }
+        self.overlay = Some(Overlay::Machine(picker));
+    }
+
+    /// Asks for a path on a machine this client cannot browse.
+    fn open_path_prompt(&mut self, device: DeviceId) {
+        let name = self
+            .state
+            .device(device)
+            .map(|d| d.name.clone())
+            .unwrap_or_default();
+
+        self.overlay = Some(Overlay::OpenOn {
+            device,
+            prompt: Prompt::new(
+                format!("Open on {name}"),
+                "a directory on that machine, such as ~/code/app",
+            ),
+        });
     }
 
     /// Opens the directory browser.
@@ -2540,6 +2690,11 @@ impl App {
 
         if let Overlay::Browse(browser) = overlay {
             frame.render_widget(browser, panes_area);
+            return;
+        }
+
+        if let Overlay::OpenOn { prompt, .. } = overlay {
+            frame.render_widget(prompt, panes_area);
             return;
         }
 
@@ -5515,5 +5670,136 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The prefix, then `o`.
+    fn open_project(app: &mut App) {
+        app.handle(
+            &Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Size::new(100, 30),
+        )
+        .expect("a keystroke is handled");
+        press(app, KeyCode::Char('o'));
+    }
+
+    /// Types `text` one key at a time.
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    /// This machine's daemon and one registered machine, `tower`.
+    fn near_and_tower() -> (App, Receiver<ClientMessage>, Receiver<ClientMessage>) {
+        let (near, _near_daemon, near_sent) = Client::for_test();
+        near.handle().rename_for_test("near");
+        let (tower, _tower_daemon, tower_sent) = Client::for_test();
+
+        let mut app = App::new(HarnessRegistry::default());
+        app.attach(near);
+        app.attach_named(tower, Some("tower".into()), Vec::new());
+        app.poll_daemon();
+
+        (app, near_sent, tower_sent)
+    }
+
+    #[test]
+    fn opening_with_two_machines_asks_which_one_first() {
+        let (mut app, _near, _tower) = near_and_tower();
+
+        open_project(&mut app);
+
+        let Some(Overlay::Machine(picker)) = &app.overlay else {
+            panic!("expected the machine picker");
+        };
+        let labels: Vec<&str> = picker.items().iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["near", "tower"]);
+    }
+
+    #[test]
+    fn this_machine_still_gets_the_browser() {
+        let (mut app, _near, _tower) = near_and_tower();
+
+        open_project(&mut app);
+        press(&mut app, KeyCode::Enter);
+
+        assert!(matches!(app.overlay, Some(Overlay::Browse(_))));
+    }
+
+    #[test]
+    fn a_remote_machine_gets_a_path_prompt_and_only_it_is_asked() {
+        let dir = scratch("open-on");
+        let (mut app, near_sent, tower_sent) = near_and_tower();
+        app.keep_projects_in(&dir);
+
+        open_project(&mut app);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.overlay, Some(Overlay::OpenOn { .. })));
+
+        type_text(&mut app, "~/code/app");
+        press(&mut app, KeyCode::Enter);
+
+        let asked: Vec<ClientMessage> = tower_sent.try_iter().collect();
+        assert!(
+            asked.contains(&ClientMessage::OpenProject {
+                root: PathBuf::from("~/code/app")
+            }),
+            "tower is asked: {asked:?}"
+        );
+        assert!(
+            !near_sent
+                .try_iter()
+                .any(|m| matches!(m, ClientMessage::OpenProject { .. })),
+            "this machine is not"
+        );
+        assert_eq!(
+            dispatch_config::projects::load_on(&dir, "tower").expect("it reads back"),
+            [PathBuf::from("~/code/app")],
+            "kept under the machine it was opened on"
+        );
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn enter_on_an_empty_path_does_nothing() {
+        let (mut app, _near, tower_sent) = near_and_tower();
+
+        open_project(&mut app);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        type_text(&mut app, "   ");
+        press(&mut app, KeyCode::Enter);
+
+        assert!(
+            matches!(app.overlay, Some(Overlay::OpenOn { .. })),
+            "still asking"
+        );
+        assert!(
+            !tower_sent
+                .try_iter()
+                .any(|m| matches!(m, ClientMessage::OpenProject { .. })),
+            "nothing was asked for"
+        );
+    }
+
+    #[test]
+    fn one_remote_machine_goes_straight_to_the_prompt() {
+        let (tower, _daemon, _sent) = Client::for_test();
+        let mut app = App::new(HarnessRegistry::default());
+        app.attach_named(tower, Some("tower".into()), Vec::new());
+
+        open_project(&mut app);
+
+        assert!(matches!(app.overlay, Some(Overlay::OpenOn { .. })));
+    }
+
+    #[test]
+    fn one_local_machine_still_opens_the_browser() {
+        let (mut app, _project, _daemon, _sent) = attached_app();
+
+        open_project(&mut app);
+
+        assert!(matches!(app.overlay, Some(Overlay::Browse(_))));
     }
 }
