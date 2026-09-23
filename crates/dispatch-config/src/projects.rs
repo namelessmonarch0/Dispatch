@@ -33,6 +33,7 @@ struct Saved {
 /// One remote machine's kept roots.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Kept {
+    /// Project roots on this remote machine, in the order they were first opened.
     #[serde(default)]
     roots: Vec<PathBuf>,
 }
@@ -138,6 +139,10 @@ pub fn forget_machine(dir: &Path, machine: &str) -> Result<bool, ConfigError> {
     Ok(true)
 }
 
+/// Shared implementation for adding `root` to either this machine's or a remote machine's list.
+///
+/// `machine: None` means this machine's top-level list; `machine: Some(name)` means that remote
+/// machine's table in the machines map. This one body serves both `remember` and `remember_on`.
 fn remember_in(dir: &Path, machine: Option<&str>, root: &Path) -> Result<bool, ConfigError> {
     let mut saved = read(dir)?;
     let list = saved.list_mut(machine);
@@ -151,6 +156,10 @@ fn remember_in(dir: &Path, machine: Option<&str>, root: &Path) -> Result<bool, C
     Ok(true)
 }
 
+/// Shared implementation for removing `root` from either this machine's or a remote machine's list.
+///
+/// `machine: None` means this machine's top-level list; `machine: Some(name)` means that remote
+/// machine's table in the machines map. This one body serves both `forget` and `forget_on`.
 fn forget_in(dir: &Path, machine: Option<&str>, root: &Path) -> Result<bool, ConfigError> {
     let mut saved = read(dir)?;
     let list = saved.list_mut(machine);
