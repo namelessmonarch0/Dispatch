@@ -334,7 +334,7 @@ one.
 
 ## The daemon
 
-Two changes to `open_project_for`, with a new helper,
+Three changes to `open_project_for`, with a new helper,
 `dispatch_os::paths::expand_home`:
 
 - **A leading `~` expands against the daemon's own home.** A path typed by hand
@@ -366,6 +366,28 @@ Two changes to `open_project_for`, with a new helper,
   meets a newer client. `ServerMessage` has `#[serde(other)] Unknown`: an older
   client skips `ProjectRefused` and loses only the status line. Adding a
   variant is not a version bump; `VERSION` stays 1.1.
+
+- **A message telling the asker what its root became.** A client keeps a root
+  as typed — `~/code/app` — but the row it gets back carries the root the
+  daemon resolved — `/home/me/code/app` — so dropping that row would match
+  nothing it keeps, and the root would be re-sent on the next connection. On
+  success `open_project_for` therefore sends, to the asking client only and
+  before the `ProjectOpened` broadcast:
+
+  ```rust
+  ProjectResolved {
+      /// The root exactly as the client sent it.
+      root: PathBuf,
+      /// The project's root, as every client will see it.
+      resolved: PathBuf,
+  },
+  ```
+
+  It is sent even when the two are equal, which keeps the daemon simple. A
+  client that receives it with the two different replaces `root` with
+  `resolved` in the attachment's `opened` and its kept list, if `root` is
+  still there. An older client skips it as `Unknown`, as with
+  `ProjectRefused`; `VERSION` stays 1.1.
 
 ## Failure cases
 
@@ -410,10 +432,14 @@ Two changes to `open_project_for`, with a new helper,
   - `~/x` opens `$HOME/x`.
   - A missing root is answered with `ProjectRefused` carrying the root as sent,
     to the asking client only.
+  - `~` is answered with `ProjectResolved { root: "~", resolved: <home> }`,
+    to the asking client only.
 - **`dispatch` app**, with `Client::for_test`
   - A row added by `attach_named` shows the label and is unreachable.
   - A first connect says `connected to`, not `reattached to`.
   - `ProjectRefused` removes the root from the kept list and from `opened`.
+  - `ProjectResolved` rewrites a typed root to the resolved one, so dropping
+    that project's row forgets it and a reconnect does not re-send it.
   - `^a m` while standalone is refused and leaves local panes running.
   - `^a o` with two machines opens the machine picker; choosing a remote
     machine opens the path prompt and sends to that machine only.

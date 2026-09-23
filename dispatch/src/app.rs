@@ -1453,6 +1453,37 @@ impl App {
                 true
             }
 
+            ServerMessage::ProjectResolved { root, resolved } => {
+                // Every record of this root now names what the row will carry.
+                // Kept as typed, a dropped row would match none of them, and
+                // the root would be asked for again on the next connection.
+                // Only a root still in `opened`: one dropped or refused while
+                // this was on its way is not to be brought back.
+                let Mode::Attached(attachments) = &mut self.mode else {
+                    return false;
+                };
+                let Some(attachment) = attachments.iter_mut().find(|a| a.device == device) else {
+                    return false;
+                };
+                let Some(at) = attachment.opened.iter().position(|kept| *kept == root) else {
+                    return false;
+                };
+                if root == resolved {
+                    return false;
+                }
+
+                if attachment.opened.contains(&resolved) {
+                    attachment.opened.remove(at);
+                } else {
+                    attachment.opened[at] = resolved.clone();
+                }
+
+                let list = self.kept_list(device);
+                self.unkeep(&list, &root);
+                self.keep(&list, &resolved);
+                false
+            }
+
             // The handshake is done by the client, and nothing here pings.
             // `DelegateFinished` is for the delegate caller, not interface
             // clients. Unknown messages from newer peers are ignored.
@@ -5903,6 +5934,97 @@ mod tests {
         open_project(&mut app);
 
         assert!(matches!(app.overlay, Some(Overlay::Browse(_))));
+    }
+
+    /// One registered machine, `tower`, already answering, with the app
+    /// keeping its projects in `dir`.
+    fn tower_keeping_in(
+        dir: &Path,
+    ) -> (
+        App,
+        dispatch_client::Handle,
+        Sender<ServerMessage>,
+        Receiver<ClientMessage>,
+    ) {
+        let (tower, daemon, sent) = Client::for_test();
+        let handle = tower.handle();
+        let mut app = App::new(HarnessRegistry::default());
+        app.keep_projects_in(dir);
+        app.attach_named(tower, Some("tower".into()), Vec::new());
+        app.poll_daemon();
+        (app, handle, daemon, sent)
+    }
+
+    #[test]
+    fn a_project_opened_by_a_typed_path_is_dropped_for_good() {
+        // Kept as typed, drawn as resolved: the drop has to find the one from
+        // the other, or the root comes back on the next connection.
+        let dir = scratch("drop-typed");
+        let (mut app, handle, daemon, sent) = tower_keeping_in(&dir);
+
+        open_project(&mut app);
+        type_text(&mut app, "~/code/app");
+        press(&mut app, KeyCode::Enter);
+
+        daemon
+            .send(ServerMessage::ProjectResolved {
+                root: PathBuf::from("~/code/app"),
+                resolved: PathBuf::from("/home/me/code/app"),
+            })
+            .expect("the app is listening");
+        daemon
+            .send(ServerMessage::ProjectOpened {
+                project: Project::new("/home/me/code/app", ProjectSource::LocalDir),
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        open_project_picker(&mut app);
+        press(&mut app, KeyCode::Char('d'));
+
+        assert!(
+            dispatch_config::projects::load_on(&dir, "tower")
+                .expect("it reads back")
+                .is_empty(),
+            "the kept list no longer holds it"
+        );
+
+        let _ = sent.try_iter().count();
+        handle.connect_for_test("tower");
+        app.poll_daemon();
+        assert!(
+            !sent
+                .try_iter()
+                .any(|m| matches!(m, ClientMessage::OpenProject { .. })),
+            "and the next connection does not ask for it again"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_resolved_root_replaces_the_typed_one_in_the_kept_list() {
+        let dir = scratch("resolved");
+        let (mut app, _handle, daemon, _sent) = tower_keeping_in(&dir);
+
+        open_project(&mut app);
+        type_text(&mut app, "~/code/app");
+        press(&mut app, KeyCode::Enter);
+
+        daemon
+            .send(ServerMessage::ProjectResolved {
+                root: PathBuf::from("~/code/app"),
+                resolved: PathBuf::from("/home/me/code/app"),
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        assert_eq!(
+            dispatch_config::projects::load_on(&dir, "tower").expect("it reads back"),
+            [PathBuf::from("/home/me/code/app")]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The prefix, then `m`.

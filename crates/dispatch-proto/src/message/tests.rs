@@ -143,6 +143,39 @@ fn a_refused_root_round_trips_and_an_older_peer_skips_it() {
 }
 
 #[test]
+fn a_resolved_root_round_trips_and_an_older_peer_skips_it() {
+    // Both spellings travel: the client finds its record by the first and
+    // rewrites it to the second, which is what the project row will carry.
+    let resolved = ServerMessage::ProjectResolved {
+        root: PathBuf::from("~/code/app"),
+        resolved: PathBuf::from("/home/me/code/app"),
+    };
+    assert_eq!(round_trip(&resolved), resolved);
+
+    // An older client has no `project_resolved`, and must skip it rather
+    // than fail the frame: it only loses the rewrite, which it never had.
+    #[derive(Serialize)]
+    struct FromNewer {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        root: &'static str,
+        resolved: &'static str,
+    }
+    let mut buf = Vec::new();
+    Frame::write(
+        &mut buf,
+        &FromNewer {
+            kind: "some_other_message_from_the_future",
+            root: "~/x",
+            resolved: "/home/me/x",
+        },
+    )
+    .expect("writing succeeds");
+    let read: ServerMessage = Frame::read(&mut buf.as_slice()).expect("reading succeeds");
+    assert_eq!(read, ServerMessage::Unknown);
+}
+
+#[test]
 fn arbitrary_bytes_survive_a_round_trip() {
     // Terminal output is not text. Anything that mangles a byte corrupts the
     // screen on the far side.

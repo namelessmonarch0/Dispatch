@@ -526,7 +526,7 @@ impl Daemon {
 
         let reason = match dispatch_os::paths::resolve(&expanded) {
             Ok(resolved) if resolved.is_dir() => {
-                self.opened_for(resolved);
+                self.opened_for(client, root, resolved);
                 return;
             }
             Ok(resolved) => format!("not a directory: {}", resolved.display()),
@@ -540,10 +540,24 @@ impl Daemon {
 
     /// Registers a root that has been resolved and checked, and tells every
     /// subscriber.
-    fn opened_for(&mut self, resolved: PathBuf) {
+    ///
+    /// `root` is the root as `client` sent it, which only that client keeps.
+    fn opened_for(&mut self, client: ClientId, root: PathBuf, resolved: PathBuf) {
         let id = self.open_project(resolved);
         let project = self.projects[&id].clone();
         tracing::info!(project = %id, root = %project.root.display(), "project opened");
+
+        // The asker keeps what it typed, and the row it is about to get names
+        // what that became. Told first, so by the time the row arrives the
+        // asker's records already match it — and even when the two are equal,
+        // since checking would only move the comparison here from the client.
+        self.send(
+            client,
+            ServerMessage::ProjectResolved {
+                root,
+                resolved: project.root.clone(),
+            },
+        );
 
         // Every client hears about it: they are looking at the same fleet, and
         // a project one of them opened is one they can all spawn into.

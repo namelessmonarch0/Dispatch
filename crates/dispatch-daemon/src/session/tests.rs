@@ -700,8 +700,12 @@ fn opening_a_project_tells_every_subscriber() {
         },
     );
 
+    // Past the asker's own `ProjectResolved`, which comes first.
     let seen = drain(&inbox);
-    let Some(ServerMessage::ProjectOpened { project }) = seen.first() else {
+    let Some(project) = seen.iter().find_map(|m| match m {
+        ServerMessage::ProjectOpened { project } => Some(project),
+        _ => None,
+    }) else {
         panic!("expected a project, got {seen:#?}");
     };
     assert_eq!(project.name, "nested");
@@ -779,6 +783,58 @@ fn a_root_under_home_is_opened_from_the_daemons_own_home() {
             ServerMessage::ProjectOpened { project } if project.root == expected
         )),
         "`~` should open the daemon's home"
+    );
+}
+
+#[test]
+fn the_asker_alone_is_told_what_its_root_resolved_to() {
+    // The asker keeps `~`, but the row every client gets carries the home it
+    // resolved to. Only the asker has a record to rewrite; the others were
+    // never told `~`, and it would mean nothing to them.
+    let (mut daemon, _, _dir) = daemon("resolved");
+    let asker = daemon.attach_for_test(1);
+    let other = daemon.attach_for_test(2);
+    for client in [1, 2] {
+        daemon.request_for_test(client, hello());
+        daemon.request_for_test(client, ClientMessage::Subscribe);
+    }
+    let _ = drain(&asker);
+    let _ = drain(&other);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::OpenProject {
+            root: PathBuf::from("~"),
+        },
+    );
+
+    let home = dispatch_os::paths::expand_home(Path::new("~"));
+    let expected = dispatch_os::paths::resolve(&home).expect("home resolves");
+
+    let heard = drain(&asker);
+    assert!(
+        matches!(
+            heard.as_slice(),
+            [
+                ServerMessage::ProjectResolved { root, resolved },
+                ServerMessage::ProjectOpened { project },
+            ] if root == Path::new("~") && *resolved == expected && project.root == expected
+        ),
+        "the asker hears how its root resolved, before the row arrives: {heard:#?}"
+    );
+
+    let overheard = drain(&other);
+    assert!(
+        !overheard
+            .iter()
+            .any(|m| matches!(m, ServerMessage::ProjectResolved { .. })),
+        "nobody else is told: {overheard:#?}"
+    );
+    assert!(
+        overheard
+            .iter()
+            .any(|m| matches!(m, ServerMessage::ProjectOpened { .. })),
+        "though everyone still gets the row"
     );
 }
 

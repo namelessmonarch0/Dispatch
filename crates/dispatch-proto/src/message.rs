@@ -318,6 +318,25 @@ pub enum ServerMessage {
         reason: String,
     },
 
+    /// A root asked for in [`ClientMessage::OpenProject`] was opened, and this
+    /// is the project root it became.
+    ///
+    /// Sent only to the client that asked, before the [`ProjectOpened`]
+    /// broadcast. The client keeps the root as it was typed — `~/code/app` —
+    /// but the row it gets back carries the root as the daemon resolved it,
+    /// so without this the client could never match the two: dropping the row
+    /// would forget nothing, and the root would come back on the next start.
+    /// Sent even when the two are equal, which keeps the daemon simple; the
+    /// client ignores a rewrite to the same path. An older client skips it.
+    ///
+    /// [`ProjectOpened`]: ServerMessage::ProjectOpened
+    ProjectResolved {
+        /// The root exactly as the client sent it.
+        root: PathBuf,
+        /// The project's root, as every client will see it.
+        resolved: PathBuf,
+    },
+
     /// A pane was started.
     PaneSpawned {
         /// The new pane.
