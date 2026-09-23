@@ -33,6 +33,19 @@ impl Device {
             reachable: true,
         }
     }
+
+    /// A device named `name` that has not connected yet.
+    ///
+    /// A registered machine is drawn before it first answers, so a machine
+    /// that is asleep still has its row — and that row must not claim a
+    /// connection it does not have.
+    #[must_use]
+    pub fn pending(name: impl Into<String>) -> Self {
+        Self {
+            reachable: false,
+            ..Self::new(name)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -47,5 +60,15 @@ mod tests {
 
         assert_eq!(device.name, "laptop");
         assert!(device.reachable);
+    }
+
+    #[test]
+    fn a_pending_device_is_not_reachable_yet() {
+        // A registered machine has a row before its first connection, and
+        // that row must not claim a connection it does not have.
+        let device = Device::pending("tower");
+
+        assert_eq!(device.name, "tower");
+        assert!(!device.reachable);
     }
 }

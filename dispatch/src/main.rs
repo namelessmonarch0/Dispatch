@@ -48,8 +48,8 @@ struct Args {
 
     /// Also attach to a daemon listening on this endpoint. Repeatable.
     ///
-    /// The plumbing federation is built on: `machine add` will fill these in
-    /// from the machine list once it can reach another host.
+    /// The plumbing federation is built on. Dialled in the background and
+    /// retried until it answers.
     #[arg(long = "daemon", value_name = "ENDPOINT")]
     daemons: Vec<PathBuf>,
 
@@ -59,6 +59,7 @@ struct Args {
     /// `ssh user@host dispatchd --stdio`, a wrapper, an absolute path — is
     /// whitespace-separated. A program whose path contains a space needs the
     /// machine registry, which holds the program and its arguments apart.
+    /// Dialled in the background and retried until it answers.
     #[arg(long = "daemon-command", value_name = "COMMAND")]
     daemon_commands: Vec<String>,
 
@@ -177,72 +178,41 @@ fn main() -> Result<ExitCode> {
         App::new(harnesses)
     };
 
-    for endpoint in &args.daemons {
-        use dispatch_client::{Client, Liveness};
-        use dispatch_proto::Role;
+    use dispatch_client::{Client, Dial, Liveness};
+    use dispatch_proto::Role;
 
-        match Client::attach_at(
+    // Dialled in the background: the interface is drawn at once, and each
+    // machine's row lights up when it answers. Attaching in turn cost thirty
+    // seconds per machine that was down, before anything was on screen.
+    for endpoint in &args.daemons {
+        let client = Client::dial(
             Role::Interface,
             CLIENT_NAME,
             Liveness::default(),
-            endpoint.clone(),
-        ) {
-            Ok(client) => {
-                client.subscribe();
-                app.attach(client);
-            }
-            // One machine being down is not a reason to refuse to start: the
-            // others are the reason the user opened Dispatch. But failing
-            // silently here is worse than the single-daemon case: with one
-            // machine attached there is no device row at all yet for a
-            // second one to be missing from, so a log line nobody is
-            // tailing is the only place this ever showed up. No `Attachment`
-            // is created for this endpoint, so nothing here retries it or
-            // ever will — that is the next slice's job — and the machine
-            // cannot join this session without Dispatch being restarted once
-            // it is reachable.
-            Err(error) => {
-                tracing::warn!(%error, endpoint = %endpoint.display(), "could not attach");
-                app.set_status(format!(
-                    "{} is unreachable — not retried; restart Dispatch once it answers",
-                    endpoint.display()
-                ));
-            }
-        }
+            Dial::Endpoint(endpoint.clone()),
+        );
+        client.subscribe();
+        app.attach_named(client, None, Vec::new());
     }
 
     for command in &args.daemon_commands {
-        use dispatch_client::{Client, Liveness};
-        use dispatch_proto::Role;
-
         let mut words = command.split_whitespace().map(std::ffi::OsString::from);
         let Some(program) = words.next() else {
             app.set_status("--daemon-command was empty".to_string());
             continue;
         };
-        let rest: Vec<std::ffi::OsString> = words.collect();
 
-        match Client::attach_over(
+        let client = Client::dial(
             Role::Interface,
             CLIENT_NAME,
             Liveness::default(),
-            program,
-            rest,
-        ) {
-            Ok(client) => {
-                client.subscribe();
-                app.attach(client);
-            }
-            // One machine being unreachable is not a reason to refuse to
-            // start: the others are why the user opened Dispatch. Not retried
-            // until the machine registry supervises them.
-            Err(error) => {
-                tracing::warn!(%error, %command, "could not attach over a command");
-                app.set_status(format!(
-                    "{command} did not answer; not retried — restart Dispatch once it does"
-                ));
-            }
-        }
+            Dial::Command {
+                program,
+                args: words.collect(),
+            },
+        );
+        client.subscribe();
+        app.attach_named(client, None, Vec::new());
     }
 
     // Set before the projects are added, so opening one is what keeps it.

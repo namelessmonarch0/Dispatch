@@ -263,10 +263,34 @@ struct Attachment {
     device: DeviceId,
     client: Client,
     /// That connection's generation. Per attachment, because one daemon
-    /// restarting says nothing about the others.
+    /// restarting says nothing about the others. 0 until it first connects.
     generation: u64,
     /// Roots asked of this daemon, so its own reconnect can ask again.
     opened: Vec<PathBuf>,
+    /// The registry name, which the row keeps whatever the daemon calls
+    /// itself: it exists before the first connection, and it is unique where
+    /// hostnames are not.
+    label: Option<String>,
+    /// Whether this is another machine rather than this one's own daemon.
+    ///
+    /// Only this machine's filesystem can be browsed; a path on any other
+    /// has to be typed.
+    remote: bool,
+    /// The failure last put on the status line, so a machine retrying every
+    /// thirty seconds says so once rather than every time.
+    reported: Option<String>,
+}
+
+/// Which kept list a root opened on an attachment belongs on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeptList {
+    /// This machine's: the top-level list.
+    ThisMachine,
+    /// A registered machine's, by name.
+    Machine(String),
+    /// Nowhere. A machine reached by `--daemon` or `--daemon-command` has no
+    /// name to keep it under, and nothing would dial it again next start.
+    Unkept,
 }
 
 /// Where this Dispatch's agents run.
@@ -374,6 +398,18 @@ pub struct App {
     sent: Vec<ClientMessage>,
 }
 
+/// One attachment's device, connection generation, whether it is up, what it
+/// calls itself, why it is down when it is, and what it has said, taken all
+/// at once before any of it is acted on.
+type Snapshot = (
+    DeviceId,
+    u64,
+    bool,
+    String,
+    Option<String>,
+    Vec<ServerMessage>,
+);
+
 impl App {
     /// Creates an application that owns its own agents.
     pub fn new(harnesses: HarnessRegistry) -> Self {
@@ -426,6 +462,36 @@ impl App {
     /// under. A project stamped with a device the sidebar does not know is
     /// drawn nowhere at all.
     pub fn attach(&mut self, client: Client) {
+        let device = Device::new(client.device());
+        self.hold(client, device, None, false, Vec::new());
+    }
+
+    /// Adds another machine's daemon to the fleet, whether or not it has
+    /// answered yet.
+    ///
+    /// The row is drawn at once — under `label`, or the dial itself when
+    /// there is no label — so a machine that is asleep is visibly there
+    /// rather than missing. `roots` go out the first time it connects.
+    pub fn attach_named(&mut self, client: Client, label: Option<String>, roots: Vec<PathBuf>) {
+        let name = label.clone().unwrap_or_else(|| client.dialled());
+        // A client the add overlay has already proven arrives connected.
+        let device = if client.is_connected() {
+            Device::new(name)
+        } else {
+            Device::pending(name)
+        };
+        self.hold(client, device, label, true, roots);
+    }
+
+    /// Registers `device` and keeps `client` as its attachment.
+    fn hold(
+        &mut self,
+        client: Client,
+        device: Device,
+        label: Option<String>,
+        remote: bool,
+        opened: Vec<PathBuf>,
+    ) {
         // The agents are no longer this process's to run, so the machine it
         // was standing in for goes with them: from here on what is on screen
         // belongs to a daemon. Through `forget_device` rather than
@@ -437,14 +503,17 @@ impl App {
             self.remove_device(local);
         }
 
-        let device = self.state.add_device(Device::new(client.device()));
+        let device = self.state.add_device(device);
         let generation = client.generation();
 
         let attachment = Attachment {
             device,
             client,
             generation,
-            opened: Vec::new(),
+            opened,
+            label,
+            remote,
+            reported: None,
         };
 
         match &mut self.mode {
@@ -681,7 +750,12 @@ impl App {
     /// answers: it is the daemon that names projects, and both clients on a
     /// fleet have to use the same id for the same checkout.
     pub fn add_project(&mut self, root: PathBuf) {
-        self.keep(&root);
+        // Kept on the list of whichever machine it is about to be asked of.
+        let list = self
+            .attachments()
+            .first()
+            .map_or(KeptList::ThisMachine, |a| self.kept_list(a.device));
+        self.keep(&list, &root);
 
         // The first daemon, because a root is a path and nothing has yet asked
         // the user which machine to read it on. For a client holding one — the
@@ -725,28 +799,53 @@ impl App {
             .add_project(Project::new(root, source).with_device(device));
     }
 
-    /// Adds `root` to the kept list, if this client keeps one.
+    /// Which kept list a root opened on `device` belongs on.
+    fn kept_list(&self, device: DeviceId) -> KeptList {
+        match self.attachments().iter().find(|a| a.device == device) {
+            // Standalone: the only machine there is, is this one.
+            None => KeptList::ThisMachine,
+            Some(attachment) if !attachment.remote => KeptList::ThisMachine,
+            Some(Attachment {
+                label: Some(label), ..
+            }) => KeptList::Machine(label.clone()),
+            Some(_) => KeptList::Unkept,
+        }
+    }
+
+    /// Adds `root` to `list`, if this client keeps one.
     ///
     /// A list that cannot be written is reported in the status line rather
     /// than fatal: the project is open either way, and losing it on exit is
     /// not worth refusing to run over.
-    fn keep(&mut self, root: &Path) {
+    fn keep(&mut self, list: &KeptList, root: &Path) {
         let Some(dir) = self.kept.clone() else {
             return;
         };
 
-        if let Err(error) = dispatch_config::projects::remember(&dir, root) {
+        let written = match list {
+            KeptList::ThisMachine => dispatch_config::projects::remember(&dir, root),
+            KeptList::Machine(name) => dispatch_config::projects::remember_on(&dir, name, root),
+            KeptList::Unkept => return,
+        };
+
+        if let Err(error) = written {
             self.status = format!("could not keep {}: {error}", root.display());
         }
     }
 
-    /// Takes `root` off the kept list, if this client keeps one.
-    fn unkeep(&mut self, root: &Path) {
+    /// Takes `root` off `list`, if this client keeps one.
+    fn unkeep(&mut self, list: &KeptList, root: &Path) {
         let Some(dir) = self.kept.clone() else {
             return;
         };
 
-        if let Err(error) = dispatch_config::projects::forget(&dir, root) {
+        let written = match list {
+            KeptList::ThisMachine => dispatch_config::projects::forget(&dir, root),
+            KeptList::Machine(name) => dispatch_config::projects::forget_on(&dir, name, root),
+            KeptList::Unkept => return,
+        };
+
+        if let Err(error) = written {
             self.status = format!("could not drop {}: {error}", root.display());
         }
     }
@@ -877,7 +976,7 @@ impl App {
         // Collected first: applying a message borrows `self` mutably, and the
         // attachments are borrowed from it. One entry per machine, so this
         // grows with the fleet rather than with the session.
-        let snapshot: Vec<(DeviceId, u64, bool, String, Vec<ServerMessage>)> = attachments
+        let snapshot: Vec<Snapshot> = attachments
             .iter()
             .map(|attachment| {
                 (
@@ -885,6 +984,7 @@ impl App {
                     attachment.client.generation(),
                     attachment.client.is_connected(),
                     attachment.client.device(),
+                    attachment.client.last_error(),
                     attachment.client.poll(),
                 )
             })
@@ -892,8 +992,8 @@ impl App {
 
         let mut changed = false;
 
-        for (device, generation, connected, name, messages) in snapshot {
-            changed |= self.sync_attachment(device, generation, connected, &name);
+        for (device, generation, connected, name, error, messages) in snapshot {
+            changed |= self.sync_attachment(device, generation, connected, &name, error.as_deref());
 
             for message in messages {
                 changed |= self.apply_from(device, message);
@@ -916,22 +1016,28 @@ impl App {
         generation: u64,
         connected: bool,
         name: &str,
+        error: Option<&str>,
     ) -> bool {
         let was = self.state.device(device).is_some_and(|d| d.reachable);
         self.state.set_device_reachable(device, connected);
         let mut changed = was != connected;
 
-        // `client.device()` is read fresh every poll, but until now only
-        // `reachable` was written back to state -- a daemon that came back
-        // under a different name left the sidebar's row naming the old one
-        // forever, with nothing past the one "reattached to {name}" status
-        // line ever saying otherwise. Compared rather than written
-        // unconditionally, so an unreachable machine's last-known name is not
-        // stamped over itself, unchanged, on every poll.
-        if self.state.device(device).is_some_and(|d| d.name != name) {
+        // A registered machine keeps the name the user gave it. An unnamed
+        // one takes its daemon's name once there is one: until the first
+        // handshake `name` is empty, and an empty row names nothing.
+        let labelled = self
+            .attachments()
+            .iter()
+            .any(|a| a.device == device && a.label.is_some());
+        if !labelled
+            && !name.is_empty()
+            && self.state.device(device).is_some_and(|d| d.name != name)
+        {
             self.state.set_device_name(device, name);
             changed = true;
         }
+
+        changed |= self.report_outage(device, connected, error);
 
         let Mode::Attached(attachments) = &mut self.mode else {
             return changed;
@@ -944,11 +1050,13 @@ impl App {
             return changed;
         }
 
+        let first = attachment.generation == 0;
+        attachment.generation = generation;
+
         // Everything this machine was showing was described by a connection
         // that is gone. Its `Subscribe` replay describes its own fleet afresh,
         // so the rows are rebuilt from what it says rather than patched — and
         // only its rows: one daemon restarting says nothing about the others.
-        attachment.generation = generation;
         let roots = attachment.opened.clone();
         let client = &attachment.client;
 
@@ -984,8 +1092,52 @@ impl App {
         }
 
         self.forget_device(device);
-        self.status = format!("reattached to {name}");
 
+        let shown = self
+            .state
+            .device(device)
+            .map_or_else(|| name.to_string(), |d| d.name.clone());
+        self.status = if first {
+            format!("connected to {shown}")
+        } else {
+            format!("reattached to {shown}")
+        };
+
+        true
+    }
+
+    /// Says that a machine cannot be reached, and why — once per failure,
+    /// not once per retry.
+    ///
+    /// A machine asleep for an hour is retried a hundred times; the status
+    /// line should change when something does, not every thirty seconds.
+    fn report_outage(&mut self, device: DeviceId, connected: bool, error: Option<&str>) -> bool {
+        let Mode::Attached(attachments) = &mut self.mode else {
+            return false;
+        };
+        let Some(attachment) = attachments.iter_mut().find(|a| a.device == device) else {
+            return false;
+        };
+
+        if connected {
+            attachment.reported = None;
+            return false;
+        }
+
+        let Some(error) = error else {
+            return false;
+        };
+        if attachment.reported.as_deref() == Some(error) {
+            return false;
+        }
+        attachment.reported = Some(error.to_string());
+
+        let name = self
+            .state
+            .device(device)
+            .map(|d| d.name.clone())
+            .unwrap_or_default();
+        self.status = format!("{name} unreachable: {error}");
         true
     }
 
@@ -1245,13 +1397,34 @@ impl App {
                 true
             }
 
+            ServerMessage::ProjectRefused { root, reason } => {
+                // Forgotten everywhere it was remembered: kept, it would be
+                // asked for again on every start and every reconnection, and
+                // it never becomes a row the user could delete it from.
+                let list = self.kept_list(device);
+                self.unkeep(&list, &root);
+
+                if let Mode::Attached(attachments) = &mut self.mode
+                    && let Some(attachment) = attachments.iter_mut().find(|a| a.device == device)
+                {
+                    attachment.opened.retain(|kept| kept != &root);
+                }
+
+                let name = self
+                    .state
+                    .device(device)
+                    .map(|d| d.name.clone())
+                    .unwrap_or_default();
+                self.status = format!("cannot open {} on {name}: {reason}", root.display());
+                true
+            }
+
             // The handshake is done by the client, and nothing here pings.
             // `DelegateFinished` is for the delegate caller, not interface
             // clients. Unknown messages from newer peers are ignored.
             ServerMessage::Welcome { .. }
             | ServerMessage::Pong { .. }
             | ServerMessage::DelegateFinished { .. }
-            | ServerMessage::ProjectRefused { .. }
             | ServerMessage::Unknown => false,
         }
     }
@@ -1941,11 +2114,19 @@ impl App {
             return;
         }
 
-        self.unkeep(&root);
-        if let Mode::Attached(attachments) = &mut self.mode {
-            for attachment in attachments.iter_mut() {
-                attachment.opened.retain(|kept| kept != &root);
-            }
+        let device = self
+            .state
+            .projects()
+            .iter()
+            .find(|p| p.id == project)
+            .map(|p| p.device);
+        let list = device.map_or(KeptList::ThisMachine, |d| self.kept_list(d));
+        self.unkeep(&list, &root);
+
+        if let (Mode::Attached(attachments), Some(device)) = (&mut self.mode, device)
+            && let Some(attachment) = attachments.iter_mut().find(|a| a.device == device)
+        {
+            attachment.opened.retain(|kept| kept != &root);
         }
 
         if !self.attachments().is_empty() {
@@ -5179,5 +5360,160 @@ mod tests {
             "and the user is told: {:?}",
             app.status
         );
+    }
+
+    /// The one device a test attached, by its label.
+    fn device_named<'a>(app: &'a App, name: &str) -> &'a Device {
+        app.state
+            .devices()
+            .iter()
+            .find(|device| device.name == name)
+            .unwrap_or_else(|| panic!("no device named {name}: {:?}", app.state.devices()))
+    }
+
+    #[test]
+    fn a_machine_not_yet_answering_is_drawn_under_its_registry_name() {
+        let (client, _daemon, _sent) = Client::pending_for_test();
+        let mut app = App::new(HarnessRegistry::default());
+
+        app.attach_named(client, Some("tower".into()), Vec::new());
+        app.poll_daemon();
+
+        assert!(!device_named(&app, "tower").reachable);
+    }
+
+    #[test]
+    fn a_first_connection_says_connected_and_keeps_the_registry_name() {
+        let (client, _daemon, _sent) = Client::pending_for_test();
+        let handle = client.handle();
+        let mut app = App::new(HarnessRegistry::default());
+        app.attach_named(client, Some("tower".into()), Vec::new());
+        app.poll_daemon();
+
+        handle.connect_for_test("ubuntu-22");
+        app.poll_daemon();
+
+        assert_eq!(app.status, "connected to tower");
+        assert!(
+            device_named(&app, "tower").reachable,
+            "the row keeps the name the user gave it, not the daemon's hostname"
+        );
+    }
+
+    #[test]
+    fn kept_roots_go_out_when_the_machine_first_answers() {
+        let (client, _daemon, sent) = Client::pending_for_test();
+        let handle = client.handle();
+        let mut app = App::new(HarnessRegistry::default());
+        app.attach_named(
+            client,
+            Some("tower".into()),
+            vec![PathBuf::from("~/srv/app")],
+        );
+        app.poll_daemon();
+
+        assert!(
+            sent.try_iter().next().is_none(),
+            "nothing is asked of a machine that is not there"
+        );
+
+        handle.connect_for_test("tower");
+        app.poll_daemon();
+
+        let asked: Vec<ClientMessage> = sent.try_iter().collect();
+        assert!(
+            asked.contains(&ClientMessage::OpenProject {
+                root: PathBuf::from("~/srv/app")
+            }),
+            "the kept root is asked for once the machine answers: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn an_outage_is_reported_once_not_on_every_retry() {
+        let (client, _daemon, _sent) = Client::pending_for_test();
+        let handle = client.handle();
+        let mut app = App::new(HarnessRegistry::default());
+        app.attach_named(client, Some("tower".into()), Vec::new());
+
+        handle.fail_for_test("Permission denied (publickey)");
+        app.poll_daemon();
+        assert_eq!(
+            app.status,
+            "tower unreachable: Permission denied (publickey)"
+        );
+
+        app.set_status("something else");
+        handle.fail_for_test("Permission denied (publickey)");
+        app.poll_daemon();
+        assert_eq!(
+            app.status, "something else",
+            "the same failure again says nothing new"
+        );
+
+        handle.fail_for_test("Connection refused");
+        app.poll_daemon();
+        assert_eq!(app.status, "tower unreachable: Connection refused");
+    }
+
+    #[test]
+    fn an_unlabelled_machine_takes_its_daemons_name_once_it_answers() {
+        // `--daemon-command` has no registry name: the row shows the command
+        // until the daemon says what it is called.
+        let (client, _daemon, _sent) = Client::pending_for_test();
+        let handle = client.handle();
+        let mut app = App::new(HarnessRegistry::default());
+        app.attach_named(client, None, Vec::new());
+        app.poll_daemon();
+        assert!(!device_named(&app, "test-dial").reachable);
+
+        handle.connect_for_test("far");
+        app.poll_daemon();
+
+        assert!(device_named(&app, "far").reachable);
+    }
+
+    #[test]
+    fn a_refused_root_is_forgotten_everywhere() {
+        let dir = scratch("refused");
+        dispatch_config::projects::remember_on(&dir, "tower", Path::new("~/typo"))
+            .expect("written");
+
+        let (client, daemon, sent) = Client::pending_for_test();
+        let handle = client.handle();
+        let mut app = App::new(HarnessRegistry::default());
+        app.keep_projects_in(&dir);
+        app.attach_named(client, Some("tower".into()), vec![PathBuf::from("~/typo")]);
+
+        daemon
+            .send(ServerMessage::ProjectRefused {
+                root: PathBuf::from("~/typo"),
+                reason: "No such file or directory".into(),
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        assert!(
+            dispatch_config::projects::load_on(&dir, "tower")
+                .expect("it reads back")
+                .is_empty(),
+            "a root that can never open is not kept"
+        );
+        assert!(
+            app.status.contains("cannot open ~/typo on tower"),
+            "{}",
+            app.status
+        );
+
+        handle.connect_for_test("tower");
+        app.poll_daemon();
+        assert!(
+            !sent
+                .try_iter()
+                .any(|m| matches!(m, ClientMessage::OpenProject { .. })),
+            "and it is not asked for again on the next connection"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
