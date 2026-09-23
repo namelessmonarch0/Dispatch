@@ -1973,8 +1973,13 @@ impl App {
     fn handle_add_machine_key(&mut self, key: &KeyEvent) {
         let dir = self.kept.clone();
         let host = this_machine();
+        // The reason alone for a refused name: the overlay is narrow, and the
+        // registry's path in front of it would push the reason off its edge.
         let validate = |name: &str| match &dir {
-            Some(dir) => machines::check(dir, name, &host).map_err(|e| e.to_string()),
+            Some(dir) => machines::check(dir, name, &host).map_err(|e| match e {
+                dispatch_config::ConfigError::Machine { reason, .. } => reason,
+                other => other.to_string(),
+            }),
             None => Ok(()),
         };
 
@@ -6097,6 +6102,33 @@ mod tests {
             "attached, already connected"
         );
         assert!(app.status.contains("added tower"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_refused_name_says_why_without_the_files_path() {
+        // The overlay is narrow, and a path in front of the reason pushes the
+        // reason off its edge.
+        let dir = scratch("add-machine-taken");
+        dispatch_config::machines::save(&dir, &[Machine::new("tower", "tower")]).expect("written");
+        let (mut app, _project, _daemon, _sent) = attached_app();
+        app.keep_projects_in(&dir);
+
+        add_machine(&mut app);
+        type_text(&mut app, "tower");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+
+        let Some(Overlay::AddMachine(add)) = &app.overlay else {
+            panic!("the overlay stays open");
+        };
+        assert_eq!(
+            add.prompt().note(),
+            Some(&dispatch_tui::Note::Error(
+                "tower is already registered".into()
+            ))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

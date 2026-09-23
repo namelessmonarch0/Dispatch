@@ -90,7 +90,41 @@ fn a_long_input_shows_its_end() {
 }
 
 #[test]
+fn a_note_wider_than_the_hint_is_shown_whole() {
+    // The box is sized to its widest line. A reason left out of that is cut
+    // at the box's edge, and the part cut is usually the part that says why.
+    let reason = "ssh: connect to host tower port 22: Connection refused, twice";
+    let mut prompt = Prompt::new("Add a machine", "an ssh target").with_input("tower");
+    prompt.set_note(Some(Note::Error(reason.into())));
+
+    let screen = render(&prompt, 100, 30);
+    assert!(screen.contains(reason), "{screen}");
+}
+
+#[test]
+fn a_note_too_wide_for_the_area_wraps_rather_than_being_cut() {
+    let reason = "ssh: connect to host tower.example.org port 22: Connection refused";
+    let mut prompt = Prompt::new("t", "h").with_input("tower");
+    prompt.set_note(Some(Note::Error(reason.into())));
+
+    let screen = render(&prompt, 50, 20);
+    for word in reason.split(' ') {
+        assert!(screen.contains(word), "{word:?} is missing from\n{screen}");
+    }
+}
+
+#[test]
 fn a_tiny_area_draws_nothing_rather_than_panicking() {
     let prompt = Prompt::new("t", "h").with_input("abc");
     let _ = render(&prompt, 3, 2);
+}
+
+#[test]
+fn a_note_wraps_between_words_and_never_inside_a_character() {
+    assert_eq!(wrap("short", 10), ("short", None));
+    assert_eq!(wrap("one two three", 7), ("one two", Some("three")));
+    assert_eq!(wrap("one two three", 8), ("one two", Some("three")));
+    assert_eq!(wrap("abcdefgh", 3), ("abc", Some("defgh")), "one long word");
+    // `…` is three bytes; a cut at it must land on its edge.
+    assert_eq!(wrap("ab…cd", 2), ("ab", Some("…cd")));
 }

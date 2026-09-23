@@ -110,10 +110,18 @@ impl Widget for &Prompt {
             return;
         }
 
+        let note = self.note.as_ref().map(|note| match note {
+            Note::Busy(text) => (text.as_str(), Color::Yellow),
+            Note::Error(text) => (text.as_str(), Color::Red),
+        });
+
+        // The note counts: it is usually the reason something was refused,
+        // and a reason cut at the box's edge loses the part that says why.
         let widest = [
             self.title.chars().count(),
             self.hint.chars().count(),
             self.input.chars().count(),
+            note.map_or(0, |(text, _)| text.chars().count()),
         ]
         .into_iter()
         .max()
@@ -122,8 +130,21 @@ impl Widget for &Prompt {
             .unwrap_or(u16::MAX)
             .clamp(MIN_WIDTH.min(area.width), area.width);
 
-        // Border, input, hint, note.
-        let rect = centred(area, width, 5);
+        // A note still wider than the box, because the area is, takes a
+        // second line rather than being cut.
+        let lines = note.map(|(text, colour)| (wrap(text, usize::from(width - 2)), colour));
+        let height = if lines
+            .as_ref()
+            .is_some_and(|(wrapped, _)| wrapped.1.is_some())
+        {
+            6
+        } else {
+            5
+        };
+
+        // Border, input, hint, note — and the note's second line when it
+        // needs one, for as many rows as the area has.
+        let rect = centred(area, width, height);
 
         // Floats over the grid, so whatever it covers is erased rather than
         // left showing through.
@@ -172,20 +193,43 @@ impl Widget for &Prompt {
             Style::default().fg(Color::DarkGray),
         );
 
-        if let Some(note) = &self.note {
-            let (text, colour) = match note {
-                Note::Busy(text) => (text, Color::Yellow),
-                Note::Error(text) => (text, Color::Red),
-            };
-            write(
-                buf,
-                inner,
-                inner.x,
-                inner.y + 2,
-                text,
-                Style::default().fg(colour),
-            );
+        if let Some(((first, second), colour)) = lines {
+            let style = Style::default().fg(colour);
+            write(buf, inner, inner.x, inner.y + 2, first, style);
+            if let Some(second) = second {
+                write(buf, inner, inner.x, inner.y + 3, second, style);
+            }
         }
+    }
+}
+
+/// Splits `text` into what fits in `width` columns and the rest, if any.
+///
+/// At the last space that fits, so a word is not broken across the two
+/// lines; mid-word only when a single word is wider than the line. The rest
+/// is not split again: two lines are as much as a one-line prompt spares, and
+/// `write` cuts whatever is left at the box's edge.
+fn wrap(text: &str, width: usize) -> (&str, Option<&str>) {
+    if text.chars().count() <= width {
+        return (text, None);
+    }
+
+    // The first character that does not fit, and where it starts. There is
+    // one: the text is longer than the line.
+    let Some((cut, next)) = text.char_indices().nth(width) else {
+        return (text, None);
+    };
+
+    // A space right at the edge fits the whole of the word before it.
+    let space = if next == ' ' {
+        Some(cut)
+    } else {
+        text[..cut].rfind(' ')
+    };
+
+    match space {
+        Some(space) if space > 0 => (&text[..space], Some(&text[space + 1..])),
+        _ => (&text[..cut], Some(&text[cut..])),
     }
 }
 
