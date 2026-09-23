@@ -355,10 +355,22 @@ Three changes to `open_project_for`, with a new helper,
   },
   ```
 
-  A client that receives it removes that root from its kept list and from the
-  attachment's `opened`, and puts the reason on the status line. Without this,
-  a mistyped remote path would be kept and re-sent on every start, and it would
-  never become a project row the user could delete it from.
+  A client that receives it removes that root from the attachment's `opened`,
+  so the connection stops asking, and puts the reason on the status line.
+  Without this, a mistyped remote path would be kept and re-sent on every
+  start, and it would never become a project row the user could delete it
+  from.
+
+  **Only a root asked for this session is forgotten.** Each attachment holds
+  the roots the user asked for in this session (`add_project`,
+  `add_project_on`) that the daemon has not yet answered with
+  `ProjectResolved`. A refused root in that set is also removed from the kept
+  list. A root kept from an earlier run — handed to `attach_named` at startup,
+  or re-sent on a reconnect — opened once, and a refusal now is as likely a
+  mount not up yet or a directory briefly renamed as one that is gone. It
+  stays in `projects.toml`, and the status line says so: `cannot open <root>
+  on <name>: <reason> (still kept; delete it from projects.toml if it is
+  gone)`.
 
   A `ServerMessage` variant rather than a `ProtocolError` one. `ProtocolError`
   is externally tagged and has no `Unknown`, so a variant added there fails an
@@ -397,6 +409,7 @@ Three changes to `open_project_for`, with a new helper,
 | ssh authentication or host-key failure | `BatchMode` makes `ssh` fail fast. The status line shows the first stderr line, once per outage. |
 | `dispatchd` is not installed on the remote | The same path, reported as `dispatchd: command not found` or similar. `add` refuses to save the machine unless `--no-check` is given. |
 | A typed remote path is wrong | The daemon answers `ProjectRefused`; the client removes the root from its kept list and `opened` and says why. |
+| A kept root cannot be opened at startup or on a reconnect | The daemon answers `ProjectRefused`; the client stops asking for it this session but keeps it in `projects.toml`, and says so. |
 | `^a m` pressed while standalone | Refused with a status line. Nothing is torn down. |
 | Enter on an empty prompt | Nothing happens. No `OpenProject` is sent and no machine is saved. |
 | `machines.toml` does not parse | Startup fails, naming the file. |
@@ -437,7 +450,9 @@ Three changes to `open_project_for`, with a new helper,
 - **`dispatch` app**, with `Client::for_test`
   - A row added by `attach_named` shows the label and is unreachable.
   - A first connect says `connected to`, not `reattached to`.
-  - `ProjectRefused` removes the root from the kept list and from `opened`.
+  - `ProjectRefused` for a root typed this session removes it from the kept
+    list and from `opened`; for a root kept from an earlier run it removes it
+    from `opened` only.
   - `ProjectResolved` rewrites a typed root to the resolved one, so dropping
     that project's row forgets it and a reconnect does not re-send it.
   - `^a m` while standalone is refused and leaves local panes running.

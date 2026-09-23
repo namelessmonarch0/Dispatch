@@ -293,6 +293,15 @@ struct Attachment {
     generation: u64,
     /// Roots asked of this daemon, so its own reconnect can ask again.
     opened: Vec<PathBuf>,
+    /// Roots the user asked for this session that the daemon has not yet
+    /// answered for.
+    ///
+    /// A refusal of one of these is about what was just typed, so it is
+    /// forgotten. A root kept from an earlier run is not in here: it opened
+    /// then, and a refusal now is as likely a mount not up yet as a directory
+    /// that is gone — forgetting it would lose it for good over a moment's
+    /// outage.
+    unconfirmed: HashSet<PathBuf>,
     /// The registry name, which the row keeps whatever the daemon calls
     /// itself: it exists before the first connection, and it is unique where
     /// hostnames are not.
@@ -543,6 +552,7 @@ impl App {
             client,
             generation,
             opened,
+            unconfirmed: HashSet::new(),
             label,
             remote,
             reported: None,
@@ -798,6 +808,7 @@ impl App {
             attachment
                 .client
                 .send(ClientMessage::OpenProject { root: root.clone() });
+            attachment.unconfirmed.insert(root.clone());
             // Remembered so a reconnection asks again: a daemon that was
             // restarted is serving whatever its own command line said, which
             // need not include what this client was opened with.
@@ -1432,16 +1443,13 @@ impl App {
             }
 
             ServerMessage::ProjectRefused { root, reason } => {
-                // Forgotten everywhere it was remembered: kept, it would be
-                // asked for again on every start and every reconnection, and
-                // it never becomes a row the user could delete it from.
-                let list = self.kept_list(device);
-                self.unkeep(&list, &root);
-
+                // Out of `opened` either way, so this connection stops asking.
+                let mut typed_now = false;
                 if let Mode::Attached(attachments) = &mut self.mode
                     && let Some(attachment) = attachments.iter_mut().find(|a| a.device == device)
                 {
                     attachment.opened.retain(|kept| kept != &root);
+                    typed_now = attachment.unconfirmed.remove(&root);
                 }
 
                 let name = self
@@ -1449,7 +1457,23 @@ impl App {
                     .device(device)
                     .map(|d| d.name.clone())
                     .unwrap_or_default();
-                self.status = format!("cannot open {} on {name}: {reason}", root.display());
+
+                // Typed this session, it is forgotten everywhere it was
+                // remembered: kept, it would be asked for again on every start
+                // and never become a row the user could delete it from. Kept
+                // from an earlier run, it stays kept — see `unconfirmed` — and
+                // the user is told where to delete it if it really is gone.
+                if typed_now {
+                    let list = self.kept_list(device);
+                    self.unkeep(&list, &root);
+                    self.status = format!("cannot open {} on {name}: {reason}", root.display());
+                } else {
+                    self.status = format!(
+                        "cannot open {} on {name}: {reason} \
+                         (still kept; delete it from projects.toml if it is gone)",
+                        root.display()
+                    );
+                }
                 true
             }
 
@@ -1465,6 +1489,8 @@ impl App {
                 let Some(attachment) = attachments.iter_mut().find(|a| a.device == device) else {
                     return false;
                 };
+                // It opened, so it is kept whatever a later refusal says.
+                attachment.unconfirmed.remove(&root);
                 let Some(at) = attachment.opened.iter().position(|kept| *kept == root) else {
                     return false;
                 };
@@ -2044,6 +2070,7 @@ impl App {
         attachment
             .client
             .send(ClientMessage::OpenProject { root: root.clone() });
+        attachment.unconfirmed.insert(root.clone());
         if !attachment.opened.contains(&root) {
             attachment.opened.push(root);
         }
@@ -5768,15 +5795,24 @@ mod tests {
 
     #[test]
     fn a_refused_root_is_forgotten_everywhere() {
+        // Typed this session, so a refusal is about what was typed: kept, it
+        // would be asked for on every start and never become a row the user
+        // could delete it from.
         let dir = scratch("refused");
-        dispatch_config::projects::remember_on(&dir, "tower", Path::new("~/typo"))
-            .expect("written");
-
         let (client, daemon, sent) = Client::pending_for_test();
         let handle = client.handle();
         let mut app = App::new(HarnessRegistry::default());
         app.keep_projects_in(&dir);
-        app.attach_named(client, Some("tower".into()), vec![PathBuf::from("~/typo")]);
+        app.attach_named(client, Some("tower".into()), Vec::new());
+
+        open_project(&mut app);
+        type_text(&mut app, "~/typo");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            dispatch_config::projects::load_on(&dir, "tower").expect("it reads back"),
+            [PathBuf::from("~/typo")],
+            "kept until the machine says otherwise"
+        );
 
         daemon
             .send(ServerMessage::ProjectRefused {
@@ -5792,12 +5828,12 @@ mod tests {
                 .is_empty(),
             "a root that can never open is not kept"
         );
-        assert!(
-            app.status.contains("cannot open ~/typo on tower"),
-            "{}",
-            app.status
+        assert_eq!(
+            app.status,
+            "cannot open ~/typo on tower: No such file or directory"
         );
 
+        let _ = sent.try_iter().count();
         handle.connect_for_test("tower");
         app.poll_daemon();
         assert!(
@@ -5805,6 +5841,59 @@ mod tests {
                 .try_iter()
                 .any(|m| matches!(m, ClientMessage::OpenProject { .. })),
             "and it is not asked for again on the next connection"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_kept_root_refused_on_the_way_back_is_still_kept() {
+        // Kept from an earlier run, it opened then. A refusal now is as likely
+        // a mount not up yet as a directory that is gone, and only the user
+        // can tell which.
+        let dir = scratch("refused-kept");
+        dispatch_config::projects::remember_on(&dir, "tower", Path::new("/mnt/data/app"))
+            .expect("written");
+
+        let (client, daemon, sent) = Client::pending_for_test();
+        let handle = client.handle();
+        let mut app = App::new(HarnessRegistry::default());
+        app.keep_projects_in(&dir);
+        app.attach_named(
+            client,
+            Some("tower".into()),
+            vec![PathBuf::from("/mnt/data/app")],
+        );
+        handle.connect_for_test("tower");
+        app.poll_daemon();
+
+        daemon
+            .send(ServerMessage::ProjectRefused {
+                root: PathBuf::from("/mnt/data/app"),
+                reason: "No such file or directory".into(),
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        assert_eq!(
+            dispatch_config::projects::load_on(&dir, "tower").expect("it reads back"),
+            [PathBuf::from("/mnt/data/app")],
+            "still kept for the next start"
+        );
+        assert_eq!(
+            app.status,
+            "cannot open /mnt/data/app on tower: No such file or directory \
+             (still kept; delete it from projects.toml if it is gone)"
+        );
+
+        let _ = sent.try_iter().count();
+        handle.connect_for_test("tower");
+        app.poll_daemon();
+        assert!(
+            !sent
+                .try_iter()
+                .any(|m| matches!(m, ClientMessage::OpenProject { .. })),
+            "though this session stops asking for it"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
