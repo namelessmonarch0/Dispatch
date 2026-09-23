@@ -441,7 +441,12 @@ impl Handle {
     }
 }
 
-/// An attached daemon connection.
+/// A connection to one daemon: attached, or — made by [`Client::dial`] — still
+/// dialling one that has not answered yet.
+///
+/// One type for both because a caller treats them alike: a client that has
+/// never connected is one whose connection is down, and its first connection
+/// is a generation change like any reconnection.
 pub struct Client {
     handle: Handle,
     inbox: Receiver<ServerMessage>,
@@ -607,11 +612,14 @@ impl Client {
             .clone()
     }
 
-    /// Which connection this is, counting from one.
+    /// Which connection this is, counting from one; 0 means it has never
+    /// connected.
     ///
     /// A caller that has built state from the daemon's messages compares this
     /// against what it built: a higher number means a different connection, and
-    /// everything it was told belongs to a socket that no longer exists.
+    /// everything it was told belongs to a socket that no longer exists. A
+    /// client from [`Client::dial`] starts at 0, so its first connection is
+    /// the same kind of change as any later one.
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.wire.generation.load(Ordering::Relaxed)

@@ -46,11 +46,18 @@ widget this slice added for a question a list cannot answer.
 Underneath, `Client::dial` now retries a `Command` dial the way a socket
 dial already did — starting at 1s and doubling to a 30s ceiling — so a
 machine asleep at startup joins once it wakes rather than needing a
-restart; this closes F1's known gap. A machine that refuses to open a
-project (a bad path, one already open under another name) says so with
+restart; this closes F1's known gap. A machine that cannot open a project
+(a bad path, not a directory, permission denied) says so with
 `ServerMessage::ProjectRefused` rather than leaving the client to guess
-from silence. No binary copying: a machine either has `dispatchd` on its
-`PATH` or cannot be added.
+from silence; a root already open is not refused, the daemon hands back the
+existing project. A machine that does open one tells the asking client, with
+`ServerMessage::ProjectResolved`, what its root resolved to — `~/code/app`
+becomes `/home/me/code/app` — so the client can rewrite what it keeps and
+dropping the row forgets it. A refusal forgets the root only when the user
+asked for it this session; a root kept from an earlier run stays kept, since
+a mount not up yet is refused the same way as a directory that is gone. No
+binary copying: a machine either has `dispatchd` on its `PATH` or cannot be
+added.
 
 ## Parked, and not in any issue tracker
 
@@ -83,6 +90,13 @@ Ordered by how much they would hurt on a real fleet.
 7. **Removing or renaming a machine in the TUI.** The CLI can remove one
    (`dispatch machine remove`); neither it nor the overlay can rename one —
    the overlay only adds.
+8. **`Wire::lost` can run twice for one connection**: liveness declares it
+   dead, then the killed reader errors. A late second call can take the next
+   connection's child and clear its writer. It predates F2b; fix it with a
+   generation-tagged `lost(gen)`.
+9. **A remote `dispatchd` older than the client** answers `~/x` with a plain
+   `Error` and no `~` expansion. The root is then kept and re-sent without
+   ever becoming a row. Keep remote `dispatchd` at the client's version.
 
 ## Decisions taken on the user's behalf during execution
 
@@ -101,9 +115,9 @@ Recorded because they were judgement calls, not requirements:
   so a mouse click cannot desync it.
 - `dispatchd --device` defaults to the real hostname via `dispatch_os::host`,
   not `$HOSTNAME` — which bash sets but does not export.
-- `ProjectRefused` is a `ServerMessage`, not a `ProtocolError` variant:
-  `ProtocolError` has no `Unknown`, so a new variant would fail an older
-  peer's frame.
+- `ProjectRefused` and `ProjectResolved` are `ServerMessage`s, not
+  `ProtocolError` variants: `ProtocolError` has no `Unknown`, so a new
+  variant would fail an older peer's frame.
 - `^a m` is refused while standalone rather than attaching mid-session,
   because attaching tears the standalone panes down.
 
