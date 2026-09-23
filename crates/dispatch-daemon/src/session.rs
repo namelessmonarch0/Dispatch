@@ -99,6 +99,12 @@ struct Client {
     /// prompts are broadcast to interface clients only; a delegate caller
     /// wants the fate of its own request and nothing else.
     role: Role,
+    /// Whether its `Hello` has been accepted.
+    ///
+    /// Nothing but a `Hello` is acted on before then: a peer that has not
+    /// said which protocol it speaks may mean something else by every byte
+    /// that follows, and one that was refused must not get to act anyway.
+    ready: bool,
 }
 
 /// The daemon.
@@ -272,6 +278,7 @@ impl Daemon {
                         outbox,
                         subscribed: false,
                         role: Role::default(),
+                        ready: false,
                     },
                 );
                 tracing::info!(client = id, "client attached");
@@ -286,6 +293,27 @@ impl Daemon {
     }
 
     fn handle_request(&mut self, id: ClientId, message: ClientMessage) {
+        let Some(client) = self.clients.get(&id) else {
+            // Refused, hung up on, or detached. Its reader may still be
+            // forwarding frames it had already read -- a peer can send a
+            // request right behind a Hello it is about to be refused for --
+            // and none of them is anyone's to act on.
+            tracing::debug!(client = id, "ignoring a request from a client that is gone");
+            return;
+        };
+
+        if !client.ready && !matches!(message, ClientMessage::Hello { .. }) {
+            tracing::info!(client = id, "a client spoke before its Hello");
+            self.send(
+                id,
+                ServerMessage::Error {
+                    error: ProtocolError::Other("the connection must begin with a Hello".into()),
+                },
+            );
+            self.hang_up(id);
+            return;
+        }
+
         match message {
             ClientMessage::Hello {
                 version,
@@ -304,12 +332,13 @@ impl Daemon {
                             },
                         },
                     );
-                    self.clients.remove(&id);
+                    self.hang_up(id);
                     return;
                 }
 
                 if let Some(existing) = self.clients.get_mut(&id) {
                     existing.role = role;
+                    existing.ready = true;
                 }
 
                 tracing::info!(client = id, %version, name = %client, "handshake accepted");
@@ -1228,6 +1257,19 @@ impl Daemon {
         }
 
         self.expire_requests();
+    }
+
+    /// Forgets a client, and whatever it was waiting on.
+    ///
+    /// What the daemon does to a client it will not serve any longer: a
+    /// refused handshake, a protocol violation. Its outbox goes with it, so
+    /// the writer thread sends what was already queued -- the refusal among
+    /// it -- and stops.
+    fn hang_up(&mut self, id: ClientId) {
+        if self.clients.remove(&id).is_some() {
+            tracing::info!(client = id, "hung up on a client");
+        }
+        self.abandon(id);
     }
 
     /// Sends to one client.

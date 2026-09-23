@@ -2157,3 +2157,81 @@ fn a_blanket_approved_pane_at_its_cap_is_refused_rather_than_started() {
         "the second caller is refused"
     );
 }
+
+fn spawn_request(project: ProjectId) -> ClientMessage {
+    ClientMessage::SpawnPane {
+        project,
+        harness: "shell".into(),
+        size: (80, 24),
+    }
+}
+
+#[test]
+fn nothing_is_acted_on_before_a_hello() {
+    let (mut daemon, project, _dir) = daemon("before-hello");
+    let inbox = daemon.attach_for_test(1);
+
+    daemon.request_for_test(1, spawn_request(project));
+
+    assert_eq!(
+        daemon.pane_count(),
+        0,
+        "a request before Hello starts nothing"
+    );
+    assert!(
+        drain(&inbox)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::Error { .. })),
+        "and says why"
+    );
+
+    // The connection is over: a Hello now is too late to rescue it.
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, spawn_request(project));
+    assert_eq!(daemon.pane_count(), 0);
+    assert!(drain(&inbox).is_empty(), "nothing more reaches it");
+}
+
+#[test]
+fn a_refused_client_cannot_act_afterwards() {
+    // The audit's probe: an incompatible Hello is answered with an error, and
+    // then a SpawnPane from the same client started a pane anyway.
+    let (mut daemon, project, _dir) = daemon("refused-acts");
+    let refused = daemon.attach_for_test(2);
+    daemon.request_for_test(
+        2,
+        ClientMessage::Hello {
+            version: dispatch_proto::Version {
+                major: 99,
+                minor: 0,
+            },
+            client: "incompatible".into(),
+            role: dispatch_proto::Role::Interface,
+        },
+    );
+    assert!(matches!(
+        refused.try_recv(),
+        Ok(ServerMessage::Error {
+            error: ProtocolError::IncompatibleVersion { .. }
+        })
+    ));
+
+    daemon.request_for_test(2, spawn_request(project));
+
+    assert_eq!(daemon.pane_count(), 0, "a refused client spawned a pane");
+}
+
+#[test]
+fn a_detached_client_cannot_act() {
+    let (mut daemon, project, _dir) = daemon("detached-acts");
+    let _inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.detach_for_test(1);
+
+    // A request already read off the socket arrives after the reader said
+    // the client left: events from one client are ordered, but a request
+    // queued by a thread that is gone is still a request from nobody.
+    daemon.request_for_test(1, spawn_request(project));
+
+    assert_eq!(daemon.pane_count(), 0);
+}

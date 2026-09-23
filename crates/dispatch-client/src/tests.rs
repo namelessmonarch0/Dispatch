@@ -1395,3 +1395,35 @@ fn a_replaced_connection_cannot_speak_for_its_successor() {
     drop(client);
     drop(server.join());
 }
+
+#[test]
+fn a_daemon_speaking_another_major_version_is_refused_by_the_client() {
+    // The daemon checks the client's version; until now the client never
+    // checked the daemon's, and would read every frame of a protocol it
+    // does not speak.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _endpoint = Endpoint::new("future-daemon");
+
+    let _server = serve_one(
+        ServerMessage::Welcome {
+            version: Version {
+                major: 99,
+                minor: 0,
+            },
+            device: "future".into(),
+        },
+        |_| {},
+        After::Silence,
+    );
+
+    let error = Client::attach_with("test", Liveness::default())
+        .expect_err("a daemon from another major version is refused");
+
+    assert!(
+        matches!(
+            error,
+            ClientError::Refused(ProtocolError::IncompatibleVersion { .. })
+        ),
+        "expected an incompatible version, got {error:?}"
+    );
+}

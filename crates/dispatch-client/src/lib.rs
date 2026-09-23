@@ -800,7 +800,17 @@ fn connect(
     // fail attaching rather than arrive later as a message the caller has to
     // know to look for.
     let device = match Frame::read::<_, ServerMessage>(&mut reader) {
-        Ok(ServerMessage::Welcome { device, .. }) => device,
+        Ok(ServerMessage::Welcome { version, device }) => {
+            // Checked here as the daemon checks ours: a major version apart,
+            // every frame after this one could mean something else.
+            if !dispatch_proto::VERSION.is_compatible_with(version) {
+                return Err(ClientError::Refused(ProtocolError::IncompatibleVersion {
+                    peer: version,
+                    ours: dispatch_proto::VERSION,
+                }));
+            }
+            device
+        }
         Ok(ServerMessage::Error { error }) => {
             return Err(with_hint(ClientError::Refused(error), hint.as_ref()));
         }
