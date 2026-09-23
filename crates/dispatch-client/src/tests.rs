@@ -1100,6 +1100,50 @@ fn a_command_that_keeps_failing_is_not_respawned_every_moment() {
 
 #[test]
 #[cfg(unix)]
+fn a_client_dropped_while_backing_off_dials_no_more() {
+    // The backoff sleep is where a dialling client spends nearly all its
+    // time. Dropped there, it must not wake up and run ssh one last time for
+    // nobody.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("drop-backoff");
+    let counter = dir.join("runs");
+    let runs = || {
+        std::fs::read_to_string(&counter)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+
+    let client = Client::dial(
+        Role::Interface,
+        "test",
+        Liveness::default(),
+        Dial::Command {
+            program: OsString::from("sh"),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from(format!("echo ran >> {}; exit 1", counter.display())),
+            ],
+        },
+    );
+
+    assert!(
+        wait_until(PATIENCE, || client.last_error().is_some()),
+        "the first dial fails at once"
+    );
+    // Well into the first second-long backoff.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(runs(), 1);
+    drop(client);
+
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(runs(), 1, "no dial after the client was dropped");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(unix)]
 fn a_command_failure_is_remembered_in_its_own_words() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
 

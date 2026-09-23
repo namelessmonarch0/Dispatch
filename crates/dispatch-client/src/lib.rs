@@ -902,6 +902,13 @@ fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
             if !std::mem::take(&mut dial_now) {
                 std::thread::sleep(backoff);
                 backoff = next_backoff(backoff, &wire.dial);
+
+                // Checked again after the sleep, not only at the top: a
+                // client dropped during a thirty-second backoff would
+                // otherwise run ssh once more for nobody.
+                if wire.closed.load(Ordering::Relaxed) {
+                    return;
+                }
             }
 
             let patience = patience_for(&wire.dial);
