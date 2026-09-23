@@ -3,6 +3,7 @@
 pub mod config;
 pub mod defaults;
 pub mod harness;
+pub mod machines;
 pub mod projects;
 
 /// Shared by this crate's test modules, so there is one temporary-directory
@@ -55,6 +56,15 @@ pub enum ConfigError {
         declared: String,
         /// The file stem.
         expected: String,
+    },
+
+    /// A machine could not be registered under the name it was given.
+    #[error("{path}: {reason}")]
+    Machine {
+        /// The registry file.
+        path: PathBuf,
+        /// What is wrong with the name.
+        reason: String,
     },
 }
 
