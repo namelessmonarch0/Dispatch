@@ -341,11 +341,36 @@ impl Wire {
     /// The pid is taken *before* the connection is marked down, because down
     /// is what lets the supervisor dial again: taking second could hand this
     /// call the fresh connection's child and kill that instead.
-    fn lost(&self) {
+    ///
+    /// `generation` names the connection the caller is reporting on, and a
+    /// connection that has already been replaced is left alone. A reader
+    /// parked on a peer that liveness gave up on wakes only when that peer
+    /// finally closes -- by which time the supervisor may have dialled a
+    /// replacement, and acting on "whatever is current" would clear the
+    /// replacement's writer and kill its child. Compared under the writer
+    /// lock, which the supervisor holds while it installs a connection, so
+    /// the check cannot fall between a replacement's child being recorded
+    /// and its generation being counted.
+    fn lost(&self, generation: u64) {
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        if self.generation.load(Ordering::Relaxed) != generation {
+            return;
+        }
+
         let child = self.child.take();
-        *self.writer.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *writer = None;
         self.connected.store(false, Ordering::Relaxed);
+        drop(writer);
         reap_dialled(child);
+    }
+
+    /// Records that the current connection has broken.
+    ///
+    /// For callers that are about the connection as it stands rather than
+    /// one they were handed: the supervisor, which is the only thing that
+    /// replaces it, and a queue whose writer thread has gone.
+    fn lost_current(&self) {
+        self.lost(self.generation.load(Ordering::Relaxed));
     }
 }
 
@@ -374,7 +399,7 @@ impl Handle {
     /// add noise.
     pub fn send(&self, message: ClientMessage) -> bool {
         if self.outbox.send(message).is_err() {
-            self.wire.lost();
+            self.wire.lost_current();
             return false;
         }
 
@@ -578,7 +603,8 @@ impl Client {
         let (incoming, inbox) = channel::<ServerMessage>();
 
         if let Some(reader) = reader {
-            read_from(reader, &incoming, &wire);
+            let generation = wire.generation.load(Ordering::Relaxed);
+            read_from(reader, generation, &incoming, &wire);
         }
         write_to(outgoing, &wire);
         supervise(incoming, &wire);
@@ -834,8 +860,13 @@ fn with_hint(error: ClientError, hint: Option<&StderrHint>) -> ClientError {
 }
 
 /// Moves messages from the socket into the queue, until the socket ends.
+///
+/// `generation` is the connection this reader belongs to, so that its
+/// ending is reported against that connection and not whichever one has
+/// replaced it by then.
 fn read_from(
     mut reader: impl Read + Send + 'static,
+    generation: u64,
     incoming: &Sender<ServerMessage>,
     wire: &Arc<Wire>,
 ) {
@@ -852,8 +883,8 @@ fn read_from(
                     }
                 }
                 Err(error) => {
-                    tracing::info!(%error, "the daemon connection ended");
-                    wire.lost();
+                    tracing::info!(%error, generation, "the daemon connection ended");
+                    wire.lost(generation);
                     return;
                 }
             }
@@ -920,19 +951,29 @@ fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
                     // only at the top of the loop, a dial that finished after
                     // the client was dropped left a process nobody would
                     // ever take.
+                    //
+                    // All of it under the writer lock, which `Wire::lost`
+                    // takes to compare generations: a stale reader's report
+                    // then sees either the old generation with the old
+                    // child already gone, or the new generation and leaves
+                    // it alone -- never the new child under the old number.
+                    let mut writer = wire.writer.lock().unwrap_or_else(|e| e.into_inner());
                     wire.child.record(connected.child);
                     if wire.closed.load(Ordering::Relaxed) {
+                        drop(writer);
                         reap_dialled(wire.child.take());
                         return;
                     }
 
                     *wire.device.lock().unwrap_or_else(|e| e.into_inner()) = connected.device;
-                    *wire.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(connected.writer);
+                    *writer = Some(connected.writer);
+                    let generation = wire.generation.fetch_add(1, Ordering::Relaxed) + 1;
+                    drop(writer);
+
                     *wire.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                    wire.generation.fetch_add(1, Ordering::Relaxed);
                     wire.heard();
                     wire.connected.store(true, Ordering::Relaxed);
-                    read_from(connected.reader, &incoming, &wire);
+                    read_from(connected.reader, generation, &incoming, &wire);
 
                     // Sent directly rather than through the queue: the queue's
                     // writer may be mid-message, and a subscribe that arrives
@@ -964,7 +1005,7 @@ fn check_liveness(wire: &Wire) {
 
     if quiet >= wire.liveness.silence {
         tracing::info!(?quiet, "the daemon stopped answering");
-        wire.lost();
+        wire.lost_current();
         return;
     }
 

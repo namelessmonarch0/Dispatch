@@ -1215,3 +1215,83 @@ fn a_client_dropped_mid_dial_leaves_nothing_behind() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_connection_given_up_on_cannot_take_its_successor_down() {
+    // Liveness gives up on a silent peer, but the reader parked on that
+    // peer's socket is still there: nothing wakes it until the peer closes.
+    // When it finally does, that stale reader reports its connection lost --
+    // and `lost` acted on whichever connection was current, so it tore down
+    // the one the supervisor had already dialled to replace it.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _endpoint = Endpoint::new("stale-reader");
+
+    let listener = Listener::bind().expect("binding succeeds");
+    let endpoint = dispatch_os::ipc::endpoint().expect("the endpoint resolves");
+    let (release, released) = std::sync::mpsc::channel::<()>();
+
+    let server = std::thread::spawn(move || {
+        // The first connection is welcomed and then says nothing, held open
+        // until the test lets go of it.
+        let (mut first_reader, mut first_writer) =
+            listener.accept().expect("the first dial arrives").split();
+        let _ = Frame::read::<_, ClientMessage>(&mut first_reader);
+        Frame::write(&mut first_writer, &welcome()).expect("the welcome goes out");
+
+        // The second is the replacement, and answers like a live daemon.
+        let (mut second_reader, mut second_writer) =
+            listener.accept().expect("the redial arrives").split();
+        let _ = Frame::read::<_, ClientMessage>(&mut second_reader);
+        Frame::write(&mut second_writer, &welcome()).expect("the welcome goes out");
+        std::thread::spawn(move || {
+            while let Ok(message) = Frame::read::<_, ClientMessage>(&mut second_reader) {
+                if let ClientMessage::Ping { token } = message
+                    && Frame::write(&mut second_writer, &ServerMessage::Pong { token }).is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        let _ = released.recv();
+        drop(first_reader);
+        drop(first_writer);
+        // Kept alive so the endpoint stays bound for the rest of the test.
+        listener
+    });
+
+    let client = Client::attach_at(
+        Role::Interface,
+        "test",
+        Liveness {
+            interval: Duration::from_millis(50),
+            silence: Duration::from_millis(300),
+        },
+        endpoint,
+    )
+    .expect("the first connection is welcomed");
+
+    assert!(
+        wait_until(PATIENCE, || client.generation() == 2
+            && client.is_connected()),
+        "the silent connection is given up on and replaced"
+    );
+
+    // The old peer finally closes, and the reader parked on it wakes up.
+    release.send(()).expect("the server is waiting");
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        assert!(
+            client.is_connected() && client.generation() == 2,
+            "the stale reader took down the connection that replaced it \
+             (connected: {}, generation: {})",
+            client.is_connected(),
+            client.generation()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    drop(client);
+    drop(server.join());
+}

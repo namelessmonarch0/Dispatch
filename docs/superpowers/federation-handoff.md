@@ -90,11 +90,7 @@ Ordered by how much they would hurt on a real fleet.
 7. **Removing or renaming a machine in the TUI.** The CLI can remove one
    (`dispatch machine remove`); neither it nor the overlay can rename one —
    the overlay only adds.
-8. **`Wire::lost` can run twice for one connection**: liveness declares it
-   dead, then the killed reader errors. A late second call can take the next
-   connection's child and clear its writer. It predates F2b; fix it with a
-   generation-tagged `lost(gen)`.
-9. **A remote `dispatchd` older than the client** answers `~/x` with a plain
+8. **A remote `dispatchd` older than the client** answers `~/x` with a plain
    `Error` and no `~` expansion. The root is then kept and re-sent without
    ever becoming a row. Keep remote `dispatchd` at the client's version.
 
