@@ -112,29 +112,41 @@ Nothing scans your disk, and nothing is kept that you did not open.
 
 ## More than one machine
 
-Each machine runs its own `dispatchd`, and one client can hold several of them:
-`--daemon <endpoint>`, repeatable, attaches to another alongside the usual one.
-Every project is drawn under the machine it is on, and a machine whose daemon
-goes down keeps its rows -- dimmed and labelled `unreachable` -- because its
-agents are still running. Keystrokes aimed at an unreachable machine are
-refused rather than swallowed.
-
-A machine does not have to be reachable by a socket. `dispatchd --stdio` carries
-one client's frames to whatever daemon its machine is running -- starting one if
-none is listening -- so the transport can be anything that can run a command and
-pipe bytes:
+Register a machine once, and every Dispatch after that reaches it over ssh:
 
 ```sh
-dispatch --attach --daemon-command "ssh tower dispatchd --stdio"
+dispatch machine add me@tower          # dials it first; saved only if it answers
+dispatch machine add gpu-box --name gpu
+dispatch machine list
+dispatch machine remove gpu            # its daemon and agents keep running
 ```
 
-The agents belong to the daemon on that machine, not to the pipe, so a dropped
-connection costs the view and nothing else: the client redials the same command
-and the panes are still there. `--daemon-command` is split on whitespace and
-runs no shell.
+The machine needs `dispatchd` on its `PATH`; nothing is copied to it. Dispatch
+runs `ssh -T -o BatchMode=yes -o ConnectTimeout=10 <target> dispatchd --stdio`,
+so ssh never prompts: run `ssh <target>` once by hand first to accept its host
+key, and use a key or an agent rather than a password. Anything else — a
+wrapper, a nix shell, a transport other than ssh — goes after `--`:
 
-Remembering machines between runs -- `dispatch machine add`, and retrying one
-that was asleep -- is the next slice.
+```sh
+dispatch machine add gpu-box -- /opt/tools/tunnel gpu-box dispatchd --stdio
+```
+
+With any machine registered, `dispatch` attaches to its daemons on its own —
+this machine's included — and draws a row for each at once. Every project is
+drawn under the machine it is on. A machine that is asleep, or whose daemon
+has gone down since, stays in the sidebar — dimmed and labelled
+`unreachable` — and joins (or rejoins) when it answers again; keystrokes
+aimed at it are refused rather than swallowed. Its agents are not lost in the
+meantime: they belong to the daemon on that machine, not to the connection to
+it, so a dropped connection costs the view and nothing else, and the client
+redials until the panes are there again. `^a m` adds a machine without
+restarting. `^a o` asks which machine to open a project on; a remote one takes
+a typed path, such as `~/code/app`.
+
+`--daemon <endpoint>` and `--daemon-command "<command>"` still reach a daemon
+for one run without registering it. `--daemon-command` is split on
+whitespace, with no shell; a program whose path holds a space needs the
+registry.
 
 ## Running the daemon
 

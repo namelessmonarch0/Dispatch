@@ -1,6 +1,6 @@
 # F2b — Machines: a registry, SSH, and a supervisor
 
-Status: approved design, not yet implemented.
+Status: implemented.
 Date: 2026-09-22.
 Follows: `docs/superpowers/specs/2026-09-22-federation-stdio-transport-design.md` (F2a, merged).
 Context: `docs/superpowers/federation-handoff.md`.

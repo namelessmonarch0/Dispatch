@@ -11,7 +11,7 @@ at.
 |---|---|---|
 | F1 — many daemons in one client | **merged** | `specs/2026-09-21-federation-many-daemons-design.md` |
 | F2a — a connection that is not a socket | **merged** | `specs/2026-09-22-federation-stdio-transport-design.md` |
-| F2b — machines: SSH, a registry, a supervisor | **designed** | `specs/2026-09-22-federation-machines-design.md` |
+| F2b — machines: SSH, a registry, a supervisor | **built, on branch `feat/machines`** | `specs/2026-09-22-federation-machines-design.md` |
 
 What works today, end to end: one client holds a connection per machine; every
 project and pane is attributed to the machine it is on; the sidebar draws a row
@@ -25,56 +25,64 @@ to the daemon rather than the pipe.
 dispatch --attach ~/code/thing --daemon-command "ssh tower dispatchd --stdio"
 ```
 
-## F2b, already decided
+## What F2b built
 
-These came from the user during F2a's design and do not need re-litigating:
+A `machines.toml` registry beside `projects.toml`
+(`crates/dispatch-config/src/machines.rs`) holding each machine's name, its
+ssh target, and an optional command override for a non-PATH install, a
+wrapper, or a nix shell — program and arguments kept as separate fields,
+because `--daemon-command`'s whitespace split cannot express a program path
+containing a space. `dispatch machine add <ssh-target> [--name]`, `list`, and
+`remove` (`dispatch/src/machine.rs`) manage it from the command line; `add`
+dials the machine before saving it, unless told `--no-check`, so a typo or an
+unreachable host is caught at the command rather than at the next start.
+`^a m` does the same from a running Dispatch, and `^a o` grew a machine
+step: with more than one machine attached it asks which one a project
+belongs to, and picking a remote machine asks for a typed path rather than
+walking the local directory browser, which has no way to list a remote
+machine's files. Both live behind `dispatch_tui::Prompt`, the one-line
+widget this slice added for a question a list cannot answer.
 
-- **Bridge, don't be the daemon.** `dispatchd --stdio` connects to that
-  machine's own daemon and starts one if none is listening. Already built and
-  merged — F2b consumes it.
-- **`dispatchd --stdio` by default, with a per-machine `command` override** for
-  a non-PATH install, a wrapper, or a nix shell. Fails naming the exact command
-  it tried.
-- **`machines.toml` beside `projects.toml`**, holding program and arguments as
-  separate fields rather than one string — `--daemon-command`'s whitespace
-  split cannot express a program path containing a space, and the registry is
-  where that is answered.
-- **`dispatch machine add <ssh-target> [--name]`, `list`, `remove`**, *and* an
-  in-TUI overlay to add one while Dispatch runs, the way `^a o` adds a project.
-- **A supervisor per registered machine**, with backoff, so a machine that was
-  asleep at startup joins when it wakes. This closes F1's known gap.
-- **No binary copying.** A machine either has `dispatchd` or cannot be added.
+Underneath, `Client::dial` now retries a `Command` dial the way a socket
+dial already did — starting at 1s and doubling to a 30s ceiling — so a
+machine asleep at startup joins once it wakes rather than needing a
+restart; this closes F1's known gap. A machine that refuses to open a
+project (a bad path, one already open under another name) says so with
+`ServerMessage::ProjectRefused` rather than leaving the client to guess
+from silence. No binary copying: a machine either has `dispatchd` on its
+`PATH` or cannot be added.
 
 ## Parked, and not in any issue tracker
 
 Ordered by how much they would hurt on a real fleet.
 
-1. **Attaching is serial and synchronous at startup.** Each unreachable
-   `--daemon-command` costs up to 30 seconds (`COMMAND_HANDSHAKE_TIMEOUT`)
-   before the interface appears, and N down machines cost N × 30s. F2b's
-   supervisor is the right place to fix it: attach in the background and let
-   rows fill in.
-2. **A dial in flight when `Client::drop` runs can leave one process behind.**
-   `closed` is only checked at the top of the supervisor loop; a dial that
-   completes after the check records a pid nobody will take. The cheap fix is a
-   `closed` check in `supervise`'s `Ok` arm before `record`.
-3. **Windows `process::terminate_tree` only calls `TerminateProcess` on the one
+1. **Windows `process::terminate_tree` only calls `TerminateProcess` on the one
    handle**, despite a comment about job objects. Pre-existing, but F2a's
    command transport now *depends* on tree termination — an `ssh.exe` with
    children would outlive a dropped connection there. Must be looked at before
    any Windows fleet.
-4. **Reaping a group whose child is a zombie the parked reader still holds**
+2. **Reaping a group whose child is a zombie the parked reader still holds**
    returns EPERM on macOS, so an ordinary disconnect logs `failed to stop the
    process behind a dial` — noise, not a leak. On Linux the same shape costs a
    bounded ~2s inside `Client::drop` over a command dial.
-5. **Focus after a reconnect replay** lands on the last pane the daemon
+3. **Focus after a reconnect replay** lands on the last pane the daemon
    replayed rather than the one the user was in (`state.rs` focuses every
    replayed pane while its project is selected). Invisible with one pane.
-6. **Several `--daemon-command` failures collapse into one status line** — the
-   last one wins. `--daemon` has the same shape.
-7. **`StderrHint::first_line` is read after a bounded 50ms poll.** A command
+4. **Several machines going bad at once still collapse into one status
+   line.** Each machine now dedupes its own outage — `report_outage` says so
+   once per failure, not once per retry — but `App::status` is a single
+   field, so two machines failing close together still leave only the last
+   writer's line on screen. `--daemon` and `--daemon-command` have the same
+   shape.
+5. **`StderrHint::first_line` is read after a bounded 50ms poll.** A command
    that dies slower than that still reports the bare error. Lengthening the
    wait trades a failing attach's latency for a better message.
+6. **Remote directory browsing.** `^a o` on a remote machine takes a typed
+   path; the browser would need protocol messages that list a remote
+   directory.
+7. **Removing or renaming a machine in the TUI.** The CLI can remove one
+   (`dispatch machine remove`); neither it nor the overlay can rename one —
+   the overlay only adds.
 
 ## Decisions taken on the user's behalf during execution
 
@@ -83,9 +91,6 @@ Recorded because they were judgement calls, not requirements:
 - A project whose device is not registered is dropped from the sidebar
   entirely. Safe only because `App::attach` registers a machine before its
   projects can arrive; there is a test pinning that ordering.
-- `add_project` asks the first attachment. With two machines attached, opening
-  a path puts it on the wrong one. F2b's registry owns the question of which
-  machine a directory lives on.
 - A command dial gets 30s of patience; a socket dial keeps 2s. A local daemon
   silent for two seconds is genuinely wrong; a network round trip plus a remote
   process start is not.
@@ -96,6 +101,11 @@ Recorded because they were judgement calls, not requirements:
   so a mouse click cannot desync it.
 - `dispatchd --device` defaults to the real hostname via `dispatch_os::host`,
   not `$HOSTNAME` — which bash sets but does not export.
+- `ProjectRefused` is a `ServerMessage`, not a `ProtocolError` variant:
+  `ProtocolError` has no `Unknown`, so a new variant would fail an older
+  peer's frame.
+- `^a m` is refused while standalone rather than attaching mid-session,
+  because attaching tears the standalone panes down.
 
 ## Where the moving parts live
 
@@ -109,6 +119,10 @@ Recorded because they were judgement calls, not requirements:
 | The transports themselves | `crates/dispatch-os/src/ipc.rs` (`over_command`, `ChildReader`) |
 | The bridge | `dispatchd/src/bridge.rs` |
 | Kept projects | `crates/dispatch-config/src/projects.rs` |
+| The machine registry | `crates/dispatch-config/src/machines.rs` |
+| The machine verbs | `dispatch/src/machine.rs` |
+| The add overlay | `dispatch/src/add_machine.rs` |
+| One-line prompts | `crates/dispatch-tui/src/prompt.rs` |
 
 ## How this work was run
 
