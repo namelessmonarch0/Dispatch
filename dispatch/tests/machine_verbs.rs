@@ -138,3 +138,26 @@ fn a_name_already_taken_is_refused_before_dialling() {
         stderr(&second)
     );
 }
+
+#[test]
+fn a_target_ssh_would_read_as_an_option_is_refused_before_dialling() {
+    // `ssh -oProxyCommand=…` runs a local command before it connects. The
+    // proxy here would leave a mark if it ever ran.
+    let config = Scratch::new("opt-cfg");
+    let ran = config.0.join("ran");
+    let target = format!("-oProxyCommand=touch {}", ran.display());
+
+    let added = machine(&config.0, &["add", "--name", "evil", &target]);
+
+    assert_eq!(added.status.code(), Some(1), "{}", stderr(&added));
+    assert!(
+        stderr(&added).contains("not an ssh target"),
+        "{}",
+        stderr(&added)
+    );
+    assert!(!ran.exists(), "nothing was dialled");
+    assert!(
+        !config.0.join("machines.toml").exists(),
+        "and nothing was saved"
+    );
+}

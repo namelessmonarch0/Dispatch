@@ -148,6 +148,34 @@ fn adding_refuses_a_name_that_is_not_one() {
 }
 
 #[test]
+fn a_target_is_something_ssh_reads_as_a_host() {
+    assert!(valid_target("tower"));
+    assert!(valid_target("me@tower.lan"));
+    assert!(valid_target("ssh://me@tower:2222"));
+    assert!(!valid_target(""));
+    // ssh would read these as options: `ProxyCommand` runs a local command.
+    assert!(!valid_target("-oProxyCommand=touch /tmp/x"));
+    assert!(!valid_target("-p2222"));
+    assert!(!valid_target("my tower"));
+    assert!(!valid_target("tower\t"));
+}
+
+#[test]
+fn adding_refuses_a_target_ssh_would_read_as_an_option() {
+    let dir = TempDir::new("machines-target");
+
+    let error = add(
+        dir.path(),
+        Machine::new("evil", "-oProxyCommand=x"),
+        "laptop",
+    )
+    .expect_err("a leading dash is an ssh option");
+
+    assert!(error.to_string().contains("not an ssh target"), "{error}");
+    assert!(load(dir.path()).expect("it reads").is_empty());
+}
+
+#[test]
 fn removing_answers_whether_it_was_there() {
     let dir = TempDir::new("machines-remove");
     add(dir.path(), Machine::new("tower", "me@tower"), "laptop").expect("added");

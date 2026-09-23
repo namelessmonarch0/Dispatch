@@ -159,6 +159,11 @@ is an IPv4 address keeps all four parts with the dots made dashes:
 this machine's own hostname, since the local daemon's row already carries that
 name.
 
+It also refuses a target that is empty, starts with `-`, or holds whitespace
+(`machines::valid_target`): ssh reads a leading `-` as an option wherever it
+stands, and `-oProxyCommand=…` runs a local command. The CLI checks this
+before dialling, and the `^a m` overlay refuses it at the target step.
+
 ### Kept projects, per machine
 
 `projects.toml` keeps its top-level `roots` for this machine's projects,

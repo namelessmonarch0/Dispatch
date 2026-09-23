@@ -117,6 +117,18 @@ pub fn valid_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// Whether `target` can be handed to ssh as the host to connect to.
+///
+/// ssh reads an argument starting with `-` as an option wherever it stands,
+/// and `-oProxyCommand=…` runs a local command before it connects: a target
+/// is a place to connect to, never a way to run something here. Whitespace is
+/// refused too, since no host has any and it only ever means two words were
+/// typed where one belongs.
+#[must_use]
+pub fn valid_target(target: &str) -> bool {
+    !target.is_empty() && !target.starts_with('-') && !target.chars().any(char::is_whitespace)
+}
+
 /// A name for the machine at `target`, when one can be made from it.
 ///
 /// The host, cut at its first dot: `tower` from `me@tower.lan`. An IPv4
@@ -204,8 +216,17 @@ pub fn check(dir: &Path, name: &str, this_host: &str) -> Result<(), ConfigError>
     Ok(())
 }
 
-/// Registers `machine`, refusing a name [`check`] would refuse.
+/// Registers `machine`, refusing a name [`check`] would refuse and a target
+/// [`valid_target`] would.
 pub fn add(dir: &Path, machine: Machine, this_host: &str) -> Result<(), ConfigError> {
+    // Here as well as in each caller, so nothing can save a target that the
+    // next start would hand to ssh as an option.
+    if !valid_target(&machine.target) {
+        return Err(ConfigError::Machine {
+            path: dir.join(FILE),
+            reason: format!("{:?} is not an ssh target", machine.target),
+        });
+    }
     check(dir, &machine.name, this_host)?;
 
     let mut machines = load(dir)?;

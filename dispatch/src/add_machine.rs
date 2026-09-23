@@ -134,6 +134,15 @@ impl AddMachine {
 
         match &self.stage {
             Stage::Target { name } => {
+                // Refused where it was typed, so it can be fixed in place:
+                // ssh would read it as an option, and some options run a
+                // local command.
+                if !machines::valid_target(&answer) {
+                    self.prompt.set_note(Some(Note::Error(format!(
+                        "{answer:?} is not an ssh target"
+                    ))));
+                    return Step::Stay;
+                }
                 let name = name
                     .clone()
                     .or_else(|| machines::default_name(&answer))
@@ -271,6 +280,28 @@ mod tests {
             Step::Stay
         ));
         assert_eq!(add.prompt().input(), "  ", "still on the target");
+    }
+
+    #[test]
+    fn a_target_ssh_would_read_as_an_option_is_refused_where_it_was_typed() {
+        // `ssh -oProxyCommand=…` runs a local command before it connects.
+        let mut add = AddMachine::new();
+        type_text(&mut add, "-oProxyCommand=x");
+
+        assert!(matches!(
+            add.key(&key(KeyCode::Enter), |_| Ok(())),
+            Step::Stay
+        ));
+        assert_eq!(
+            add.prompt().input(),
+            "-oProxyCommand=x",
+            "still on the target"
+        );
+        assert!(
+            matches!(add.prompt().note(), Some(Note::Error(reason)) if reason.contains("not an ssh target")),
+            "{:?}",
+            add.prompt().note()
+        );
     }
 
     #[test]

@@ -18,6 +18,10 @@ pub enum Action {
     Add {
         /// Where ssh connects: a host, `user@host`, or an alias from your ssh
         /// configuration.
+        //
+        // Hyphens allowed so a target ssh would read as an option reaches
+        // `add` and is refused by name, rather than by clap as a stray flag.
+        #[arg(allow_hyphen_values = true)]
         target: String,
 
         /// What to call it. Defaults to the target's host.
@@ -67,6 +71,13 @@ fn add(
     no_check: bool,
     command: Vec<String>,
 ) -> Result<ExitCode> {
+    // First, and before any dial: ssh reads a target starting with `-` as an
+    // option, and `-oProxyCommand=…` would run a local command.
+    if !machines::valid_target(&target) {
+        eprintln!("{target:?} is not an ssh target");
+        return Ok(ExitCode::from(1));
+    }
+
     let Some(name) = name.or_else(|| machines::default_name(&target)) else {
         eprintln!("cannot make a machine name from {target:?}; pass --name");
         return Ok(ExitCode::from(1));
