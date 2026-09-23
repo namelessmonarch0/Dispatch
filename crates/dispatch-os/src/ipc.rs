@@ -746,6 +746,7 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::time::Duration;
 
     /// Points the endpoint at a directory of this test's own.

@@ -359,6 +359,17 @@ fn welcome() -> ServerMessage {
     }
 }
 
+/// `bytes` as a `printf` format string.
+///
+/// Three-digit octal escapes rather than `\xHH`: `printf` must understand
+/// them under POSIX, and Ubuntu's `/bin/sh` is dash, whose `printf` has no
+/// `\x` at all -- it printed the escapes as text and the handshake never
+/// completed.
+#[cfg(unix)]
+fn octal(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("\\{b:03o}")).collect()
+}
+
 #[test]
 fn attaching_reports_the_daemon_it_reached() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -739,7 +750,7 @@ fn a_command_that_dies_is_respawned() {
     // lost, and the supervisor has to dial again.
     let mut encoded = Vec::new();
     Frame::write(&mut encoded, &welcome()).expect("writing succeeds");
-    let escaped: String = encoded.iter().map(|b| format!("\\x{b:02x}")).collect();
+    let escaped = octal(&encoded);
 
     let program = std::ffi::OsString::from("sh");
     let args = vec![
@@ -870,6 +881,14 @@ fn a_dial_that_never_answers_leaves_no_process_behind() {
     );
 
     let grandchild = first_recorded_pid(&pid_file);
+
+    // Polled, as every sibling test polls: the tree has been signalled, but a
+    // killed process answers `kill(pid, 0)` until whoever inherited it reaps
+    // it, and on macOS that is launchd, on its own schedule.
+    let deadline = Instant::now() + PATIENCE;
+    while pid_is_alive(grandchild) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(
         !pid_is_alive(grandchild),
         "the dial's process tree outlived the handshake that walked away from it"
@@ -895,7 +914,7 @@ fn a_connection_given_up_on_leaves_no_process_behind() {
     // handshake completes and the connection is up before it goes quiet.
     let mut encoded = Vec::new();
     Frame::write(&mut encoded, &welcome()).expect("writing succeeds");
-    let escaped: String = encoded.iter().map(|b| format!("\\x{b:02x}")).collect();
+    let escaped = octal(&encoded);
 
     let (program, args) = mute_command(&pid_file, &format!("printf '{escaped}'; "));
 
@@ -1182,7 +1201,7 @@ fn a_client_dropped_mid_dial_leaves_nothing_behind() {
 
     let mut encoded = Vec::new();
     Frame::write(&mut encoded, &welcome()).expect("writing succeeds");
-    let escaped: String = encoded.iter().map(|b| format!("\\x{b:02x}")).collect();
+    let escaped = octal(&encoded);
 
     let client = Client::dial(
         Role::Interface,
