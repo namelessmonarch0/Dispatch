@@ -1842,6 +1842,21 @@ impl App {
 
     /// Handles input while an overlay has the keyboard.
     fn handle_overlay(&mut self, event: &Event, area: Size) -> Result<()> {
+        // A path or a target is as likely pasted as typed. Line breaks are
+        // dropped: Enter is a decision, and the newline a copied path often
+        // ends with must not make it for the user.
+        if let Event::Paste(text) = event {
+            match &mut self.overlay {
+                Some(Overlay::OpenOn { prompt, .. }) => text
+                    .chars()
+                    .filter(|c| !matches!(c, '\r' | '\n'))
+                    .for_each(|c| prompt.push(c)),
+                Some(Overlay::AddMachine(add)) => add.paste(text),
+                _ => {}
+            }
+            return Ok(());
+        }
+
         let Event::Key(key) = event else {
             return Ok(());
         };
@@ -5986,6 +6001,31 @@ mod tests {
             "kept under the machine it was opened on"
         );
         assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn a_pasted_path_is_typed_into_the_prompt() {
+        let (tower, _daemon, sent) = Client::for_test();
+        let mut app = App::new(HarnessRegistry::default());
+        app.attach_named(tower, Some("tower".into()), Vec::new());
+
+        open_project(&mut app);
+        // Copied with its line ending, which must not answer for the user.
+        app.handle(&Event::Paste("~/code/app\r\n".into()), Size::new(100, 30))
+            .expect("a paste is handled");
+        assert!(
+            matches!(app.overlay, Some(Overlay::OpenOn { .. })),
+            "still asking"
+        );
+        press(&mut app, KeyCode::Enter);
+
+        let asked: Vec<ClientMessage> = sent.try_iter().collect();
+        assert!(
+            asked.contains(&ClientMessage::OpenProject {
+                root: PathBuf::from("~/code/app")
+            }),
+            "the pasted path is what is asked for: {asked:?}"
+        );
     }
 
     #[test]

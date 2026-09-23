@@ -126,6 +126,20 @@ impl AddMachine {
         Step::Stay
     }
 
+    /// Types pasted text, as keys would.
+    ///
+    /// Line breaks are dropped: Enter is a decision, and the newline a copied
+    /// target often ends with must not make it for the user. Ignored while
+    /// checking, as keys are.
+    pub fn paste(&mut self, text: &str) {
+        if matches!(self.stage, Stage::Checking { .. }) {
+            return;
+        }
+        for c in text.chars().filter(|c| !matches!(c, '\r' | '\n')) {
+            self.prompt.push(c);
+        }
+    }
+
     /// Accepts what is typed, when something is.
     fn submit(&mut self, validate: impl Fn(&str) -> Result<(), String>) -> Step {
         let Some(answer) = self.prompt.answer().map(str::to_string) else {
@@ -398,6 +412,27 @@ mod tests {
         let _ = add.key(&key(KeyCode::Enter), |_| Ok(()));
 
         assert_eq!(add.prompt().input(), "big");
+    }
+
+    #[test]
+    fn a_paste_is_typed_but_waits_while_checking() {
+        let mut add = AddMachine::new();
+        add.paste("me@tower.lan");
+        assert_eq!(add.prompt().input(), "me@tower.lan");
+
+        let _ = add.key(&key(KeyCode::Enter), |_| Ok(()));
+        let Step::Check(machine) = add.key(&key(KeyCode::Enter), |_| Ok(())) else {
+            panic!("the check starts");
+        };
+        let (_done, answer) = std::sync::mpsc::channel();
+        add.checking(machine, answer);
+
+        add.paste("zzz");
+        assert_eq!(
+            add.prompt().input(),
+            "tower",
+            "a paste waits for the answer too"
+        );
     }
 
     #[test]
