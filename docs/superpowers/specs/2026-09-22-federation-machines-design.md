@@ -95,9 +95,12 @@ pub struct Machine {
     pub command: Option<Command>,
 }
 
+/// Strings rather than `OsString`s: serde writes an `OsString` into TOML as a
+/// platform-tagged byte array nobody could edit by hand. A path with a space
+/// is still expressible, which is the point of the separate fields.
 pub struct Command {
-    pub program: OsString,
-    pub args: Vec<OsString>,
+    pub program: String,
+    pub args: Vec<String>,
 }
 
 impl Machine {
@@ -142,10 +145,19 @@ command line.
 
 ### Names
 
-`--name`, or else the host part of the target: `tower` from `me@tower`,
-`gpu-box` from `gpu-box`, with any `:port` dropped. `add` refuses a name
-already registered, and a name equal to this machine's own hostname, since the
-local daemon's row already carries that name.
+A name is one or more of `A-Z a-z 0-9 - _`. It is a TOML table key in
+`projects.toml` and a word typed on the command line, so nothing that would
+need quoting in either.
+
+`--name`, or else a default taken from the target's host: an `ssh://` prefix,
+any `user@` and any `:port` are dropped, then the host is cut at its first dot
+— `tower` from `me@tower.lan`, `tower` from `ssh://me@tower:2222`. A host that
+is an IPv4 address keeps all four parts with the dots made dashes:
+`192-168-1-5`. A target that yields no valid name needs `--name`.
+
+`add` refuses an invalid name, a name already registered, and a name equal to
+this machine's own hostname, since the local daemon's row already carries that
+name.
 
 ### Kept projects, per machine
 
@@ -159,9 +171,11 @@ roots = ["/Users/me/code/thing"]
 roots = ["~/code/server"]
 ```
 
-A file from before this slice loads as it always did. `projects::remember` and
-`projects::forget` gain a machine argument (`None` for local). `machine remove`
-drops that machine's table.
+A file from before this slice loads as it always did, and so does one written
+by this slice read by an older build: serde ignores the unknown table.
+`projects::load`, `remember` and `forget` keep their meaning for this machine,
+and gain siblings for a remote one: `load_on`, `remember_on`, `forget_on`, and
+`forget_machine`, which `machine remove` calls to drop the whole table.
 
 ## The supervisor
 
@@ -207,14 +221,20 @@ connection's process down if the client has already been dropped.
 
 ### `dispatch`
 
-- `Attachment` gains `label: Option<String>`, the registry name.
-  `sync_attachment` writes the daemon's own name into the row only when there
-  is no label.
+- `Attachment` gains `label: Option<String>`, the registry name, and `remote:
+  bool`. `sync_attachment` writes the daemon's own name into the row only when
+  there is no label, and never writes an empty one.
 - `Device::pending(name)`: a device that has not connected yet,
   `reachable: false`. `Device::new` keeps its meaning.
-- `App::attach_named(client, label)` registers a pending device under the label
-  and holds the client. `App::attach` is unchanged for callers that pass a
-  connected client.
+- `App::attach_named(client, label, roots)` registers a pending device — named
+  by the label, or by the dial string when there is none — holds the client,
+  and pre-fills its `opened` with `roots`, which go out on first connect.
+  `App::attach` is unchanged, and is what makes an attachment *this machine's*:
+  every `attach_named` attachment is remote.
+- Kept projects are recorded under the attachment's label. This machine's go
+  in the top-level list; a remote attachment with no label (one reached by
+  `--daemon` or `--daemon-command`) keeps nothing, because nothing would dial
+  it again on the next start.
 - A first connect is the move from generation 0 to 1. `sync_attachment`
   already re-sends `opened` roots and the supervisor already re-sends
   `Subscribe`, so the only difference is the status text: `connected to tower`
@@ -280,6 +300,10 @@ The overlay has two steps:
 2. **Name.** Pre-filled with the default name for that target, editable. Enter
    starts the check.
 
+`^a m` is refused while Dispatch runs standalone, with a status line saying to
+restart with `--attach`. Attaching tears down the standalone machine and every
+pane running on it; a keystroke must not do that.
+
 The check runs `Client::attach_over` on a background thread while the overlay
 shows `checking tower…`. The name is validated before the check starts, with
 the same rules as `add`.
@@ -304,23 +328,26 @@ The command override and `--no-check` are CLI-only.
    `OpenProject` with the typed path to that machine's attachment and keeps it
    under `[machines.tower]`.
 
-With one machine attached, `^a o` behaves exactly as it does today.
+With one machine attached, `^a o` goes straight to that machine's step: the
+browser for this machine, exactly as today, or the path prompt for a remote
+one.
 
 ## The daemon
 
-Two changes to `open_project_for`:
+Two changes to `open_project_for`, with a new helper,
+`dispatch_os::paths::expand_home`:
 
 - **A leading `~` expands against the daemon's own home.** A path typed by hand
   for a remote machine almost always starts with one, and `paths::resolve`
   would otherwise look for a directory literally named `~` in the daemon's
   working directory.
-- **A typed error for a root that cannot be opened.** Its two
-  `ProtocolError::Other` strings become:
+- **A message of its own for a root that cannot be opened.** Its two
+  `ServerMessage::Error { error: ProtocolError::Other(..) }` replies become:
 
   ```rust
-  /// A root asked for in `OpenProject` could not be opened.
-  #[error("cannot open {root}: {reason}")]
-  CannotOpen {
+  /// A root asked for in `OpenProject` could not be opened. Sent only to the
+  /// client that asked.
+  ProjectRefused {
       /// The root exactly as the client sent it.
       root: PathBuf,
       /// Why: not a directory, no such file, permission denied.
@@ -329,11 +356,16 @@ Two changes to `open_project_for`:
   ```
 
   A client that receives it removes that root from its kept list and from the
-  attachment's `opened`, and puts the error on the status line. Without this, a
-  mistyped remote path would be kept and re-sent on every start, and it would
+  attachment's `opened`, and puts the reason on the status line. Without this,
+  a mistyped remote path would be kept and re-sent on every start, and it would
   never become a project row the user could delete it from.
 
-The new variant is a minor protocol bump: `VERSION` goes from 1.1 to 1.2.
+  A `ServerMessage` variant rather than a `ProtocolError` one. `ProtocolError`
+  is externally tagged and has no `Unknown`, so a variant added there fails an
+  older peer's whole frame — and a fleet is exactly where an older `dispatchd`
+  meets a newer client. `ServerMessage` has `#[serde(other)] Unknown`: an older
+  client skips `ProjectRefused` and loses only the status line. Adding a
+  variant is not a version bump; `VERSION` stays 1.1.
 
 ## Failure cases
 
@@ -342,7 +374,9 @@ The new variant is a minor protocol bump: `VERSION` goes from 1.1 to 1.2.
 | A registered machine is asleep at startup | Its row is drawn at once, dimmed. The supervisor retries with backoff up to 30s. When the handshake succeeds the row lights up, and its kept roots and `Subscribe` go out. |
 | ssh authentication or host-key failure | `BatchMode` makes `ssh` fail fast. The status line shows the first stderr line, once per outage. |
 | `dispatchd` is not installed on the remote | The same path, reported as `dispatchd: command not found` or similar. `add` refuses to save the machine unless `--no-check` is given. |
-| A typed remote path is wrong | The daemon answers `CannotOpen`; the client removes the root from its kept list and `opened` and says why. |
+| A typed remote path is wrong | The daemon answers `ProjectRefused`; the client removes the root from its kept list and `opened` and says why. |
+| `^a m` pressed while standalone | Refused with a status line. Nothing is torn down. |
+| Enter on an empty prompt | Nothing happens. No `OpenProject` is sent and no machine is saved. |
 | `machines.toml` does not parse | Startup fails, naming the file. |
 | The client is dropped while a dial is in flight | The `closed` check in the `Ok` arm tears the new connection down. No process is left behind. |
 | The overlay is closed while its check is in flight | The result and its client are dropped on arrival. |
@@ -355,26 +389,32 @@ The new variant is a minor protocol bump: `VERSION` goes from 1.1 to 1.2.
     command override.
   - `add` refuses a duplicate name.
   - The default command is the ssh line above; an override replaces it whole.
-  - Default names: `me@tower` → `tower`, `gpu-box:2222` → `gpu-box`.
+  - Default names: `me@tower.lan` → `tower`, `ssh://me@tower:2222` → `tower`,
+    `192.168.1.5` → `192-168-1-5`; a name with a space is refused.
+  - An empty `machines.toml` loads as no machines.
   - A `projects.toml` in the old shape still loads; per-machine tables
     round-trip; `machine remove` drops its table.
 - **`dispatch-client`**
   - `Client::dial` against an endpoint nothing listens on starts disconnected
     at generation 0. Once a daemon listens there, it reaches generation 1 and
     has sent `Subscribe`.
-  - A command dial backs off to the 30s ceiling. The test counts spawns of a
-    stub command, with the ceiling injected so the test takes milliseconds.
+  - The backoff arithmetic for each dial, as a pure function: a command
+    starts at 1s and stops doubling at 30s; a socket keeps 100ms and 2s.
+  - A client dialling a command that always fails spawns it at most twice in
+    its first 1.5 seconds.
   - `last_error` carries a failing command's first stderr line, and clears on
     connect.
   - The dial-in-flight race: a client dropped while its dial is completing
     leaves no child process.
 - **`dispatch-daemon`**
   - `~/x` opens `$HOME/x`.
-  - A missing root is answered with `CannotOpen` carrying the root as sent.
+  - A missing root is answered with `ProjectRefused` carrying the root as sent,
+    to the asking client only.
 - **`dispatch` app**, with `Client::for_test`
   - A row added by `attach_named` shows the label and is unreachable.
   - A first connect says `connected to`, not `reattached to`.
-  - `CannotOpen` removes the root from the kept list and from `opened`.
+  - `ProjectRefused` removes the root from the kept list and from `opened`.
+  - `^a m` while standalone is refused and leaves local panes running.
   - `^a o` with two machines opens the machine picker; choosing a remote
     machine opens the path prompt and sends to that machine only.
   - The `^a m` overlay's steps: target, name, checking, success, failure, and
@@ -382,10 +422,12 @@ The new variant is a minor protocol bump: `VERSION` goes from 1.1 to 1.2.
 - **End to end** (`dispatch/tests/end_to_end.rs`). There is no ssh in tests:
   the command override is how a test reaches a machine.
   - A temporary configuration directory whose `machines.toml` holds a machine
-    whose command is `<dispatchd> --stdio --endpoint <second dir>/dispatchd.sock`.
-    Dispatch starts before the second daemon exists, and its interface is up
-    without waiting. The second daemon is started afterwards, and the machine's
-    row comes up with its projects.
+    whose command is `sh -c 'test -e <flag> && exec <dispatchd> --stdio
+    --endpoint <second dir>/dispatchd.sock'`. The flag stands in for the
+    machine being asleep: `--stdio` would otherwise start the far daemon
+    itself. Dispatch's interface is up and the row is drawn unreachable while
+    the flag is absent; once the flag is created, the row comes up with its
+    kept project.
   - `dispatch machine add x --name x -- <dispatchd> --stdio --endpoint …`
     passes its check, saves the entry and exits 0.
   - `dispatch machine add y -- /nonexistent/dispatchd --stdio` exits 1, names
