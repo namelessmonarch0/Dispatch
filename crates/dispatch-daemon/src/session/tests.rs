@@ -1974,3 +1974,186 @@ fn closing_an_unknown_project_is_reported() {
         }
     )));
 }
+
+/// A task that is still running thirty seconds from now, on every platform.
+///
+/// `sleep` is not a command under `cmd.exe`: there it fails at once, and a
+/// test about what is *running* would pass for the wrong reason. No `>nul`:
+/// from Task 17 the Windows fixture runs its task under PowerShell, where
+/// that redirection fails.
+fn long_task() -> &'static str {
+    if cfg!(windows) {
+        "ping -n 30 127.0.0.1"
+    } else {
+        "sleep 30"
+    }
+}
+
+/// Every `DelegateResolved` outcome among `messages`.
+fn outcomes(messages: &[ServerMessage]) -> Vec<DelegateOutcome> {
+    messages
+        .iter()
+        .filter_map(|m| match m {
+            ServerMessage::DelegateResolved { outcome, .. } => Some(outcome.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn approving_more_requests_than_the_cap_allows_starts_only_what_fits() {
+    // Both requests are asked about while nothing is running, so both pass
+    // the check on arrival. Approving them one after the other must still
+    // start only one: the cap is on what runs, not on what is asked.
+    let (mut daemon, project, _dir) = daemon_with_limits(
+        "cap-at-approval",
+        DelegationLimits {
+            max_depth: 1,
+            max_live_per_parent: 1,
+            request_timeout_secs: 600,
+        },
+    );
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let first = ask_as(&mut daemon, 8, parent, long_task());
+    let second = ask_as(&mut daemon, 9, parent, long_task());
+    let requests: Vec<RequestId> = drain(&ui)
+        .iter()
+        .filter_map(|m| match m {
+            ServerMessage::DelegatePending { request, .. } => Some(*request),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(requests.len(), 2, "both fit while nothing runs yet");
+
+    for request in requests {
+        daemon.request_for_test(
+            1,
+            ClientMessage::DelegateDecision {
+                request,
+                approve: true,
+                blanket: false,
+            },
+        );
+    }
+
+    assert_eq!(
+        daemon.pane_count(),
+        2,
+        "the parent and exactly one subagent"
+    );
+
+    let mut told = outcomes(&drain(&first));
+    told.extend(outcomes(&drain(&second)));
+    assert_eq!(
+        told.iter()
+            .filter(|o| matches!(o, DelegateOutcome::Approved { .. }))
+            .count(),
+        1,
+        "one caller is told it runs: {told:?}"
+    );
+    assert!(
+        told.iter()
+            .any(|o| matches!(o, DelegateOutcome::Refused { reason } if reason.contains("cap"))),
+        "the other is told why it does not: {told:?}"
+    );
+}
+
+#[test]
+fn approvals_from_two_interfaces_do_not_share_one_slot() {
+    // The same race with the approvals coming from two people at two
+    // screens, which is the ordinary shape on a shared fleet.
+    let (mut daemon, project, _dir) = daemon_with_limits(
+        "cap-two-uis",
+        DelegationLimits {
+            max_depth: 1,
+            max_live_per_parent: 1,
+            request_timeout_secs: 600,
+        },
+    );
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let other_ui = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let _ = drain(&other_ui);
+
+    let _first = ask_as(&mut daemon, 8, parent, long_task());
+    let _second = ask_as(&mut daemon, 9, parent, long_task());
+    let requests: Vec<RequestId> = drain(&ui)
+        .iter()
+        .filter_map(|m| match m {
+            ServerMessage::DelegatePending { request, .. } => Some(*request),
+            _ => None,
+        })
+        .collect();
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request: requests[0],
+            approve: true,
+            blanket: false,
+        },
+    );
+    daemon.request_for_test(
+        2,
+        ClientMessage::DelegateDecision {
+            request: requests[1],
+            approve: true,
+            blanket: false,
+        },
+    );
+
+    assert_eq!(
+        daemon.pane_count(),
+        2,
+        "the parent and exactly one subagent"
+    );
+}
+
+#[test]
+fn a_blanket_approved_pane_at_its_cap_is_refused_rather_than_started() {
+    let (mut daemon, project, _dir) = daemon_with_limits(
+        "cap-blanket",
+        DelegationLimits {
+            max_depth: 1,
+            max_live_per_parent: 1,
+            request_timeout_secs: 600,
+        },
+    );
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let _first = ask_as(&mut daemon, 8, parent, long_task());
+    let request = pending(&drain(&ui)).expect("the first is asked about");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: true,
+        },
+    );
+
+    let second = ask_as(&mut daemon, 9, parent, long_task());
+
+    assert_eq!(
+        daemon.pane_count(),
+        2,
+        "blanket approval is not a second slot"
+    );
+    assert!(
+        outcomes(&drain(&second))
+            .iter()
+            .any(|o| matches!(o, DelegateOutcome::Refused { .. })),
+        "the second caller is refused"
+    );
+}

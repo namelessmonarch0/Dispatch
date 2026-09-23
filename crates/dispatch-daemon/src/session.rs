@@ -863,11 +863,28 @@ impl Daemon {
             return;
         };
 
-        let Some(launch) = self
+        let launch = self
             .harnesses
             .get(harness)
-            .and_then(|def| def.task_launch(task))
-        else {
+            .and_then(|def| def.task_launch(task));
+
+        // Asked again here, and not only when the request arrived: several
+        // requests can each see a free slot while they wait, and every one
+        // of them would start on approval. The cap is on what runs, so it is
+        // enforced where things start running -- with the same predicate the
+        // request was first judged by, so the two can never disagree.
+        let depth = self.depth_of(parent);
+        let live = self.live_children(parent);
+        if let Some(reason) =
+            crate::delegation::refusal(depth, live, self.limits, launch.is_some(), harness)
+        {
+            tracing::info!(%parent, %harness, %reason, "refused an approved delegation");
+            self.resolve(request, caller, DelegateOutcome::Refused { reason });
+            return;
+        }
+        let Some(launch) = launch else {
+            // `refusal` refuses a missing form first, so this cannot be
+            // reached; kept as a refusal rather than a panic all the same.
             self.resolve(
                 request,
                 caller,
