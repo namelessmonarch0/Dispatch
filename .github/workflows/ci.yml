@@ -96,3 +96,19 @@ jobs:
 
       - name: Build
         run: cargo build --workspace --all-targets --locked
+
+  advisories:
+    name: advisories
+    # `cargo audit` alone exits 0 on unsound and unmaintained crates -- which
+    # is how two lru soundness advisories sat in the lockfile unnoticed.
+    # `--deny warnings` makes every class fail; exceptions live, dated, in
+    # .cargo/audit.toml.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit
+        run: cargo audit --deny warnings

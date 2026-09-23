@@ -39,10 +39,12 @@ dispatch-tui = { path = "crates/dispatch-tui" }
 # wrapped row count the render path itself computes. Three attempts at
 # reimplementing that count by hand (a character sum, a per-line `div_ceil`,
 # a two-row probe) were each wrong in a way tests at only one terminal width
-# missed; the version is pinned, so "unstable" here means "the API may move
-# under us later," not "unverified now."
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
+# missed; the minor version is pinned, so "unstable" here means "the API may
+# move under us on the next minor," not "unverified now." 0.30 rather than
+# 0.29 because 0.29's layout cache pulled in an `lru` with two soundness
+# advisories and the unmaintained `paste`.
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 
 # Runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net", "io-util"] }

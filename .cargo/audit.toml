@@ -1,0 +1,10 @@
+# CI runs `cargo audit --deny warnings`: a vulnerability, an unsound crate, an
+# unmaintained crate and a yanked version all fail the build. That is the
+# policy; an advisory is not waited out.
+#
+# An exception goes in `ignore` below only with a comment beside it naming
+# the advisory, why Dispatch cannot reach the affected code or cannot yet
+# upgrade, and a date by which it is looked at again. An exception without a
+# date is not one.
+[advisories]
+ignore = []
