@@ -103,7 +103,7 @@ impl Picker {
 }
 
 /// Centres a box of at most `width` by `height` inside `area`.
-fn centred(area: Rect, width: u16, height: u16) -> Rect {
+pub(crate) fn centred(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
 
@@ -204,7 +204,7 @@ impl Widget for &Picker {
 }
 
 /// Writes `text` at `(x, y)` clipped to `area`, returning the next column.
-fn write(buf: &mut Buffer, area: Rect, x: u16, y: u16, text: &str, style: Style) -> u16 {
+pub(crate) fn write(buf: &mut Buffer, area: Rect, x: u16, y: u16, text: &str, style: Style) -> u16 {
     let mut cursor = x;
 
     for c in text.chars() {
