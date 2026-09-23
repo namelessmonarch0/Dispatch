@@ -5,6 +5,7 @@
 //! and it outlives the process until they remove one. Nothing here scans the
 //! disk, and nothing is kept that was not opened.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -15,79 +16,152 @@ use crate::ConfigError;
 const FILE: &str = "projects.toml";
 
 /// The file's shape.
+///
+/// This machine's roots stay at the top level, where every file written
+/// before machines existed put them. Each remote machine gets a table of its
+/// own; an older build reading this file ignores those tables.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Saved {
-    /// Project roots, in the order they were first opened.
+    /// This machine's project roots, in the order they were first opened.
+    #[serde(default)]
+    roots: Vec<PathBuf>,
+    /// Each remote machine's, keyed by its registry name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    machines: BTreeMap<String, Kept>,
+}
+
+/// One remote machine's kept roots.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Kept {
     #[serde(default)]
     roots: Vec<PathBuf>,
 }
 
-/// The remembered project roots, oldest first.
-///
-/// No file yet means nothing has been kept, which is what a first run looks
-/// like rather than a failure.
-pub fn load(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
+impl Saved {
+    /// The list for `machine`, or this machine's for `None`.
+    fn list_mut(&mut self, machine: Option<&str>) -> &mut Vec<PathBuf> {
+        match machine {
+            None => &mut self.roots,
+            Some(name) => &mut self.machines.entry(name.to_string()).or_default().roots,
+        }
+    }
+}
+
+/// Reads the whole file. No file is an empty one.
+fn read(dir: &Path) -> Result<Saved, ConfigError> {
     let path = dir.join(FILE);
 
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Saved::default()),
         Err(source) => return Err(ConfigError::Io { path, source }),
     };
 
-    let saved: Saved = toml::from_str(&text).map_err(|source| ConfigError::Toml {
-        path: path.clone(),
-        source,
-    })?;
-
-    Ok(saved.roots)
+    toml::from_str(&text).map_err(|source| ConfigError::Toml { path, source })
 }
 
-/// Writes the list, replacing whatever was there.
-pub fn save(dir: &Path, roots: &[PathBuf]) -> Result<(), ConfigError> {
+/// Writes the whole file.
+fn write(dir: &Path, saved: &Saved) -> Result<(), ConfigError> {
     std::fs::create_dir_all(dir).map_err(|source| ConfigError::Io {
         path: dir.to_path_buf(),
         source,
     })?;
 
     let path = dir.join(FILE);
-    let text = toml::to_string_pretty(&Saved {
-        roots: roots.to_vec(),
-    })
-    .expect("a list of paths serialises");
-
+    let text = toml::to_string_pretty(saved).expect("lists of paths serialise");
     std::fs::write(&path, text).map_err(|source| ConfigError::Io { path, source })
 }
 
-/// Adds `root` to the list, if it is not already on it.
+/// This machine's remembered project roots, oldest first.
+///
+/// No file yet means nothing has been kept, which is what a first run looks
+/// like rather than a failure.
+pub fn load(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
+    Ok(read(dir)?.roots)
+}
+
+/// A remote machine's remembered project roots, oldest first, exactly as they
+/// were typed.
+///
+/// Unresolved on purpose: they are paths on another machine, and only its
+/// daemon can resolve them.
+pub fn load_on(dir: &Path, machine: &str) -> Result<Vec<PathBuf>, ConfigError> {
+    Ok(read(dir)?
+        .machines
+        .get(machine)
+        .map(|kept| kept.roots.clone())
+        .unwrap_or_default())
+}
+
+/// Writes this machine's list, replacing whatever was there — and leaving
+/// every remote machine's alone.
+pub fn save(dir: &Path, roots: &[PathBuf]) -> Result<(), ConfigError> {
+    let mut saved = read(dir)?;
+    saved.roots = roots.to_vec();
+    write(dir, &saved)
+}
+
+/// Adds `root` to this machine's list, if it is not already on it.
 ///
 /// Answers whether the file was written: every start opens what is kept, and
 /// rewriting the file each time would churn it for nothing.
 pub fn remember(dir: &Path, root: &Path) -> Result<bool, ConfigError> {
-    let mut roots = load(dir)?;
-
-    if roots.iter().any(|kept| kept == root) {
-        return Ok(false);
-    }
-
-    roots.push(root.to_path_buf());
-    save(dir, &roots)?;
-    Ok(true)
+    remember_in(dir, None, root)
 }
 
-/// Takes `root` off the list.
+/// Adds `root` to a remote machine's list, if it is not already on it.
+pub fn remember_on(dir: &Path, machine: &str, root: &Path) -> Result<bool, ConfigError> {
+    remember_in(dir, Some(machine), root)
+}
+
+/// Takes `root` off this machine's list.
 ///
 /// Answers whether it was there to take off.
 pub fn forget(dir: &Path, root: &Path) -> Result<bool, ConfigError> {
-    let mut roots = load(dir)?;
-    let before = roots.len();
+    forget_in(dir, None, root)
+}
 
-    roots.retain(|kept| kept != root);
-    if roots.len() == before {
+/// Takes `root` off a remote machine's list.
+pub fn forget_on(dir: &Path, machine: &str, root: &Path) -> Result<bool, ConfigError> {
+    forget_in(dir, Some(machine), root)
+}
+
+/// Drops a remote machine's whole list, for a machine that has been removed.
+///
+/// Answers whether it had one.
+pub fn forget_machine(dir: &Path, machine: &str) -> Result<bool, ConfigError> {
+    let mut saved = read(dir)?;
+    if saved.machines.remove(machine).is_none() {
+        return Ok(false);
+    }
+    write(dir, &saved)?;
+    Ok(true)
+}
+
+fn remember_in(dir: &Path, machine: Option<&str>, root: &Path) -> Result<bool, ConfigError> {
+    let mut saved = read(dir)?;
+    let list = saved.list_mut(machine);
+
+    if list.iter().any(|kept| kept == root) {
         return Ok(false);
     }
 
-    save(dir, &roots)?;
+    list.push(root.to_path_buf());
+    write(dir, &saved)?;
+    Ok(true)
+}
+
+fn forget_in(dir: &Path, machine: Option<&str>, root: &Path) -> Result<bool, ConfigError> {
+    let mut saved = read(dir)?;
+    let list = saved.list_mut(machine);
+    let before = list.len();
+
+    list.retain(|kept| kept != root);
+    if list.len() == before {
+        return Ok(false);
+    }
+
+    write(dir, &saved)?;
     Ok(true)
 }
 
