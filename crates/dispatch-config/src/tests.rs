@@ -630,6 +630,54 @@ fn an_edited_built_in_from_an_older_release_is_left_alone() {
 }
 
 #[test]
+fn a_command_windows_finds_as_a_batch_file_puts_the_task_on_cmds_command_line_too() {
+    // `claude` written bare is `claude.cmd` once Windows looks for it, and
+    // a batch file runs through cmd.exe: the file found decides, not the
+    // name written.
+    let def: HarnessDef = toml::from_str(
+        "id = \"bare\"\ndisplay_name = \"Bare\"\ncommand = \"claude\"\n\n\
+         [task]\nargs = [\"-p\", \"{task}\"]\n",
+    )
+    .expect("the definition parses");
+    let on_path = |dir: &TempDir, path_key: &str| {
+        let mut launch = def.launch_for("windows");
+        launch
+            .env
+            .insert(path_key.into(), dir.path().display().to_string());
+        launch
+            .env
+            .insert("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD".into());
+        launch
+    };
+
+    // Named in PATHEXT's own case, so a case-sensitive file system finds
+    // them as Windows would.
+    let shim = TempDir::new("batch-on-path");
+    shim.write("claude.CMD", "");
+    // Keyed as Windows keys it: case aside, `Path` is `PATH`.
+    let reason = def
+        .task_refusal_as("windows", &on_path(&shim, "Path"))
+        .expect("a batch file found on PATH is refused");
+    assert!(
+        reason.to_lowercase().contains("claude.cmd") && reason.contains("bare.toml"),
+        "the refusal says what was found and which file to fix: {reason}"
+    );
+
+    let executable = TempDir::new("exe-on-path");
+    executable.write("claude.EXE", "");
+    assert_eq!(
+        def.task_refusal_as("windows", &on_path(&executable, "PATH")),
+        None,
+        "an executable is started directly, and its arguments reach it whole"
+    );
+    assert_eq!(
+        def.task_refusal_as("linux", &on_path(&shim, "PATH")),
+        None,
+        "a .cmd file is nothing special where there is no cmd.exe"
+    );
+}
+
+#[test]
 fn a_file_form_that_also_names_the_task_is_refused_everywhere() {
     // A file form fills in nothing, so `{task}` would reach the agent as
     // those six characters: a form that cannot mean what it says.

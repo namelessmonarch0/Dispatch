@@ -3415,6 +3415,102 @@ fn a_task_redirected_by_a_posix_shell_reaches_the_agent_exactly() {
     );
 }
 
+/// A daemon serving the fixture harnesses plus `extra`, with a parent pane
+/// and a delegate caller attached, and the request for `task` under
+/// `harness` already made.
+///
+/// Returns the daemon, the interface client, the caller, and the test's
+/// directory, which the daemon's project and task files live in.
+fn delegating_to(
+    label: &str,
+    extra: &[(&str, String)],
+    harness: &str,
+    task: &str,
+) -> (Daemon, Inbox, Inbox, TempDir) {
+    let dir = TempDir::new(label);
+    let harness_dir = dir.0.join("harnesses");
+    let _ = harnesses(&harness_dir);
+    for (name, body) in extra {
+        std::fs::write(harness_dir.join(format!("{name}.toml")), body)
+            .expect("temp dir is writable");
+    }
+
+    let registry = HarnessRegistry::load_from_dir(&harness_dir).expect("loading succeeds");
+    let mut daemon = Daemon::new(registry, "test-device");
+    daemon.set_task_dir(dir.0.join("tasks"));
+    let project =
+        daemon.open_project(dispatch_os::paths::resolve(&dir.0).expect("the temp dir resolves"));
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(
+        9,
+        ClientMessage::DelegateRequest {
+            parent,
+            harness: harness.into(),
+            task: task.into(),
+            size: (80, 24),
+        },
+    );
+
+    (daemon, ui, caller, dir)
+}
+
+/// A harness whose command is the bare name `agent`, looked for only in
+/// `bin`, where `.CMD` completes it: what `claude` written bare is on a
+/// machine where npm installed `claude.cmd`.
+fn bare_agent(bin: &Path) -> String {
+    format!(
+        "id = \"agent\"\ndisplay_name = \"Agent\"\ncommand = \"agent\"\n\n\
+         [env]\nPATH = '{}'\nPATHEXT = \".CMD\"\n\n\
+         [task]\nargs = [\"{{task}}\"]\n",
+        bin.display()
+    )
+}
+
+#[test]
+#[cfg_attr(
+    not(windows),
+    ignore = "a batch file runs through cmd.exe only on Windows"
+)]
+fn a_command_windows_finds_as_a_batch_file_is_refused_before_anyone_is_asked() {
+    let bin = TempDir::new("batch-bin");
+    std::fs::write(bin.0.join("agent.CMD"), "@echo ran\r\n").expect("temp dir is writable");
+
+    let (daemon, ui, caller, _dir) = delegating_to(
+        "batch-on-path",
+        &[("agent", bare_agent(&bin.0))],
+        "agent",
+        "x & echo DISPATCH_AUDIT_MARKER",
+    );
+
+    let told = outcomes(&drain(&caller));
+    assert!(
+        told.iter().any(|o| matches!(
+            o,
+            DelegateOutcome::Refused { reason }
+                if reason.contains("agent.toml") && reason.to_lowercase().contains("agent.cmd")
+        )),
+        "the caller is told what was found and which file to fix: {told:?}"
+    );
+    assert!(
+        pending(&drain(&ui)).is_none(),
+        "nobody is asked to approve it"
+    );
+    assert_eq!(daemon.pane_count(), 1, "nothing started");
+}
+
 #[test]
 fn a_file_form_that_also_names_the_task_is_refused_before_anyone_is_asked() {
     // On every platform: a file form fills nothing in, so its `{task}` would

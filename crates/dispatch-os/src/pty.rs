@@ -6,8 +6,9 @@
 //! first escapes the job -- and `portable-pty` starts it running.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
 mod windows;
@@ -184,20 +185,49 @@ fn quote_for_crt(arg: &str) -> String {
     quoted
 }
 
+/// The file the Windows spawn starts for `program`, given the child's `PATH`
+/// and `PATHEXT`.
+///
+/// A path is taken as it is, or with the first `PATHEXT` extension that
+/// makes it name a file; a bare name is looked for the same way in each
+/// `PATH` directory in turn; and what is found nowhere is returned as given,
+/// for `CreateProcessW` to fail on. With no `PATHEXT`, only `.EXE` is tried.
+///
+/// Public, and not behind a `#[cfg]`, because what a command *is* matters
+/// before it is started: `claude` found as `claude.cmd` is a batch file,
+/// which Windows runs through `cmd.exe`, and whoever decides what may reach
+/// its command line has to judge the file this finds, not the name it was
+/// given. `portable-pty` 0.9 differed in two ways: it replaced an extension
+/// the name already had rather than adding one, and it looked for a relative
+/// path with a separator on `PATH`, where this finds it from the current
+/// directory, as `CreateProcessW` does.
+#[must_use]
+pub fn resolve_program(program: &str, path: Option<&OsStr>, pathext: Option<&OsStr>) -> PathBuf {
+    let pathext = pathext.map_or_else(|| ".EXE".into(), OsStr::to_string_lossy);
+
+    let given = Path::new(program);
+    if given.is_absolute() || given.components().count() > 1 {
+        return find_with_pathext(given, &pathext).unwrap_or_else(|| given.to_path_buf());
+    }
+
+    if let Some(path) = path {
+        for dir in std::env::split_paths(path) {
+            if let Some(found) = find_with_pathext(&dir.join(program), &pathext) {
+                return found;
+            }
+        }
+    }
+
+    given.to_path_buf()
+}
+
 /// `path` when it names a file, or else `path` with the first extension in
 /// `pathext` -- a `;`-separated list, as the variable is -- that makes it
 /// name one.
 ///
 /// How Windows finds a program named without its extension: `claude` is run
 /// as `claude.exe`, or as `claude.cmd` when that is what an installer left.
-#[cfg_attr(
-    not(windows),
-    allow(
-        dead_code,
-        reason = "only the Windows spawn looks for its program; the tests run everywhere"
-    )
-)]
-fn find_with_pathext(path: &Path, pathext: &str) -> Option<std::path::PathBuf> {
+fn find_with_pathext(path: &Path, pathext: &str) -> Option<PathBuf> {
     if path.is_file() {
         return Some(path.to_path_buf());
     }
@@ -207,7 +237,7 @@ fn find_with_pathext(path: &Path, pathext: &str) -> Option<std::path::PathBuf> {
         .map(|extension| {
             let mut candidate = path.as_os_str().to_owned();
             candidate.push(extension);
-            std::path::PathBuf::from(candidate)
+            PathBuf::from(candidate)
         })
         .find(|candidate| candidate.is_file())
 }
@@ -305,7 +335,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::ErrorKind;
 
-    use super::{PtyCommand, find_with_pathext, quote_for_crt, refuse_nul, spawn};
+    use super::{PtyCommand, find_with_pathext, quote_for_crt, refuse_nul, resolve_program, spawn};
 
     /// A fresh directory holding an empty file for each of `names`.
     fn a_dir_with(label: &str, names: &[&str]) -> std::path::PathBuf {
@@ -354,6 +384,43 @@ mod tests {
         assert_eq!(find_with_pathext(&dir.join("missing"), PATHEXT), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bare_name_is_the_first_file_on_path_that_pathext_completes() {
+        let first = a_dir_with("resolve-first", &["agent.CMD"]);
+        let second = a_dir_with("resolve-second", &["agent.EXE", "other.EXE"]);
+        let path = std::env::join_paths([&first, &second]).expect("the directories join");
+        let pathext = std::ffi::OsStr::new(".EXE;.CMD");
+
+        assert_eq!(
+            resolve_program("agent", Some(&path), Some(pathext)),
+            first.join("agent.CMD"),
+            "the directory order decides, then the extension order"
+        );
+        assert_eq!(
+            resolve_program("other", Some(&path), Some(pathext)),
+            second.join("other.EXE")
+        );
+        assert_eq!(
+            resolve_program("missing", Some(&path), Some(pathext)),
+            std::path::PathBuf::from("missing"),
+            "what is found nowhere is left for the start to fail on"
+        );
+        assert_eq!(
+            resolve_program("agent", Some(&path), None),
+            second.join("agent.EXE"),
+            "without PATHEXT only .EXE is tried"
+        );
+        let given = first.join("agent");
+        assert_eq!(
+            resolve_program(&given.to_string_lossy(), None, Some(pathext)),
+            first.join("agent.CMD"),
+            "a path is completed where it points, whatever PATH says"
+        );
+
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
     }
 
     #[test]

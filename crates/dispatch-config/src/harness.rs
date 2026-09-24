@@ -273,18 +273,32 @@ impl HarnessDef {
         Some(TaskRun { launch, input })
     }
 
-    /// Why this harness's one-shot form must not run on `os`, if it must not.
+    /// Why this harness's one-shot form must not run on `os`, if it must not,
+    /// judged as [`HarnessDef::task_refusal_as`] judges it, on the harness's
+    /// own launch with this process's environment beneath it.
+    #[must_use]
+    pub fn task_refusal_for(&self, os: &str) -> Option<String> {
+        self.task_refusal_as(os, &self.launch_for(os))
+    }
+
+    /// Why this harness's one-shot form must not start as `launch` on `os`,
+    /// if it must not.
     ///
     /// A form that puts the task on `cmd.exe`'s command line lets the task's
     /// `&`, `|` and `%VAR%` run as commands. The harness file is the user's
     /// and may predate Dispatch knowing that, so such a form is refused with
-    /// a way out rather than run.
+    /// a way out rather than run. What decides is the file Windows would
+    /// start: `cmd.exe` named outright, or a command that `launch`'s `PATH`
+    /// and `PATHEXT` turn into a batch file -- `claude` found as
+    /// `claude.cmd` -- which Windows runs through `cmd.exe` all the same. So
+    /// `launch` is the run as it will start, environment and all; variables
+    /// it does not set are this process's, as the child's will be.
     ///
-    /// So is a form that reads its task from a file and names `{task}` too,
-    /// everywhere: nothing fills that in, so the agent would be handed the
-    /// placeholder itself.
+    /// A form that reads its task from a file and names `{task}` too is
+    /// refused everywhere: nothing fills that in, so the agent would be
+    /// handed the placeholder itself.
     #[must_use]
-    pub fn task_refusal_for(&self, os: &str) -> Option<String> {
+    pub fn task_refusal_as(&self, os: &str, launch: &Launch) -> Option<String> {
         let (args, input) = self.task_form_for(os)?;
         let names_the_task = args.iter().any(|arg| arg.contains("{task}"));
 
@@ -299,19 +313,28 @@ impl HarnessDef {
             ));
         }
 
-        if os != "windows" {
+        if os != "windows" || input != TaskInput::Argument || !names_the_task {
             return None;
         }
-        let on_the_command_line = input == TaskInput::Argument && names_the_task;
-        if !on_the_command_line || !runs_through_cmd(&self.launch_for(os).command) {
-            return None;
-        }
+        let through = if runs_through_cmd(&launch.command) {
+            String::new()
+        } else {
+            let found = found_as(launch);
+            if !runs_through_cmd(&found.to_string_lossy()) {
+                return None;
+            }
+            format!(
+                " ({} is {}, a batch file, which Windows runs through cmd.exe)",
+                launch.command,
+                found.display()
+            )
+        };
 
         Some(format!(
-            "harness {id:?} would put the task on cmd.exe's command line, where characters \
-             like & and % run as commands. In {id}.toml, under [task.platform.windows] (add \
-             that table if there is none), set input = \"file\" and put \
-             \"<%{TASK_FILE_ENV}%\" where \"{{task}}\" was: args = [..., \
+            "harness {id:?} would put the task on cmd.exe's command line{through}, where \
+             characters like & and % run as commands. In {id}.toml, under \
+             [task.platform.windows] (add that table if there is none), set input = \"file\" \
+             and put \"<%{TASK_FILE_ENV}%\" where \"{{task}}\" was: args = [..., \
              \"<%{TASK_FILE_ENV}%\"]. For a harness Dispatch ships, deleting {id}.toml \
              brings back the current one instead. Then restart the daemon",
             id = self.id
@@ -328,6 +351,28 @@ impl HarnessDef {
             None => (&form.args, form.input),
         })
     }
+}
+
+/// The file Windows would start for `launch`: its command, looked for on its
+/// `PATH` and completed with its `PATHEXT` exactly as the spawn does.
+///
+/// A variable `launch` sets wins, matched as Windows matches names, without
+/// regard to case; one it does not set is this process's, which the child
+/// inherits.
+fn found_as(launch: &Launch) -> std::path::PathBuf {
+    let variable = |name: &str| {
+        launch
+            .env
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| std::ffi::OsString::from(value))
+            .or_else(|| std::env::var_os(name))
+    };
+    dispatch_os::pty::resolve_program(
+        &launch.command,
+        variable("PATH").as_deref(),
+        variable("PATHEXT").as_deref(),
+    )
 }
 
 /// Whether `command` runs through `cmd.exe`: the program itself, or a batch

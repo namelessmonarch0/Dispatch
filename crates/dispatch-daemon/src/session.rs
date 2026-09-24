@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
-use dispatch_config::{DelegationLimits, HarnessRegistry, TaskInput};
+use dispatch_config::{DelegationLimits, HarnessRegistry, TaskInput, TaskRun};
 use dispatch_core::{PaneId, PaneStatus, Project, ProjectId, ProjectSource, RequestId};
 use dispatch_os::ipc::{Closer, Connection, Listener};
 use dispatch_proto::{
@@ -894,6 +894,28 @@ impl Daemon {
         env
     }
 
+    /// The one-shot run of `task` under `harness`, with the environment pane
+    /// `pane` would start with, or `None` when the harness has no one-shot
+    /// form for this platform.
+    ///
+    /// One place builds it, so what is judged before a run starts is what
+    /// starts.
+    fn task_run(&self, harness: &str, task: &str, pane: PaneId) -> Option<TaskRun> {
+        let mut run = self.harnesses.get(harness)?.task_launch(task)?;
+        for (key, value) in self.pane_env(pane) {
+            run.launch.env.entry(key).or_insert(value);
+        }
+        Some(run)
+    }
+
+    /// Why `run` must not start, if the form it came from puts the task where
+    /// a shell parses it.
+    fn unsafe_task_form(&self, harness: &str, run: &TaskRun) -> Option<String> {
+        self.harnesses
+            .get(harness)?
+            .task_refusal_as(std::env::consts::OS, &run.launch)
+    }
+
     /// Refuses, approves, or asks about a request to delegate.
     fn delegate_request(
         &mut self,
@@ -927,12 +949,16 @@ impl Daemon {
             harness
         };
 
+        // Built as `approve` will build it, environment and all: which file a
+        // bare command names depends on `PATH`. The pane id is a stand-in,
+        // since nothing is judged by it.
+        let run = self.task_run(&harness, &task, PaneId::new());
+
         // A form that would put the task on cmd.exe's command line is refused
         // whatever the caps say: approving it would not make it safe.
-        if let Some(reason) = self
-            .harnesses
-            .get(&harness)
-            .and_then(|def| def.task_refusal_for(std::env::consts::OS))
+        if let Some(reason) = run
+            .as_ref()
+            .and_then(|run| self.unsafe_task_form(&harness, run))
         {
             tracing::info!(%parent, %harness, %reason, "refused an unsafe task form");
             self.resolve(request, caller, DelegateOutcome::Refused { reason });
@@ -945,10 +971,7 @@ impl Daemon {
         // harness with `[task]` but an empty argument list has no form either,
         // and asking the user about it only to refuse it after they approve is
         // worse than refusing up front.
-        let has_task_form = self
-            .harnesses
-            .get(&harness)
-            .is_some_and(|def| def.task_launch(&task).is_some());
+        let has_task_form = run.is_some();
 
         if let Some(reason) =
             crate::delegation::refusal(depth, live, self.limits, has_task_form, &harness)
@@ -1060,10 +1083,8 @@ impl Daemon {
             return;
         };
 
-        let run = self
-            .harnesses
-            .get(harness)
-            .and_then(|def| def.task_launch(task));
+        let id = PaneId::new();
+        let run = self.task_run(harness, task, id);
 
         // Asked again here, and not only when the request arrived: several
         // requests can each see a free slot while they wait, and every one
@@ -1092,12 +1113,7 @@ impl Daemon {
             return;
         };
 
-        let id = PaneId::new();
         let mut launch = run.launch;
-        for (key, value) in self.pane_env(id) {
-            launch.env.entry(key).or_insert(value);
-        }
-
         let task_file = match run.input {
             TaskInput::Argument => None,
             TaskInput::File => match TaskFile::write(&self.task_dir, request, task) {
