@@ -1096,6 +1096,18 @@ impl Daemon {
         let id = PaneId::new();
         let run = self.task_run(harness, task, id);
 
+        // Judged again on the run that is about to start, as the request
+        // was when it arrived: which file a bare command names is decided
+        // by the filesystem now, not then.
+        if let Some(reason) = run
+            .as_ref()
+            .and_then(|run| self.unsafe_task_form(harness, run))
+        {
+            tracing::info!(%parent, %harness, %reason, "refused an unsafe task form on approval");
+            self.resolve(request, caller, DelegateOutcome::Refused { reason });
+            return;
+        }
+
         // Asked again here, and not only when the request arrived: several
         // requests can each see a free slot while they wait, and every one
         // of them would start on approval. The cap is on what runs, so it is
