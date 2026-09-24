@@ -47,6 +47,16 @@ impl std::fmt::Debug for PtyProcess {
     }
 }
 
+/// Whether a pseudoterminal's output has to be read to its end, even once
+/// nobody wants it, for the pseudoterminal to finish closing.
+///
+/// On Windows it does: before Windows 11 24H2, closing a pseudoconsole waits
+/// until what it still has to say has been read. On Unix a reader that kept
+/// on would instead hold the terminal open for as long as anything holds its
+/// other side -- a process that left the pane's session, say -- so there a
+/// reader stops as soon as nobody wants what it reads.
+pub const OUTPUT_OUTLIVES_ITS_READER: bool = cfg!(windows);
+
 /// A pseudoterminal. Dropping it ends it.
 pub struct Terminal(imp::Terminal);
 

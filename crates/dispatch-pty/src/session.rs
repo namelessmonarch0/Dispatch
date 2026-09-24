@@ -476,9 +476,13 @@ fn drain_from(events: &Receiver<PtyEvent>, budget: usize) -> Drained {
 
 /// Reads the pseudoterminal until end-of-file, forwarding bytes.
 ///
-/// Reads on after the pane has gone, dropping what arrives: on Windows the
-/// pseudoconsole only finishes closing once its output pipe is drained, so a
-/// reader that stopped would leave that close waiting forever.
+/// Once the pane has gone, what happens depends on the platform (see
+/// [`dispatch_os::pty::OUTPUT_OUTLIVES_ITS_READER`]). On Windows it reads
+/// on, dropping what arrives: the pseudoconsole only finishes closing once
+/// its output pipe is drained, so a reader that stopped would leave that
+/// close waiting forever. On Unix it stops, letting go of its end of the
+/// terminal: reading on would keep that end open for as long as something
+/// that outlived the pane still holds the other.
 fn spawn_reader(mut reader: Box<dyn Read + Send>, tx: SyncSender<PtyEvent>) {
     std::thread::spawn(move || {
         // Large enough that a burst of output is a few reads rather than
@@ -491,6 +495,9 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, tx: SyncSender<PtyEvent>) {
                 Ok(0) => break,
                 Ok(n) => {
                     if delivering && tx.send(PtyEvent::Output(buf[..n].to_vec())).is_err() {
+                        if !dispatch_os::pty::OUTPUT_OUTLIVES_ITS_READER {
+                            break;
+                        }
                         delivering = false;
                     }
                 }
