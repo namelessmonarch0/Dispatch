@@ -3416,6 +3416,64 @@ fn a_task_redirected_by_a_posix_shell_reaches_the_agent_exactly() {
 }
 
 #[test]
+fn a_file_form_that_also_names_the_task_is_refused_before_anyone_is_asked() {
+    // On every platform: a file form fills nothing in, so its `{task}` would
+    // reach the agent as those six characters.
+    let dir = TempDir::new("mixed-form");
+    let harness_dir = dir.0.join("harnesses");
+    let _ = harnesses(&harness_dir);
+    std::fs::write(
+        harness_dir.join("mixed.toml"),
+        "id = \"mixed\"\ndisplay_name = \"Mixed\"\ncommand = \"agent\"\n\n\
+         [task]\nargs = [\"-p\", \"{task}\"]\ninput = \"file\"\n",
+    )
+    .expect("temp dir is writable");
+
+    let registry = HarnessRegistry::load_from_dir(&harness_dir).expect("loading succeeds");
+    let mut daemon = Daemon::new(registry, "test-device");
+    daemon.set_task_dir(dir.0.join("tasks"));
+    let project =
+        daemon.open_project(dispatch_os::paths::resolve(&dir.0).expect("the temp dir resolves"));
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(
+        9,
+        ClientMessage::DelegateRequest {
+            parent,
+            harness: "mixed".into(),
+            task: "anything".into(),
+            size: (80, 24),
+        },
+    );
+
+    let told = outcomes(&drain(&caller));
+    assert!(
+        told.iter().any(|o| matches!(
+            o,
+            DelegateOutcome::Refused { reason } if reason.contains("mixed.toml") && reason.contains("{task}")
+        )),
+        "the caller is told which file to fix: {told:?}"
+    );
+    assert!(
+        pending(&drain(&ui)).is_none(),
+        "nobody is asked to approve it"
+    );
+    assert_eq!(daemon.pane_count(), 1, "nothing started");
+}
+
+#[test]
 #[cfg_attr(
     not(windows),
     ignore = "the refusal is for cmd.exe, which only Windows has"

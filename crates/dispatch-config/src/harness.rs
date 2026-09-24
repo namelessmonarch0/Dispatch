@@ -279,15 +279,30 @@ impl HarnessDef {
     /// `&`, `|` and `%VAR%` run as commands. The harness file is the user's
     /// and may predate Dispatch knowing that, so such a form is refused with
     /// a way out rather than run.
+    ///
+    /// So is a form that reads its task from a file and names `{task}` too,
+    /// everywhere: nothing fills that in, so the agent would be handed the
+    /// placeholder itself.
     #[must_use]
     pub fn task_refusal_for(&self, os: &str) -> Option<String> {
+        let (args, input) = self.task_form_for(os)?;
+        let names_the_task = args.iter().any(|arg| arg.contains("{task}"));
+
+        if input == TaskInput::File && names_the_task {
+            return Some(format!(
+                "harness {id:?} reads its task from a file (input = \"file\") but its args \
+                 also name \"{{task}}\", which a file form never fills in. A file form reads \
+                 the task from %{TASK_FILE_ENV}% on Windows or \"${TASK_FILE_ENV}\" elsewhere \
+                 and must not name {{task}}: remove it from the args in {id}.toml and restart \
+                 the daemon",
+                id = self.id
+            ));
+        }
+
         if os != "windows" {
             return None;
         }
-
-        let (args, input) = self.task_form_for(os)?;
-        let on_the_command_line =
-            input == TaskInput::Argument && args.iter().any(|arg| arg.contains("{task}"));
+        let on_the_command_line = input == TaskInput::Argument && names_the_task;
         if !on_the_command_line || !runs_through_cmd(&self.launch_for(os).command) {
             return None;
         }

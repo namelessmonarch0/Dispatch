@@ -630,6 +630,34 @@ fn an_edited_built_in_from_an_older_release_is_left_alone() {
 }
 
 #[test]
+fn a_file_form_that_also_names_the_task_is_refused_everywhere() {
+    // A file form fills in nothing, so `{task}` would reach the agent as
+    // those six characters: a form that cannot mean what it says.
+    let def: HarnessDef = toml::from_str(
+        "id = \"mixed\"\ndisplay_name = \"Mixed\"\ncommand = \"agent\"\n\n\
+         [task]\nargs = [\"-p\", \"{task}\"]\ninput = \"file\"\n",
+    )
+    .expect("the definition parses");
+
+    for os in ["linux", "macos", "windows"] {
+        let reason = def
+            .task_refusal_for(os)
+            .unwrap_or_else(|| panic!("the form is refused on {os}"));
+        for needed in [
+            "mixed.toml",
+            "{task}",
+            "%DISPATCH_TASK_FILE%",
+            "$DISPATCH_TASK_FILE",
+        ] {
+            assert!(
+                reason.contains(needed),
+                "{os}: {needed:?} is missing from: {reason}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_batch_file_named_as_the_command_puts_the_task_on_cmds_command_line_too() {
     // Windows runs a .cmd or .bat through cmd.exe whatever starts it, so a
     // task in its arguments is parsed exactly as it would be after `/c`.
