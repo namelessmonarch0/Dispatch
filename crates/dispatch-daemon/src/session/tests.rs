@@ -2534,16 +2534,10 @@ fn a_client_that_never_reads_costs_no_more_than_its_budget() {
 #[test]
 #[cfg(unix)]
 fn a_client_that_stops_reading_is_hung_up_and_can_come_back() {
-    // Bigger than the in-process test's budget: this client is read over a
-    // real socket by a thread the daemon does not step in lock with, unlike
-    // `daemon.tick()` there, and `flood` can outrun a fresh reader's first
-    // few ticks before its writer thread gets scheduled at all. Still far
-    // below the crate's own default, and the never-reading client below
-    // still overruns it in well under a second.
     let served = served(
         "stop-read",
         Budgets {
-            outbox_bytes: 4 * 1024 * 1024,
+            outbox_bytes: 256 * 1024,
             ..Budgets::default()
         },
     );
@@ -2577,4 +2571,108 @@ fn a_client_that_stops_reading_is_hung_up_and_can_come_back() {
         "the reconnected client is told about the pane"
     );
     assert!(output_bytes(&seen) > 0, "and replayed what it printed");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_late_subscriber_is_not_hung_up_for_the_replay_it_asked_for() {
+    // Small enough that a single pane's full history is several times
+    // over it -- the point of the test is that the replay is not judged
+    // against this budget at all.
+    const BUDGET: usize = 64 * 1024;
+    let (mut daemon, project, _dir) = daemon("late-subscribe");
+    daemon.set_budgets(Budgets {
+        outbox_bytes: BUDGET,
+        ..Budgets::default()
+    });
+
+    // A reading client keeps the flood's output moving so pump_panes keeps
+    // draining it, until the pane's history -- replayed whole to whoever
+    // subscribes next -- is full.
+    let producer = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    daemon.request_for_test(
+        1,
+        ClientMessage::SpawnPane {
+            project,
+            harness: "flood".into(),
+            size: (80, 24),
+        },
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut delivered = 0;
+    while delivered < 256 * 1024 {
+        assert!(
+            Instant::now() < deadline,
+            "the flood did not fill the pane's history ({delivered} bytes)"
+        );
+        daemon.tick();
+        delivered += output_bytes(&drain(&producer));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Subscribing now asks for that whole history in one reply -- many
+    // times the live-traffic budget above. It must be delivered rather
+    // than refused: it is what was asked for, not live traffic.
+    let subscriber = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+
+    // Reading in lock-step, like any subscribed client, it goes on being
+    // sent live output well past the live-traffic budget above -- proving
+    // the replay it was just handed did not eat into it -- and is never
+    // hung up.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut total = 0;
+    while total < 3 * BUDGET {
+        assert!(
+            Instant::now() < deadline,
+            "the subscriber stopped receiving output ({total} bytes)"
+        );
+        daemon.tick();
+        total += output_bytes(&drain(&subscriber));
+        assert!(
+            !matches!(
+                subscriber.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "the daemon hung up on a client that was reading"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_client_that_never_reads_its_own_replies_is_hung_up() {
+    // Small enough that a loop of tiny replies -- nothing the fleet
+    // produced on its own -- passes it well within a handful of iterations.
+    const BUDGET: usize = 2 * 1024;
+    let (mut daemon, _project, _dir) = daemon("never-reads-replies");
+    daemon.set_budgets(Budgets {
+        outbox_bytes: BUDGET,
+        ..Budgets::default()
+    });
+
+    let inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+
+    // Never drained: every `Pong` piles up in what this client asked for,
+    // which is bounded too -- or a client could grow its queue forever just
+    // by asking, without the fleet doing anything at all.
+    for token in 0..500 {
+        daemon.request_for_test(1, ClientMessage::Ping { token });
+    }
+
+    // Whatever was queued before the hang-up is still there to read; once
+    // it runs out, the channel is gone rather than merely empty.
+    let _ = drain(&inbox);
+    assert!(
+        matches!(
+            inbox.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ),
+        "a client that never read its own replies should have been hung up"
+    );
 }

@@ -447,9 +447,7 @@ impl Daemon {
                     existing.push(pending.announcement.clone());
                 }
 
-                for message in existing {
-                    self.send(id, message);
-                }
+                self.send_batch(id, existing);
             }
 
             ClientMessage::OpenProject { root } => self.open_project_for(id, root),
@@ -1322,16 +1320,42 @@ impl Daemon {
 
     /// Sends to one client.
     ///
-    /// Not counted against the client's budget: this is what it asked for.
+    /// Not judged against the client's live-traffic budget: this is what it
+    /// asked for. See [`Self::send_batch`], of which this is the one-message
+    /// case.
     fn send(&mut self, id: ClientId, message: ServerMessage) {
+        self.send_batch(id, vec![message]);
+    }
+
+    /// Sends every message in `messages` to one client, as a single reply.
+    ///
+    /// `ClientMessage::Subscribe`'s whole catch-up goes through here in one
+    /// call: checked once, against the asked-for backlog already waiting,
+    /// rather than once per message, so a reply that clears the check is
+    /// delivered whole -- never split or refused partway through by its own
+    /// bulk. A client that keeps asking for things without ever reading the
+    /// answers is hung up all the same, just like one that falls behind on
+    /// live traffic.
+    fn send_batch(&mut self, id: ClientId, messages: Vec<ServerMessage>) {
         let Some(client) = self.clients.get(&id) else {
             return;
         };
 
-        // A failed send means the writer thread is gone, so the client has
-        // disconnected and should be forgotten rather than retried.
-        if client.outbox.send(message).is_err() {
-            self.clients.remove(&id);
+        match client.outbox.send_all(messages, self.budgets.outbox_bytes) {
+            Ok(()) => {}
+            // A failed send means the writer thread is gone, so the client
+            // has disconnected and should be forgotten rather than retried.
+            Err(Refused::Gone) => {
+                self.clients.remove(&id);
+            }
+            Err(Refused::Behind { queued }) => {
+                tracing::warn!(
+                    client = id,
+                    queued,
+                    "hanging up on a client that is behind on what it asked for"
+                );
+                self.hang_up(id);
+            }
         }
     }
 

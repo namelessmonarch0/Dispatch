@@ -9,11 +9,14 @@ use std::time::Duration;
 /// everyone else's view of the fleet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budgets {
-    /// Bytes of the fleet's own traffic that may wait for one client before
-    /// it is hung up on.
+    /// Bytes of the fleet's own traffic -- output, statuses, prompts -- that
+    /// may wait for one client before it is hung up on.
     ///
-    /// Far above what a reading client ever has queued, far below what an
-    /// agent printing for an afternoon produces.
+    /// Judges only what the fleet does on its own, never what a client asked
+    /// for: an answer, or the replay a `Subscribe` begins with, is bounded
+    /// separately and delivered whole. Far above what a reading client ever
+    /// has queued, far below what an agent printing for an afternoon
+    /// produces.
     pub outbox_bytes: usize,
     /// How long a client may take to say `Hello`.
     ///
