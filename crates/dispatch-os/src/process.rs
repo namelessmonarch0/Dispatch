@@ -47,8 +47,10 @@ pub const DEFAULT_GRACE: Duration = Duration::from_millis(250);
 /// [`spawn_contained`]). A local `dispatchd --stdio` bridge is contained, as
 /// every command transport is, and the daemon it starts owns agents that
 /// must outlive the transport. On Windows a job that forbids leaving it --
-/// a CI runner's, an OpenSSH session's -- keeps the daemon in; it is started
-/// there all the same, and a warning says it will end with that job.
+/// a CI runner's, an OpenSSH session's -- keeps the daemon in, and the
+/// daemon ends with that job. Only when that is the starter's own job does
+/// Windows refuse, and a warning say so; one further out lets the daemon
+/// leave the jobs inside it and keeps it without a word.
 ///
 /// Its output goes nowhere: a daemon logs to a file, and anything it printed
 /// would land in the middle of the client's interface.
@@ -123,9 +125,10 @@ pub(crate) fn wait_for_tree(pid: u32) {
 /// On Unix the child leads a session of its own, so its pid names a process
 /// group every descendant stays in unless it leaves on purpose. On Windows it
 /// is created suspended, put in a Job Object of its own, and only then
-/// resumed: it cannot start anything outside the job, because it starts
-/// nothing before it is in it. Any creation flags already set on `command`
-/// are replaced on Windows.
+/// resumed: it starts nothing before it is in the job, so everything it
+/// starts is in it too, and leaves only by asking to
+/// (`CREATE_BREAKAWAY_FROM_JOB`, as [`spawn_detached`] starts a daemon).
+/// Any creation flags already set on `command` are replaced on Windows.
 ///
 /// Every process started this way is to be ended with [`terminate_tree`] --
 /// or signalled, waited for, and its rest waited for, as a command
