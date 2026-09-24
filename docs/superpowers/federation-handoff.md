@@ -63,15 +63,20 @@ added.
 
 Ordered by how much they would hurt on a real fleet.
 
-1. **Windows `process::terminate_tree` only calls `TerminateProcess` on the one
-   handle**, despite a comment about job objects. Pre-existing, but F2a's
-   command transport now *depends* on tree termination — an `ssh.exe` with
-   children would outlive a dropped connection there. Must be looked at before
-   any Windows fleet.
+1. ~~**Windows `process::terminate_tree` only calls `TerminateProcess` on the
+   one handle.**~~ Fixed on the `audit-remediation` branch (audit A03): panes
+   and command transports are created suspended inside a Job Object, and
+   `terminate_tree` ends the job.
 2. **Reaping a group whose child is a zombie the parked reader still holds**
-   returns EPERM on macOS, so an ordinary disconnect logs `failed to stop the
-   process behind a dial` — noise, not a leak. On Linux the same shape costs a
-   bounded ~2s inside `Client::drop` over a command dial.
+   returns EPERM on macOS. Partly addressed on `audit-remediation`: the
+   Linux half — the bounded ~2s cost inside `Client::drop` over a command
+   dial — is fixed (`03e6c77`, `crates/dispatch-os/src/ipc.rs`'s `reap` now
+   signals, waits for the leader, and only then waits for the rest of the
+   tree). The macOS EPERM case still happens, but the disconnect it used to
+   log at `warn` (`failed to stop the process behind a dial`, in
+   `dispatch-client`) moved to `dispatch-os`'s `Closer::close` and dropped to
+   `debug` (`failed to end a command transport`, `c292c86`), so an ordinary
+   disconnect no longer logs it as a warning.
 3. **Focus after a reconnect replay** lands on the last pane the daemon
    replayed rather than the one the user was in (`state.rs` focuses every
    replayed pane while its project is selected). Invisible with one pane.
@@ -81,9 +86,11 @@ Ordered by how much they would hurt on a real fleet.
    field, so two machines failing close together still leave only the last
    writer's line on screen. `--daemon` and `--daemon-command` have the same
    shape.
-5. **`StderrHint::first_line` is read after a bounded 50ms poll.** A command
-   that dies slower than that still reports the bare error. Lengthening the
-   wait trades a failing attach's latency for a better message.
+5. **`StderrHint::first_line` is read after a bounded 250ms poll** (raised
+   from 50ms on `audit-remediation`, `5d799d1`, `dispatch-client`'s
+   `HINT_PATIENCE`). A command that dies slower than that still reports the
+   bare error. Lengthening the wait further trades more of a failing
+   attach's latency for a better message.
 6. **Remote directory browsing.** `^a o` on a remote machine takes a typed
    path; the browser would need protocol messages that list a remote
    directory.

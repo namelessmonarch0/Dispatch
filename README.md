@@ -38,6 +38,13 @@ rustup target add x86_64-pc-windows-gnu
 cargo build --workspace --target x86_64-pc-windows-gnu
 ```
 
+## Security model
+
+One daemon serves one operating-system user, and anything that can reach
+its socket can do anything a client can. Delegation approval keeps
+well-meaning agents in check; it is not a sandbox for untrusted ones. See
+[docs/security-model.md](docs/security-model.md).
+
 ## Layout
 
 | Crate | Responsibility |
