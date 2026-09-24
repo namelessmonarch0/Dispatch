@@ -85,7 +85,7 @@ impl IpcError {
 /// trusted. Kept out of the platform code so that every platform's tests
 /// exercise the decision, not only Windows'.
 #[cfg(any(windows, test))]
-fn trust_owner(endpoint: &str, owner: &str, me: &str) -> Result<(), IpcError> {
+pub(crate) fn trust_owner(endpoint: &str, owner: &str, me: &str) -> Result<(), IpcError> {
     if owner == me {
         return Ok(());
     }

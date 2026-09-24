@@ -162,8 +162,9 @@ pub fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
 /// and refused if another user does, since whoever owns a directory decides
 /// what happens to the files in it. A link where the directory should be is
 /// refused outright, never followed. On Windows a new one gets a protected
-/// DACL admitting this user alone; one that exists is left as it is, since
-/// each file in it is made private on its own.
+/// DACL admitting this user alone; one that exists is used if it is a plain
+/// directory this user owns -- not a junction or a link -- and its access
+/// list left as it is, since each file in it is made private on its own.
 pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -228,6 +229,7 @@ mod private {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_REPARSE_POINT,
     };
 
     use crate::owner_only::OwnerOnly;
@@ -269,8 +271,13 @@ mod private {
         Ok(unsafe { std::fs::File::from_raw_handle(handle as _) })
     }
 
-    /// Created with its descriptor; one that already exists is left alone.
+    /// Created with its descriptor. One that already exists is used only if
+    /// it is a plain directory -- not a junction or a link, whose target is
+    /// somebody's choice -- that this user owns; its access list is left as
+    /// it is, since each file in it is made private on its own.
     pub(super) fn create_dir(path: &Path) -> std::io::Result<()> {
+        use std::os::windows::fs::MetadataExt;
+
         let security = OwnerOnly::new()?;
         let attributes = security.attributes();
         let name = wide(path);
@@ -280,11 +287,47 @@ mod private {
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) && path.is_dir() {
-            return Ok(());
+        if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
+            return Err(error);
         }
-        Err(error)
+
+        // Read without following a reparse point, so a junction is seen as
+        // one.
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} is not a directory of Dispatch's own: it is a junction, a link or a file",
+                    path.display()
+                ),
+            ));
+        }
+
+        let owner = crate::owner_only::owner_of_path(path)?;
+        let me = crate::owner_only::current_user_sid()?;
+        super::trust_dir_owner(path, &owner, &me)
     }
+}
+
+/// Refuses `path`, a task directory, unless `owner`, its owner's SID, is
+/// `me`.
+///
+/// The same decision the pipe client makes about the daemon's pipe
+/// ([`crate::ipc`]'s `trust_owner`), for the same reason: a directory
+/// another account made first is theirs to read and rearrange. Kept out of
+/// the platform code so every platform's tests exercise it.
+#[cfg(any(windows, test))]
+fn trust_dir_owner(path: &Path, owner: &str, me: &str) -> std::io::Result<()> {
+    crate::ipc::trust_owner(&path.display().to_string(), owner, me).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is owned by {owner}, not by this user; not writing tasks there",
+                path.display()
+            ),
+        )
+    })
 }
 
 /// `path` as a shell's `<` needs it in the variable that names it.
@@ -553,6 +596,23 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o755, "the link's target was changed");
+    }
+
+    #[test]
+    fn a_task_directory_another_account_owns_is_refused() {
+        // Whoever owns a directory decides what happens to the files in it.
+        let dir = Path::new(r"C:\Users\ada\AppData\Local\dispatch\data\tasks");
+        let me = "S-1-5-21-1-2-3-1001";
+
+        trust_dir_owner(dir, me, me).expect("this user's own directory is used");
+
+        let refused = trust_dir_owner(dir, "S-1-5-18", me)
+            .expect_err("a directory LocalSystem owns is not this user's");
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            refused.to_string().contains("S-1-5-18") && refused.to_string().contains("tasks"),
+            "the refusal says whose it is and which: {refused}"
+        );
     }
 
     #[test]

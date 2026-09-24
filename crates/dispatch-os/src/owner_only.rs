@@ -153,6 +153,55 @@ pub(crate) unsafe fn sid_string(sid: PSID) -> std::io::Result<String> {
     Ok(string)
 }
 
+/// The SID of whoever owns the file or directory at `path`, as a string.
+pub(crate) fn owner_of_path(path: &std::path::Path) -> std::io::Result<String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide` is NUL-terminated and outlives the call; every
+    // out-pointer is valid; on success `descriptor` is LocalAlloc'd and
+    // `owner` points into it.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
+    }
+
+    let sid = if owner.is_null() {
+        Err(std::io::Error::other(format!(
+            "{} has no owner",
+            path.display()
+        )))
+    } else {
+        // SAFETY: `owner` is a SID inside `descriptor`, which is freed only
+        // below.
+        unsafe { sid_string(owner) }
+    };
+    // SAFETY: allocated by GetNamedSecurityInfoW, freed exactly once, and
+    // `owner` is not read after this.
+    unsafe { LocalFree(descriptor as HLOCAL) };
+    sid
+}
+
 /// `ACCESS_ALLOWED_ACE_TYPE`, as the `u8` an ACE header carries.
 #[cfg(test)]
 pub(crate) const ACCESS_ALLOWED: u8 =
