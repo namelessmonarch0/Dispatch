@@ -2676,3 +2676,101 @@ fn a_client_that_never_reads_its_own_replies_is_hung_up() {
         "a client that never read its own replies should have been hung up"
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn a_refused_client_is_told_why_before_the_connection_ends() {
+    let served = served("refuse-why", Budgets::default());
+
+    let (mut reader, mut writer) = raw_client(&served.endpoint);
+    Frame::write(
+        &mut writer,
+        &ClientMessage::Hello {
+            version: dispatch_proto::Version {
+                major: 99,
+                minor: 0,
+            },
+            client: "from the future".into(),
+            role: dispatch_proto::Role::Interface,
+        },
+    )
+    .expect("writing succeeds");
+
+    // The reason arrives first...
+    let reason = Frame::read::<_, ServerMessage>(&mut reader)
+        .expect("the daemon answers with why before closing");
+    assert!(
+        matches!(
+            reason,
+            ServerMessage::Error {
+                error: ProtocolError::IncompatibleVersion { .. }
+            }
+        ),
+        "expected an IncompatibleVersion error, got {reason:?}"
+    );
+
+    // ...and only then does the connection itself end, rather than an
+    // immediate close racing the write of the refusal and the peer seeing
+    // a bare disconnect instead.
+    let (done, ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(Frame::read::<_, ServerMessage>(&mut reader).is_err());
+    });
+    assert!(
+        ended.recv_timeout(Duration::from_secs(2)).unwrap_or(false),
+        "the connection did not end after the refusal"
+    );
+}
+
+/// Same guarantee as the test above, under real contention.
+///
+/// One connection at a time essentially never catches the race a review
+/// found in `hang_up`'s immediate close: the write of a small refusal all
+/// but always wins against a freshly spawned thread. A handful refused at
+/// once give the daemon's per-connection close threads real scheduler
+/// contention to race the writer threads under, which reliably does catch
+/// it (more at once risks the transport's own connection-pairing limits
+/// instead, which are not what this is testing).
+#[test]
+#[cfg(unix)]
+fn many_refused_clients_are_all_told_why_before_the_connection_ends() {
+    let served = std::sync::Arc::new(served("refuse-many", Budgets::default()));
+
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            let served = std::sync::Arc::clone(&served);
+            std::thread::spawn(move || {
+                let (mut reader, mut writer) = raw_client(&served.endpoint);
+                Frame::write(
+                    &mut writer,
+                    &ClientMessage::Hello {
+                        version: dispatch_proto::Version {
+                            major: 99,
+                            minor: 0,
+                        },
+                        client: "from the future".into(),
+                        role: dispatch_proto::Role::Interface,
+                    },
+                )
+                .expect("writing succeeds");
+
+                let reason = Frame::read::<_, ServerMessage>(&mut reader);
+                assert!(
+                    matches!(
+                        reason,
+                        Ok(ServerMessage::Error {
+                            error: ProtocolError::IncompatibleVersion { .. }
+                        })
+                    ),
+                    "connection {i}: expected an IncompatibleVersion error, got {reason:?}"
+                );
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e));
+    }
+}

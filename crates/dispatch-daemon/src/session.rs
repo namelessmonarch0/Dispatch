@@ -333,7 +333,7 @@ impl Daemon {
                     error: ProtocolError::Other("the connection must begin with a Hello".into()),
                 },
             );
-            self.hang_up(id);
+            self.refuse(id);
             return;
         }
 
@@ -355,7 +355,7 @@ impl Daemon {
                             },
                         },
                     );
-                    self.hang_up(id);
+                    self.refuse(id);
                     return;
                 }
 
@@ -1296,11 +1296,14 @@ impl Daemon {
         self.expire_requests();
     }
 
-    /// Forgets a client, ends its connection, and drops what it was waiting
-    /// on.
+    /// Forgets a client, ends its connection at once, and drops what it was
+    /// waiting on.
     ///
-    /// Closing is what lets its threads go: a writer parked on a client that
-    /// stopped reading, a reader forwarding frames nobody will act on.
+    /// For a client whose writer thread is stuck: past its budget, live or
+    /// asked-for, there is nothing more it can be told and nothing to wait
+    /// for, so the connection ends now rather than however long the write
+    /// the writer thread is blocked on would otherwise take to fail on its
+    /// own.
     ///
     /// `Closer::close` can block for up to about two seconds -- on Windows it
     /// keeps cancelling until nothing is left in flight on either pipe -- and
@@ -1309,12 +1312,33 @@ impl Daemon {
     /// one client's connection. So the client is forgotten first, then closed
     /// on a thread of its own that outlives this call, and only then is what
     /// it was waiting on dropped.
+    ///
+    /// Not for a refusal or a protocol violation, which has just queued the
+    /// message explaining why: see [`Self::refuse`], which lets that reach
+    /// the peer first.
     fn hang_up(&mut self, id: ClientId) {
         if let Some(client) = self.clients.remove(&id) {
             let closer = client.closer;
             std::thread::spawn(move || closer.close());
             tracing::info!(client = id, "hung up on a client");
         }
+        self.abandon(id);
+    }
+
+    /// Forgets a client and drops what it was waiting on, without touching
+    /// its connection.
+    ///
+    /// For a refusal or a protocol violation, sent as the `ServerMessage`
+    /// just queued ahead of this call: closing here -- immediately, as
+    /// [`Self::hang_up`] does for a client past its budget -- races that
+    /// write, and `Closer::close` can win it, so the peer would see a bare
+    /// disconnect instead of the reason. Forgetting the client only drops
+    /// this end's `Outbox`; the writer thread's own clone of the connection's
+    /// `Closer` is what ends it, once `Inbox::recv` returns `None` -- the
+    /// refusal delivered and nothing left queued -- or a write itself fails.
+    fn refuse(&mut self, id: ClientId) {
+        self.clients.remove(&id);
+        tracing::info!(client = id, "refused a client");
         self.abandon(id);
     }
 
@@ -1437,6 +1461,12 @@ fn spawn_client(
     events: &Sender<Event>,
 ) -> Result<(), dispatch_os::ipc::IpcError> {
     let closer = connection.closer();
+    // The writer thread gets its own clone: `Daemon::hang_up` closes the one
+    // in `Wiring` at once, for a client stuck mid-write, while this one ends
+    // the connection only once the writer has nothing left to deliver (or a
+    // write itself fails) -- the ordinary way a refusal reaches its peer
+    // before the connection does.
+    let writer_closer = closer.clone();
     let (mut reader, mut writer) = connection.split();
     let (outbox, inbox) = crate::outbox::pair();
 
@@ -1479,6 +1509,14 @@ fn spawn_client(
                 break;
             }
         }
+
+        // Reached once there is nothing left to deliver -- `Daemon::refuse`
+        // dropped the `Outbox` after queueing the reason, and this is what
+        // was queued -- or once a write above failed. Either way the
+        // connection is done with; `Daemon::hang_up` closes the other clone
+        // itself, immediately, for a client this thread is instead stuck
+        // mid-write to.
+        writer_closer.close();
     });
 
     Ok(())
