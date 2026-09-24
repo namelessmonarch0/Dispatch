@@ -3016,11 +3016,20 @@ fn a_seat_held_by_a_stuck_writer_is_freed_once_the_daemon_notices() {
     )
     .expect("writing succeeds");
 
+    // Long enough for the pane to spawn and flood the socket with output
+    // nothing here is draining, so the daemon's writer thread to this
+    // client is genuinely stuck mid-write -- not merely queued -- by the
+    // time the read half closes below. The default `outbox_bytes` (32 MiB)
+    // is left in place so that budget cannot hang the client up on its own
+    // first: what this test means to catch is the reader ending while the
+    // writer is still blocked on the OS socket, not the daemon's own
+    // live-traffic limit.
+    std::thread::sleep(Duration::from_secs(1));
+
     // Shuts down only the half the daemon reads from -- an ordinary
-    // disconnect to its reader thread -- while its writer, fed by a pane
-    // that never stops printing and never drained on this end, is left to
-    // block once the socket fills. Never reading from `reader` is what
-    // lets that happen; it stays open, not dropped, until the loop below no
+    // disconnect to its reader thread -- while its writer, blocked as
+    // above, is left mid-write. Never reading from `reader` is what keeps
+    // it that way; it stays open, not dropped, until the loop below no
     // longer needs it.
     drop(writer);
 
@@ -3073,4 +3082,109 @@ fn a_ready_client_left_idle_past_its_budgets_is_still_served() {
     let answer: ServerMessage =
         Frame::read(&mut reader).expect("an idle, welcomed client is still served");
     assert!(matches!(answer, ServerMessage::Pong { token: 7 }));
+}
+
+/// Round 2, finding 1, assertion 2: pins the both-threads seat directly,
+/// independent of `Daemon::hang_up`. A client refused mid-flood is only
+/// forgotten by `Daemon::refuse`, which never closes its connection; its
+/// writer, already genuinely stuck delivering to it, is left running all
+/// the same, and its seat must stay held for exactly as long as that writer
+/// does -- not released early just because the client's reader, separately,
+/// has ended.
+#[test]
+#[cfg(unix)]
+fn a_seat_held_by_a_refused_clients_stuck_writer_is_not_released_early() {
+    let served = served(
+        "refused-stuck",
+        Budgets {
+            max_clients: 1,
+            ..Budgets::default()
+        },
+    );
+
+    let (reader, mut writer) = raw_client(&served.endpoint);
+    Frame::write(&mut writer, &hello()).expect("writing succeeds");
+    Frame::write(&mut writer, &ClientMessage::Subscribe).expect("writing succeeds");
+    Frame::write(
+        &mut writer,
+        &ClientMessage::SpawnPane {
+            project: served.project,
+            harness: "flood".into(),
+            size: (80, 24),
+        },
+    )
+    .expect("writing succeeds");
+
+    // Never read; long enough for the writer to genuinely block on the
+    // socket, same reasoning as the test above.
+    std::thread::sleep(Duration::from_secs(1));
+
+    // A second `Hello`, sent now that this client is already welcomed, is
+    // refused for its version -- `Daemon::refuse`, not `Daemon::hang_up`:
+    // it forgets the client but does not touch its connection, relying on
+    // the writer thread to end on its own once nothing is left queued or a
+    // write fails. A writer genuinely stuck mid-write does neither, which
+    // is exactly the shape that would let a reader-only seat free itself
+    // the moment the read half closes next, though nothing has actually
+    // ended.
+    Frame::write(
+        &mut writer,
+        &ClientMessage::Hello {
+            version: dispatch_proto::Version {
+                major: 99,
+                minor: 0,
+            },
+            client: "future".into(),
+            role: dispatch_proto::Role::Interface,
+        },
+    )
+    .expect("writing succeeds");
+    drop(writer);
+
+    // Closing only the read half does not touch the OS-level write the
+    // daemon's writer is blocked on, so the seat must still be held: no
+    // second client is admitted for as long as this window runs.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut admitted = false;
+    while Instant::now() < deadline && !admitted {
+        let (mut second_reader, mut second_writer) = raw_client(&served.endpoint);
+        if Frame::write(&mut second_writer, &hello()).is_ok()
+            && matches!(
+                Frame::read::<_, ServerMessage>(&mut second_reader),
+                Ok(ServerMessage::Welcome { .. })
+            )
+        {
+            admitted = true;
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    assert!(
+        !admitted,
+        "a second client was welcomed while the first's writer was still stuck"
+    );
+
+    // Only once the first client's other half closes too does its writer's
+    // blocked write finally fail, freeing the seat for real.
+    drop(reader);
+
+    let deadline = Instant::now() + PATIENCE;
+    let mut admitted = false;
+    while Instant::now() < deadline && !admitted {
+        let (mut second_reader, mut second_writer) = raw_client(&served.endpoint);
+        if Frame::write(&mut second_writer, &hello()).is_ok()
+            && matches!(
+                Frame::read::<_, ServerMessage>(&mut second_reader),
+                Ok(ServerMessage::Welcome { .. })
+            )
+        {
+            admitted = true;
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    assert!(
+        admitted,
+        "a second client was never admitted once the first was fully gone"
+    );
 }

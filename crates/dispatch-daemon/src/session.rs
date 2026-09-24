@@ -93,6 +93,27 @@ impl Drop for Seat {
     }
 }
 
+/// Tells the loop a client's reader thread has ended, however it ended.
+///
+/// Held by that thread and sent from its `Drop`, not written inline after
+/// its read loop: a frame a peer sent that fails to decode ends the thread
+/// through a panic, which unwinds past any code placed after the loop, so
+/// only a guard's `Drop` -- run during that unwind the same as at an
+/// ordinary return -- reaches the loop either way. Without it, a client
+/// whose reader crashed would stay in `self.clients` forever: nothing would
+/// ever close its connection or free its seat, because both wait on the
+/// `Event::Detached` this sends.
+struct DetachOnDrop {
+    id: ClientId,
+    events: SyncSender<Event>,
+}
+
+impl Drop for DetachOnDrop {
+    fn drop(&mut self) {
+        let _ = self.events.send(Event::Detached(self.id));
+    }
+}
+
 /// Failures starting or running the daemon.
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -384,14 +405,13 @@ impl Daemon {
                 // already: its writer thread is on its own from here,
                 // flushing a refusal or already being closed.
                 if self.clients.contains_key(&id) {
-                    // The reader ending only means no more frames are
-                    // coming; the writer can still be stuck delivering to a
-                    // peer that stopped reading, or one that is gone but
-                    // has not yet failed a write of its own. Closing the
-                    // connection now is what frees it -- and the seat it is
-                    // holding open with it -- rather than waiting however
-                    // long that write would otherwise take to fail on its
-                    // own.
+                    // Its own sending half has ended, so the client itself
+                    // is gone -- not merely idle, which is between frames,
+                    // not the end of the stream -- and closing the
+                    // connection now is what stops its writer from
+                    // lingering, stuck delivering to a peer that stopped
+                    // reading or has already left, holding a thread, a
+                    // socket and its seat open for nothing.
                     self.hang_up(id);
                 } else {
                     self.abandon(id);
@@ -1436,11 +1456,16 @@ impl Daemon {
     /// Not for a refusal or a protocol violation, which has just queued the
     /// message explaining why: see [`Self::refuse`], which lets that reach
     /// the peer first.
+    ///
+    /// Logs nothing itself: every caller already has, in its own words --
+    /// out of time, behind on what it asked for, or simply gone -- and
+    /// "hung up" would be the wrong word for the last of those, which is
+    /// the client leaving on its own rather than the daemon choosing to end
+    /// it.
     fn hang_up(&mut self, id: ClientId) {
         if let Some(client) = self.clients.remove(&id) {
             let closer = client.closer;
             std::thread::spawn(move || closer.close());
-            tracing::info!(client = id, "hung up on a client");
         }
         self.abandon(id);
     }
@@ -1613,6 +1638,11 @@ fn spawn_client(
     let incoming = events.clone();
     let reader_seat = Arc::clone(&seat);
     std::thread::spawn(move || {
+        let _detached = DetachOnDrop {
+            id,
+            events: incoming.clone(),
+        };
+
         loop {
             match Frame::read_watched::<_, ClientMessage>(&mut reader, || frame.start()) {
                 Ok(message) => {
@@ -1630,7 +1660,6 @@ fn spawn_client(
         }
 
         drop(reader_seat);
-        let _ = incoming.send(Event::Detached(id));
     });
 
     std::thread::spawn(move || {
