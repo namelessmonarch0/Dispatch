@@ -99,6 +99,12 @@ const MAX_ANNOUNCING: usize = 32;
 /// Cheap to clone; every clone ends the same connection, and closing twice
 /// does nothing. `Closer::default()` closes nothing: it is what a
 /// connection built from halves the caller already owns hands out.
+///
+/// A closer holds a second handle onto each stream, so while any clone of
+/// it lives the connection stays open, even once both halves are dropped:
+/// the peer sees no end of file, and a named pipe stays connected. Whoever
+/// holds one closes it or drops it when the connection is done with;
+/// closing lets the handles go.
 #[derive(Clone, Default)]
 pub struct Closer(Arc<Mutex<Option<Ending>>>);
 
@@ -106,8 +112,9 @@ pub struct Closer(Arc<Mutex<Option<Ending>>>);
 enum Ending {
     /// A second handle onto each of the connection's two streams.
     Streams(Vec<imp::Stream>),
-    /// The process behind a command transport.
-    Process(u32),
+    /// The process behind a command transport, while it is still there to
+    /// be ended; see [`Spawned::pid`].
+    Process(Arc<Mutex<Option<u32>>>),
 }
 
 impl std::fmt::Debug for Closer {
@@ -129,9 +136,9 @@ impl Closer {
         ])))
     }
 
-    /// A closer for the command transport running as `pid`.
-    fn process(pid: u32) -> Self {
-        Self::ending(Ending::Process(pid))
+    /// A closer for the command transport that `spawned` runs.
+    fn process(spawned: &Spawned) -> Self {
+        Self::ending(Ending::Process(Arc::clone(&spawned.pid)))
     }
 
     fn ending(ending: Ending) -> Self {
@@ -139,6 +146,11 @@ impl Closer {
     }
 
     /// Makes both halves of the connection fail, whoever holds them.
+    ///
+    /// Can block. On Windows it cancels until nothing is in flight on either
+    /// pipe, up to a second for each; for a command transport it waits out
+    /// the tree's teardown -- its grace, then up to two seconds for a killed
+    /// tree to go. Keep it off a thread that cannot afford that.
     pub fn close(&self) {
         let ending = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
 
@@ -150,7 +162,12 @@ impl Closer {
                 }
             }
             Some(Ending::Process(pid)) => {
-                if let Err(error) = crate::process::terminate_tree(pid, TEARDOWN_GRACE) {
+                // Held across the kill, so the child cannot be reaped -- and
+                // its pid freed for a stranger -- while it is being signalled.
+                let pid = pid.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(pid) = *pid
+                    && let Err(error) = crate::process::terminate_tree(pid, TEARDOWN_GRACE)
+                {
                     tracing::debug!(%error, pid, "failed to end a command transport");
                 }
             }
@@ -173,7 +190,7 @@ pub struct Connection {
     reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
     /// The process behind a command transport, kept so it can be reaped.
-    child: Option<std::process::Child>,
+    child: Option<Spawned>,
     hint: StderrHint,
     /// Ends this connection from outside; see [`Closer`].
     closer: Closer,
@@ -280,12 +297,16 @@ impl Connection {
             });
         }
 
-        let closer = Closer::process(child.id());
+        let spawned = Spawned {
+            pid: Arc::new(Mutex::new(Some(child.id()))),
+            child,
+        };
+        let closer = Closer::process(&spawned);
 
         Ok(Self {
             reader: Box::new(reader),
             writer: Box::new(writer),
-            child: Some(child),
+            child: Some(spawned),
             hint,
             closer,
         })
@@ -309,7 +330,7 @@ impl Connection {
     /// The child's process id, when the transport is a command.
     #[must_use]
     pub fn child_id(&self) -> Option<u32> {
-        self.child.as_ref().map(std::process::Child::id)
+        self.child.as_ref().map(|spawned| spawned.child.id())
     }
 
     /// Splits into a reader and a writer.
@@ -351,6 +372,20 @@ impl Drop for Connection {
 /// tearing down, which should not make a reconnect wait on it.
 const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// A command transport's process, and the pid its closers may signal.
+struct Spawned {
+    child: std::process::Child,
+    /// The child's pid until it is reaped, shared with every [`Closer`] for
+    /// the connection.
+    ///
+    /// Reaping frees the pid for the system to hand to whatever starts next,
+    /// so a closer that outlived the reader half would signal a stranger.
+    /// [`reap`] clears this under its lock before it waits, and a closer
+    /// holds the lock for as long as it signals: until the wait, the pid is
+    /// still this child's, dead or alive.
+    pid: Arc<Mutex<Option<u32>>>,
+}
+
 /// Terminates a command transport's whole process tree, then reaps its
 /// immediate child.
 ///
@@ -358,9 +393,10 @@ const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(50)
 /// would leave those orphaned and holding the pipes this `Connection` reads
 /// and writes, which is what [`put_in_its_own_group`] and
 /// [`process::terminate_tree`](crate::process::terminate_tree) are for.
-fn reap(child: &mut std::process::Child) {
-    let _ = crate::process::terminate_tree(child.id(), TEARDOWN_GRACE);
-    let _ = child.wait();
+fn reap(spawned: &mut Spawned) {
+    spawned.pid.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let _ = crate::process::terminate_tree(spawned.child.id(), TEARDOWN_GRACE);
+    let _ = spawned.child.wait();
 }
 
 /// Puts `command`'s child in a process group or job of its own, so
@@ -407,7 +443,7 @@ fn put_in_its_own_group(command: &mut std::process::Command) {
 /// the moment the `Connection` went out of scope.
 struct ChildReader {
     reader: Box<dyn Read + Send>,
-    child: std::process::Child,
+    child: Spawned,
 }
 
 impl Read for ChildReader {
@@ -619,8 +655,21 @@ fn accept_all(
                 Instant::now(),
             );
 
-            if let Some((reader, writer)) = offered {
-                let _ = paired.send(Connection::over_streams(reader, writer));
+            let Some((reader, writer)) = offered else {
+                return;
+            };
+
+            // A failure here is this one connection's -- no handle left to
+            // duplicate, say -- and it is dropped like any other that could
+            // not be served. Sent on, it would read as the listener's own
+            // failure, which the daemon takes as the end of accepting.
+            match Connection::over_streams(reader, writer) {
+                Ok(connection) => {
+                    let _ = paired.send(Ok(connection));
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "dropping a connection that could not be prepared")
+                }
             }
         });
     }
@@ -1039,6 +1088,9 @@ mod imp {
         unsafe { CancelIoEx(stream.file.as_raw_handle() as HANDLE, std::ptr::null()) };
     }
 
+    /// How often an overdue preamble's read is cancelled again.
+    const RECANCEL: Duration = Duration::from_millis(5);
+
     /// Reads a connection's preamble, giving up after `patience`.
     ///
     /// A synchronous pipe read has no timeout of its own, so a watchdog
@@ -1048,6 +1100,12 @@ mod imp {
     /// later; and it cancels rather than [`interrupt`]s, so one that lands
     /// just after the read finished finds nothing in flight and leaves the
     /// pipe usable.
+    ///
+    /// The preamble takes as many reads as the client took writes to send
+    /// it, and a cancel that lands between two of them finds nothing and is
+    /// lost -- the next read would park for good, and hold one of the
+    /// listener's announcing places with it. So once the preamble is overdue
+    /// the watchdog cancels every [`RECANCEL`] until the read gives up.
     pub(super) fn read_preamble(
         stream: &mut Stream,
         patience: std::time::Duration,
@@ -1057,8 +1115,16 @@ mod imp {
         let (finished, wait) = std::sync::mpsc::channel::<()>();
 
         let watchdog = std::thread::spawn(move || {
-            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = wait.recv_timeout(patience) {
-                cancel(&watched);
+            let overdue =
+                |waited| matches!(waited, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+
+            if overdue(wait.recv_timeout(patience)) {
+                loop {
+                    cancel(&watched);
+                    if !overdue(wait.recv_timeout(RECANCEL)) {
+                        break;
+                    }
+                }
             }
         });
 
@@ -1691,6 +1757,10 @@ mod tests {
         // its sender is dropped and the receiver sees a disconnect.
         let parked = reading(reader);
 
+        // Given time to park, so the close meets a read already in flight
+        // -- on Windows, one it has to cancel -- rather than one it stops
+        // before it starts.
+        std::thread::sleep(Duration::from_millis(100));
         closer.close();
 
         assert_eq!(
@@ -1707,6 +1777,43 @@ mod tests {
                 .and_then(|()| writer.flush())
                 .is_err(),
             "a write after closing still went through"
+        );
+    }
+
+    #[test]
+    fn a_closer_ends_a_connection_whose_writer_is_parked() {
+        // A peer that stops reading parks the writer once the transport's
+        // buffer is full, and a writer parked for good holds its half for
+        // good. Hanging up on such a peer is what the closer is for.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("closer-writer");
+
+        let listener = Listener::bind().expect("binding succeeds");
+        let server = std::thread::spawn(move || listener.accept().expect("accepting succeeds"));
+
+        let client = Connection::connect().expect("connecting succeeds");
+        let closer = client.closer();
+        // Held and never read from.
+        let _server_side = server.join().expect("the server thread finishes");
+
+        let (_reader, mut writer) = client.split();
+        let (wrote, written) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Far more than any socket or pipe buffers.
+            let sent = writer
+                .write_all(&vec![0u8; 1024 * 1024])
+                .and_then(|()| writer.flush());
+            let _ = wrote.send(sent.is_ok());
+        });
+
+        // Given time to fill the buffer and park.
+        std::thread::sleep(Duration::from_millis(100));
+        closer.close();
+
+        assert_eq!(
+            written.recv_timeout(PATIENCE),
+            Ok(false),
+            "the parked write is still parked, or went through"
         );
     }
 
@@ -1732,5 +1839,46 @@ mod tests {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
             "the read on a killed command's stdout is still parked"
         );
+    }
+
+    /// The pid `closer` would signal if it were closed now.
+    #[cfg(unix)]
+    fn aimed_at(closer: &Closer) -> Option<u32> {
+        match &*closer.0.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(Ending::Process(pid)) => *pid.lock().unwrap_or_else(|e| e.into_inner()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_closer_signals_nothing_once_its_command_is_reaped() {
+        // Reaping frees the pid, and the system hands a free pid to whatever
+        // starts next. A closer that outlives the reader half -- the reader
+        // saw end of file and let go, and only then is the connection
+        // abandoned -- would otherwise kill a stranger's process tree.
+        let connection = Connection::over_command(
+            std::ffi::OsStr::new("sh"),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("sleep 30"),
+            ],
+        )
+        .expect("sh exists");
+        let closer = connection.closer();
+        let (reader, _writer) = connection.split();
+        assert!(
+            aimed_at(&closer).is_some(),
+            "a running command is the closer's to end"
+        );
+
+        drop(reader);
+
+        assert_eq!(
+            aimed_at(&closer),
+            None,
+            "the closer still aims at a pid its command no longer holds"
+        );
+        closer.close();
     }
 }
