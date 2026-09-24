@@ -119,12 +119,42 @@ impl Widget for Approval<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(format!(" {} wants to delegate ", self.asking));
+            .title(title(self.asking, area.width));
         let inner = block.inner(area);
         block.render(area, buf);
 
         self.render_content(inner, buf);
     }
+}
+
+/// The prompt's title for a box `width` wide: who is asking, cut short so
+/// that what it asks is always in view.
+///
+/// A pane is named by whatever its program last called itself, and a shell
+/// calls itself by its whole working directory. Put first and left to run
+/// on, that pushed "wants to delegate" off the edge of the box, leaving a
+/// prompt that did not say what it asked.
+fn title(asking: &str, width: u16) -> String {
+    const ASKS: &str = " wants to delegate ";
+
+    // Inside the two corners, less the space before the name.
+    let room = usize::from(width.saturating_sub(2)).saturating_sub(Span::raw(ASKS).width() + 1);
+    if Span::raw(asking).width() <= room {
+        return format!(" {asking}{ASKS}");
+    }
+
+    let mut name = String::new();
+    let mut used = 1; // the ellipsis
+    for c in asking.chars() {
+        let mut bytes = [0; 4];
+        let columns = Span::raw(&*c.encode_utf8(&mut bytes)).width();
+        if used + columns > room {
+            break;
+        }
+        used += columns;
+        name.push(c);
+    }
+    format!(" {name}…{ASKS}")
 }
 
 #[cfg(test)]
@@ -214,5 +244,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The top row of `widget` drawn into a box `width` wide.
+    fn title_row(widget: Approval<'_>, width: u16) -> String {
+        let area = Rect::new(0, 0, width, 12);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        (0..width)
+            .map(|x| buf.cell((x, 0)).map_or(" ", |cell| cell.symbol()))
+            .collect()
+    }
+
+    #[test]
+    fn a_long_pane_name_never_hides_what_is_being_asked() {
+        // A shell names its pane after its whole working directory: this is
+        // Git Bash's, from a Windows CI runner.
+        let asking =
+            "MINGW64:/c/Users/runneradmin/AppData/Local/Temp/dispatch-e2e-1620-d7-0/project";
+        let top = title_row(
+            Approval {
+                asking,
+                ..approval("echo delegated")
+            },
+            64,
+        );
+
+        assert!(top.contains(" wants to delegate "), "{top}");
+        assert!(
+            top.contains("MINGW64:/c/Users/") && top.contains('…'),
+            "the name is cut short, not dropped: {top}"
+        );
+    }
+
+    #[test]
+    fn a_name_that_fits_is_shown_whole() {
+        let top = title_row(approval("echo delegated"), 64);
+
+        assert!(top.contains(" Claude Code wants to delegate "), "{top}");
+        assert!(!top.contains('…'), "{top}");
     }
 }
