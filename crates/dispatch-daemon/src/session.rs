@@ -252,6 +252,8 @@ pub struct Daemon {
     leftovers: Leftovers,
     /// When `leftovers` was last tried.
     leftovers_tried: Instant,
+    /// The task directory's lock, while this daemon holds it.
+    task_dir_lock: Option<std::fs::File>,
 }
 
 impl Daemon {
@@ -287,6 +289,7 @@ impl Daemon {
             task_dir: default_task_dir(),
             leftovers: Leftovers::default(),
             leftovers_tried: Instant::now(),
+            task_dir_lock: None,
         }
     }
 
@@ -353,11 +356,11 @@ impl Daemon {
 
     /// Accepts connections until the listener fails, serving them all.
     ///
-    /// First sweeps up the task files a daemon that did not stop cleanly
-    /// left behind: `listener` is bound, so this is the one daemon serving
-    /// this configuration, and nothing still means to hand those files over.
+    /// First takes the task directory, which sweeps up the task files a
+    /// daemon that did not stop cleanly left behind -- unless another
+    /// daemon holds the directory, whose files those may be.
     pub fn serve(mut self, listener: Listener) -> Result<(), DaemonError> {
-        crate::task_file::sweep(&self.task_dir);
+        self.task_dir_lock = crate::task_file::claim(&self.task_dir);
 
         let sender = self.sender.clone();
         let max_clients = self.budgets.max_clients;

@@ -3715,6 +3715,40 @@ fn the_sweep_never_reads_through_a_linked_directory() {
 }
 
 #[test]
+fn only_the_daemon_holding_the_task_directory_sweeps_it() {
+    // Two daemons can share a task directory -- on Linux, different
+    // XDG_CONFIG_HOMEs and one XDG_DATA_HOME -- and bind different endpoints,
+    // so binding proves nothing about the directory. Its lock does.
+    let dir = TempDir::new("sweep-lock");
+    let tasks = dir.0.join("tasks");
+    std::fs::create_dir(&tasks).expect("temp dir is writable");
+    let left = tasks.join(format!(
+        "dispatch-task-{}.txt",
+        dispatch_core::RequestId::new()
+    ));
+    std::fs::write(&left, "another daemon's live task").expect("temp dir is writable");
+
+    let other = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(tasks.join(crate::task_file::LOCK_FILE))
+        .expect("the lock file opens");
+    other.try_lock().expect("nobody holds it yet");
+
+    assert!(
+        crate::task_file::claim(&tasks).is_none(),
+        "the directory was claimed while another daemon held it"
+    );
+    assert!(left.exists(), "another daemon's task file was swept");
+
+    drop(other);
+    let held = crate::task_file::claim(&tasks);
+    assert!(held.is_some(), "a free directory was not claimed");
+    assert!(!left.exists(), "the holder did not sweep");
+}
+
+#[test]
 fn an_argument_form_is_never_handed_a_task_file() {
     // Its task is in its arguments. A DISPATCH_TASK_FILE in its environment
     // could only be stale -- inherited, or set in the harness file -- and a

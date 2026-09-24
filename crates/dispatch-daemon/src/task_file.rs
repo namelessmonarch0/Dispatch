@@ -117,14 +117,64 @@ impl Drop for TaskFile {
     }
 }
 
+/// The file a daemon locks to say a task directory is its own.
+pub const LOCK_FILE: &str = "dispatchd.lock";
+
+/// Takes `dir` for this daemon, and sweeps it only if it could.
+///
+/// Returns the locked file, which holds `dir` for as long as it lives. A
+/// daemon's endpoint says nothing about its task directory -- on Linux two
+/// daemons with different XDG_CONFIG_HOMEs and one XDG_DATA_HOME bind
+/// different sockets and share one -- so the directory has a lock of its
+/// own, and only its holder may decide that the files in it are nobody's.
+/// A daemon without it still writes task files there, under names nobody
+/// else will use, but never sweeps.
+pub fn claim(dir: &Path) -> Option<std::fs::File> {
+    let taken = (|| {
+        dispatch_os::paths::create_private_dir(dir)?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(LOCK_FILE))?;
+        match lock.try_lock() {
+            Ok(()) => Ok(Some(lock)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        }
+    })();
+
+    match taken {
+        Ok(Some(lock)) => {
+            sweep(dir);
+            Some(lock)
+        }
+        Ok(None) => {
+            tracing::info!(
+                dir = %dir.display(),
+                "another daemon holds this task directory; not sweeping it"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                dir = %dir.display(),
+                "could not take the task directory; not sweeping it"
+            );
+            None
+        }
+    }
+}
+
 /// Removes every task file left in `dir` by a daemon that stopped without
 /// cleaning up after itself -- one that was killed, or crashed -- and
 /// nothing else.
 ///
-/// For a daemon that has just bound its endpoint: that is proof no other
-/// daemon serves this configuration, so no running one still means to hand
-/// these to anybody. Only names exactly as [`TaskFile::write`] makes them
-/// are touched, so a file of the user's that happens to be there is not.
+/// Only for the holder of `dir`'s lock (see [`claim`]): no other daemon
+/// uses the directory then, so nothing still means to hand these to
+/// anybody. Only names exactly as [`TaskFile::write`] makes them are
+/// touched, so a file of the user's that happens to be there is not.
 pub fn sweep(dir: &Path) {
     // What a link names is somebody's choice, not Dispatch's directory.
     if std::fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
