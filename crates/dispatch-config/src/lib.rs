@@ -16,7 +16,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub use config::{Config, DelegationLimits, LoadedConfig};
-pub use harness::{HarnessDef, Launch, SettingDef, SettingKind, TaskArgs, TaskLaunch};
+pub use harness::{
+    HarnessDef, Launch, SettingDef, SettingKind, TASK_FILE_ENV, TaskArgs, TaskInput, TaskLaunch,
+    TaskRun,
+};
 
 /// Failures while loading configuration.
 ///
@@ -181,10 +184,12 @@ impl HarnessRegistry {
     }
 }
 
-/// Writes the built-in harness files into `dir`, without overwriting.
+/// Writes the built-in harness files into `dir`: any that are missing, and
+/// any still exactly as an earlier Dispatch wrote them.
 ///
-/// Returns the ids that were newly written. Files the user has edited are
-/// left alone, so an upgrade never discards local changes.
+/// Returns the ids written. A file the user has edited is left alone, so an
+/// upgrade never discards local changes; one nobody touched is brought up to
+/// date, so a fix to a built-in reaches installations made before it.
 pub fn write_missing_built_ins(dir: &Path) -> Result<Vec<&'static str>, ConfigError> {
     std::fs::create_dir_all(dir).map_err(|source| ConfigError::Io {
         path: dir.to_path_buf(),
@@ -195,8 +200,26 @@ pub fn write_missing_built_ins(dir: &Path) -> Result<Vec<&'static str>, ConfigEr
 
     for built_in in defaults::BUILT_INS {
         let path = dir.join(format!("{}.toml", built_in.id));
+
         if path.exists() {
-            continue;
+            // Compared without carriage returns: a file written from a
+            // checkout with CRLF line endings is still the same file.
+            let unix = |text: &str| text.replace("\r\n", "\n");
+            let existing = std::fs::read_to_string(&path).map_err(|source| ConfigError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            let untouched = built_in
+                .superseded
+                .iter()
+                .any(|old| unix(old) == unix(&existing));
+            if !untouched {
+                continue;
+            }
+            tracing::info!(
+                harness = built_in.id,
+                "upgrading a built-in harness nobody edited"
+            );
         }
 
         std::fs::write(&path, built_in.toml).map_err(|source| ConfigError::Io {

@@ -12,7 +12,10 @@ use std::time::Instant;
 ///
 /// Carries a `[task]` form so delegation tests have a harness to delegate to;
 /// without one, every delegation request is refused before it is even asked
-/// about.
+/// about. Its task is a script. On Windows that script is read by PowerShell
+/// from the task's file, since `cmd.exe /c {task}` is the very shape the
+/// daemon refuses there; `powershell -Command -` runs what arrives on standard
+/// input, where `echo` prints and `sleep` sleeps as they do under `sh`.
 ///
 /// Also registers `no-task-args`: a harness with a `[task]` section but an
 /// empty `args`, which `HarnessDef::task_launch` treats as no form at all — a
@@ -20,7 +23,7 @@ use std::time::Instant;
 /// `task_launch(..).is_some()`.
 fn harnesses(dir: &std::path::Path) -> HarnessRegistry {
     let body = if cfg!(windows) {
-        "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n\n[task]\nargs = [\"/c\", \"{task}\"]\n"
+        "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n\n[task]\nargs = [\"/d\", \"/v:off\", \"/c\", \"powershell.exe\", \"-NoProfile\", \"-NonInteractive\", \"-Command\", \"-\", \"<%DISPATCH_TASK_FILE%\"]\ninput = \"file\"\n"
     } else {
         "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"sh\"\n\n[task]\nargs = [\"-c\", \"{task}\"]\n"
     };
@@ -3251,4 +3254,223 @@ fn shutting_down_ends_every_panes_whole_tree() {
             .all(|p| !dispatch_os::process::is_running(*p)),
         "a process a pane started outlived the daemon: {everyone:?}"
     );
+}
+
+/// Not a test of its own: what the `capture` harness runs inside a pane, to
+/// record exactly what reached its standard input. Run without
+/// `DISPATCH_CAPTURE_TO`, it does nothing.
+#[test]
+fn capture_standard_input() {
+    let Some(out) = std::env::var_os("DISPATCH_CAPTURE_TO") else {
+        return;
+    };
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut bytes)
+        .expect("standard input is readable");
+    std::fs::write(out, bytes).expect("the capture is writable");
+}
+
+/// Delegates `task` to a `capture` harness started as `command`, whose
+/// `[task]` arguments `args` spells out given the binary that records what
+/// it is sent, and checks that the task reached that binary's standard input
+/// byte for byte, that nothing in it ran, and that its file went with the
+/// run.
+///
+/// The agent is this test binary running [`capture_standard_input`], so what
+/// it received can be compared with what was asked.
+fn assert_a_task_reaches_the_capture_exactly(
+    label: &str,
+    command: &str,
+    args: impl Fn(&Path) -> String,
+    task: &str,
+) {
+    let dir = TempDir::new(label);
+    let harness_dir = dir.0.join("harnesses");
+    let _ = harnesses(&harness_dir);
+
+    let captured = dir.0.join("captured.bin");
+    let exe = std::env::current_exe().expect("the test binary");
+    std::fs::write(
+        harness_dir.join("capture.toml"),
+        format!(
+            "id = \"capture\"\ndisplay_name = \"Capture\"\ncommand = \"{command}\"\n\n\
+             [env]\nDISPATCH_CAPTURE_TO = '{}'\n\n\
+             [task]\nargs = {}\ninput = \"file\"\n",
+            captured.display(),
+            args(&exe)
+        ),
+    )
+    .expect("temp dir is writable");
+
+    let registry = HarnessRegistry::load_from_dir(&harness_dir).expect("loading succeeds");
+    let mut daemon = Daemon::new(registry, "test-device");
+    // A space, as in many Windows profile paths: the file's path has to
+    // survive cmd.exe whole.
+    let task_dir = dir.0.join("task files");
+    daemon.set_task_dir(task_dir.clone());
+    let project =
+        daemon.open_project(dispatch_os::paths::resolve(&dir.0).expect("the temp dir resolves"));
+
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(
+        9,
+        ClientMessage::DelegateRequest {
+            parent,
+            harness: "capture".into(),
+            task: task.into(),
+            size: (80, 24),
+        },
+    );
+    let request = pending(&drain(&ui)).expect("the interface is asked");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+
+    let seen = wait_for(&mut daemon, &caller, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { .. }))
+    });
+    assert!(
+        seen.iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { exit: 0, .. })),
+        "the capture ran and succeeded: {seen:#?}"
+    );
+
+    assert_eq!(
+        std::fs::read(&captured).expect("the agent recorded its input"),
+        task.as_bytes(),
+        "the task arrived changed"
+    );
+    assert!(
+        !dir.0.join("marker.txt").exists(),
+        "a command inside the task ran"
+    );
+    assert!(
+        std::fs::read_dir(&task_dir).map_or(true, |mut d| d.next().is_none()),
+        "the task's file outlived the run"
+    );
+}
+
+#[test]
+#[cfg_attr(not(windows), ignore = "exercises cmd.exe")]
+fn a_task_reaches_a_cmd_wrapped_agent_exactly() {
+    // The audit's A01: through `cmd.exe /c agent {task}`, `&` in a task ran
+    // a second command. Here the agent is this test binary, reached through
+    // cmd.exe exactly as claude.cmd is, recording what its standard input
+    // received.
+    assert_a_task_reaches_the_capture_exactly(
+        "cmd-task",
+        "cmd.exe",
+        |exe| {
+            format!(
+                "[\"/d\", \"/v:off\", \"/c\", '{}', \"--exact\", \
+                 \"session::tests::capture_standard_input\", \"--nocapture\", \
+                 \"<%DISPATCH_TASK_FILE%\"]",
+                exe.display()
+            )
+        },
+        "literal & echo DISPATCH_AUDIT_MARKER> marker.txt | \"quoted\" %PATH% !PATH! ^caret\r\n\
+         second line \u{fc}n\u{ef}c\u{f8}d\u{e9} \u{2713}",
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_task_redirected_by_a_posix_shell_reaches_the_agent_exactly() {
+    // The same delivery where it can run on every machine: the daemon writes
+    // the task down, names the file in the environment, and removes it once
+    // the run is over. Here `sh` does the redirecting, quoting the variable
+    // itself.
+    assert_a_task_reaches_the_capture_exactly(
+        "sh-task",
+        "sh",
+        |exe| {
+            format!(
+                "[\"-c\", 'exec \"$0\" --exact session::tests::capture_standard_input \
+                 --nocapture < \"$DISPATCH_TASK_FILE\"', '{}']",
+                exe.display()
+            )
+        },
+        "literal; echo DISPATCH_AUDIT_MARKER > marker.txt $(touch marker.txt) `touch marker.txt` \
+         \"quoted\" '$HOME'\r\nsecond line \u{fc}n\u{ef}c\u{f8}d\u{e9} \u{2713}",
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(windows),
+    ignore = "the refusal is for cmd.exe, which only Windows has"
+)]
+fn a_task_form_that_would_put_the_task_on_cmds_command_line_is_refused() {
+    // What every Windows installation from before this fix still has in any
+    // harness file its user edited.
+    let dir = TempDir::new("unsafe-form");
+    let harness_dir = dir.0.join("harnesses");
+    let _ = harnesses(&harness_dir);
+    std::fs::write(
+        harness_dir.join("old.toml"),
+        "id = \"old\"\ndisplay_name = \"Old\"\ncommand = \"cmd.exe\"\n\n[task]\nargs = [\"/c\", \"{task}\"]\n",
+    )
+    .expect("temp dir is writable");
+
+    let registry = HarnessRegistry::load_from_dir(&harness_dir).expect("loading succeeds");
+    let mut daemon = Daemon::new(registry, "test-device");
+    let project =
+        daemon.open_project(dispatch_os::paths::resolve(&dir.0).expect("the temp dir resolves"));
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let caller = daemon.attach_for_test(9);
+    daemon.request_for_test(
+        9,
+        ClientMessage::Hello {
+            version: dispatch_proto::VERSION,
+            client: "delegate".into(),
+            role: dispatch_proto::Role::Delegate,
+        },
+    );
+    daemon.request_for_test(
+        9,
+        ClientMessage::DelegateRequest {
+            parent,
+            harness: "old".into(),
+            task: "x & echo DISPATCH_AUDIT_MARKER".into(),
+            size: (80, 24),
+        },
+    );
+
+    let told = outcomes(&drain(&caller));
+    assert!(
+        told.iter().any(|o| matches!(
+            o,
+            DelegateOutcome::Refused { reason } if reason.contains("old.toml") && reason.contains("cmd.exe")
+        )),
+        "the caller is told which file to fix: {told:?}"
+    );
+    assert!(
+        pending(&drain(&ui)).is_none(),
+        "nobody is asked to approve it"
+    );
+    assert_eq!(daemon.pane_count(), 1, "nothing started");
 }

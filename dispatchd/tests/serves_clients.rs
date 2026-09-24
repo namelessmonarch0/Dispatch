@@ -37,9 +37,11 @@ impl Endpoint {
         // A harness of the test's own, so what a pane runs is a plain shell
         // rather than whichever agents happen to be installed. The `[task]`
         // form is what lets a delegation request against it succeed: without
-        // one, the daemon refuses before ever asking anybody.
+        // one, the daemon refuses before ever asking anybody. On Windows the
+        // task is a PowerShell script read from its file: `cmd.exe /c {task}`
+        // is a form the daemon refuses there.
         let shell = if cfg!(windows) {
-            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n\n[task]\nargs = [\"/c\", \"{task}\"]\n"
+            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n\n[task]\nargs = [\"/d\", \"/v:off\", \"/c\", \"powershell.exe\", \"-NoProfile\", \"-NonInteractive\", \"-Command\", \"-\", \"<%DISPATCH_TASK_FILE%\"]\ninput = \"file\"\n"
         } else {
             "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"sh\"\n\n[task]\nargs = [\"-c\", \"{task}\"]\n"
         };
@@ -717,10 +719,10 @@ fn a_delegate_caller_and_an_interface_client_share_one_daemon() {
         &ClientMessage::DelegateRequest {
             parent,
             harness: "shell".into(),
-            // No arithmetic needed here: a one-shot task runs under `-c` or
-            // `/c`, which does not echo the command, so a literal marker in the
-            // tail can only have come from the subagent running.
-            task: "echo delegated-42".into(),
+            // Computed rather than written: `sh` and PowerShell both evaluate
+            // `$((6*7))`, so "delegated-42" in the tail can only have come
+            // from the subagent running, whatever a shell echoes of its input.
+            task: "echo delegated-$((6*7))".into(),
             size: (80, 24),
         },
     )

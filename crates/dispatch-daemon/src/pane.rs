@@ -43,6 +43,9 @@ pub struct DaemonPane {
     /// waiting on this pane's output cannot be answered at the exit. This is how
     /// long that wait has lasted.
     pub exited_at: Option<std::time::Instant>,
+    /// The file its task was delivered in, while the process may still read
+    /// it.
+    pub task_file: Option<crate::task_file::TaskFile>,
 }
 
 impl DaemonPane {

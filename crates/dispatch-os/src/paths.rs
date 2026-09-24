@@ -108,6 +108,39 @@ pub fn resolve(path: &Path) -> std::io::Result<PathBuf> {
     }
 }
 
+/// Creates a new file only this user can read or write.
+///
+/// Refuses one that already exists: a name in a shared directory must not
+/// be one somebody else prepared. On Windows the file takes its directory's
+/// access list, and the directories Dispatch writes these in are the user's
+/// own.
+pub fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    options.open(path)
+}
+
+/// `path` as a shell's `<` needs it in the variable that names it.
+///
+/// Quoted on Windows, where `cmd.exe` expands the variable in place and a
+/// space in the path would end the file name there; bare elsewhere, where
+/// the shell quotes the expansion itself.
+#[must_use]
+pub fn redirect_operand(path: &Path) -> String {
+    if cfg!(windows) {
+        format!("\"{}\"", path.display())
+    } else {
+        path.display().to_string()
+    }
+}
+
 /// Expands a leading `~` against the home directory of the user running this
 /// process.
 ///
@@ -255,6 +288,46 @@ mod tests {
         let config = config_file().expect("config_file resolves");
         let log = log_file().expect("log_file resolves");
         assert_ne!(config, log);
+    }
+
+    #[test]
+    fn a_private_file_is_a_new_one_only_its_owner_can_read() {
+        // A task can hold anything its user typed; nobody else on the machine
+        // reads it, and a name somebody else already took is not written into.
+        let path = std::env::temp_dir().join(format!(
+            "dispatch-os-private-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let created = create_private(&path);
+        let again = create_private(&path);
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&path).map(|m| m.permissions().mode() & 0o777)
+        };
+        let _ = std::fs::remove_file(&path);
+
+        created.expect("a new name is created");
+        assert_eq!(
+            again.expect_err("an existing name is refused").kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        #[cfg(unix)]
+        assert_eq!(mode.expect("the file existed"), 0o600);
+    }
+
+    #[test]
+    fn a_path_for_a_redirect_is_quoted_only_where_cmd_expands_it() {
+        let path = Path::new("/tmp/task files/dispatch-task.txt");
+        let expected = if cfg!(windows) {
+            "\"/tmp/task files/dispatch-task.txt\""
+        } else {
+            "/tmp/task files/dispatch-task.txt"
+        };
+        assert_eq!(redirect_operand(path), expected);
     }
 
     #[test]

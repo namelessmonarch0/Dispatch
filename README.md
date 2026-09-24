@@ -206,12 +206,16 @@ form, since an interactive agent never exits:
 [task]
 args = ["-p", "{task}"]
 
+# cmd.exe would run the task's & and % as commands, so on Windows the task
+# is written to a file and redirected into the agent's standard input.
 [task.platform.windows]
-args = ["/c", "claude", "-p", "{task}"]
+args = ["/d", "/v:off", "/c", "claude", "-p", "<%DISPATCH_TASK_FILE%"]
+input = "file"
 ```
 
-`claude` and `codex` ship with one. Caps live in `config.toml`, and refuse rather
-than prompt:
+`claude` and `codex` ship with one. On Windows the daemon refuses a form that
+would put the task on `cmd.exe`'s command line, and says which file to fix.
+Caps live in `config.toml`, and refuse rather than prompt:
 
 ```toml
 [delegation]

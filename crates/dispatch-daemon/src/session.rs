@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
-use dispatch_config::{DelegationLimits, HarnessRegistry};
+use dispatch_config::{DelegationLimits, HarnessRegistry, TaskInput};
 use dispatch_core::{PaneId, PaneStatus, Project, ProjectId, ProjectSource, RequestId};
 use dispatch_os::ipc::{Closer, Connection, Listener};
 use dispatch_proto::{
@@ -20,6 +20,7 @@ use crate::budgets::Budgets;
 use crate::delegation::Pending;
 use crate::outbox::{Inbox, Outbox, Refused};
 use crate::pane::DaemonPane;
+use crate::task_file::TaskFile;
 
 /// How much of a subagent's output its caller is given.
 ///
@@ -214,6 +215,8 @@ pub struct Daemon {
     /// Panes the user has approved for every future request, for as long as
     /// this daemon runs.
     blanket: HashSet<PaneId>,
+    /// Where a task delivered in a file is written.
+    task_dir: PathBuf,
 }
 
 impl Daemon {
@@ -246,6 +249,7 @@ impl Daemon {
             budgets: Budgets::default(),
             pending: HashMap::new(),
             blanket: HashSet::new(),
+            task_dir: std::env::temp_dir(),
         }
     }
 
@@ -254,6 +258,13 @@ impl Daemon {
     /// Before `serve`, which consumes the daemon.
     pub fn set_budgets(&mut self, budgets: Budgets) {
         self.budgets = budgets;
+    }
+
+    /// Where task files are written: the system's temporary directory unless
+    /// told otherwise.
+    #[doc(hidden)]
+    pub fn set_task_dir(&mut self, dir: PathBuf) {
+        self.task_dir = dir;
     }
 
     /// Returns the handle that stops this daemon.
@@ -827,6 +838,7 @@ impl Daemon {
             request: None,
             caller: None,
             exited_at: None,
+            task_file: None,
         };
         // Announced from the pane's own field rather than repeated here: what a
         // client draws has to be what the daemon is holding.
@@ -914,6 +926,18 @@ impl Daemon {
         } else {
             harness
         };
+
+        // A form that would put the task on cmd.exe's command line is refused
+        // whatever the caps say: approving it would not make it safe.
+        if let Some(reason) = self
+            .harnesses
+            .get(&harness)
+            .and_then(|def| def.task_refusal_for(std::env::consts::OS))
+        {
+            tracing::info!(%parent, %harness, %reason, "refused an unsafe task form");
+            self.resolve(request, caller, DelegateOutcome::Refused { reason });
+            return;
+        }
 
         let depth = self.depth_of(parent);
         let live = self.live_children(parent);
@@ -1036,7 +1060,7 @@ impl Daemon {
             return;
         };
 
-        let launch = self
+        let run = self
             .harnesses
             .get(harness)
             .and_then(|def| def.task_launch(task));
@@ -1049,13 +1073,13 @@ impl Daemon {
         let depth = self.depth_of(parent);
         let live = self.live_children(parent);
         if let Some(reason) =
-            crate::delegation::refusal(depth, live, self.limits, launch.is_some(), harness)
+            crate::delegation::refusal(depth, live, self.limits, run.is_some(), harness)
         {
             tracing::info!(%parent, %harness, %reason, "refused an approved delegation");
             self.resolve(request, caller, DelegateOutcome::Refused { reason });
             return;
         }
-        let Some(launch) = launch else {
+        let Some(run) = run else {
             // `refusal` refuses a missing form first, so this cannot be
             // reached; kept as a refusal rather than a panic all the same.
             self.resolve(
@@ -1069,10 +1093,33 @@ impl Daemon {
         };
 
         let id = PaneId::new();
-        let mut launch = launch;
+        let mut launch = run.launch;
         for (key, value) in self.pane_env(id) {
             launch.env.entry(key).or_insert(value);
         }
+
+        let task_file = match run.input {
+            TaskInput::Argument => None,
+            TaskInput::File => match TaskFile::write(&self.task_dir, request, task) {
+                Ok(file) => {
+                    launch.env.insert(
+                        dispatch_config::TASK_FILE_ENV.to_string(),
+                        file.for_redirect(),
+                    );
+                    Some(file)
+                }
+                Err(error) => {
+                    self.resolve(
+                        request,
+                        caller,
+                        DelegateOutcome::Refused {
+                            reason: format!("could not write the task down for {harness}: {error}"),
+                        },
+                    );
+                    return;
+                }
+            },
+        };
 
         let session = match Pty::spawn(&launch, &root, Size::new(size.0, size.1)) {
             Ok(session) => session,
@@ -1102,6 +1149,7 @@ impl Daemon {
                 request: Some(request),
                 caller: Some(caller),
                 exited_at: None,
+                task_file,
             },
         );
 
@@ -1343,6 +1391,8 @@ impl Daemon {
             {
                 pane.status = PaneStatus::Exited(code);
                 pane.exited_at = Some(Instant::now());
+                // Read by now, and nothing will read it again.
+                pane.task_file = None;
                 exited.push((*id, code));
             }
         }

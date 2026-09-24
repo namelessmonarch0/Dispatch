@@ -46,9 +46,10 @@ impl Config {
         std::fs::create_dir_all(&harnesses).expect("temp dir is writable");
 
         // Delegable: has a `[task]` form, so a request against it can be asked
-        // about at all.
+        // about at all. On Windows the task is a PowerShell script read from
+        // its file: `cmd.exe /c {task}` is a form the daemon refuses there.
         let shell = if cfg!(windows) {
-            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n\n[task]\nargs = [\"/c\", \"{task}\"]\n"
+            "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"cmd.exe\"\n\n[task]\nargs = [\"/d\", \"/v:off\", \"/c\", \"powershell.exe\", \"-NoProfile\", \"-NonInteractive\", \"-Command\", \"-\", \"<%DISPATCH_TASK_FILE%\"]\ninput = \"file\"\n"
         } else {
             "id = \"shell\"\ndisplay_name = \"Shell\"\ncommand = \"sh\"\n\n[task]\nargs = [\"-c\", \"{task}\"]\n"
         };

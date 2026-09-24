@@ -371,12 +371,12 @@ args = ["-p", "{task}"]
     )
     .expect("the definition parses");
 
-    let launch = def
+    let run = def
         .task_launch("write the tests")
         .expect("the harness declares a task form");
 
-    assert_eq!(launch.command, "claude");
-    assert_eq!(launch.args, vec!["-p", "write the tests"]);
+    assert_eq!(run.launch.command, "claude");
+    assert_eq!(run.launch.args, vec!["-p", "write the tests"]);
 }
 
 #[test]
@@ -413,10 +413,10 @@ args = ["-c", "{task}"]
     .expect("the definition parses");
 
     let hostile = "say \"hi\"\nthen $(rm -rf /)";
-    let launch = def.task_launch(hostile).expect("a task form exists");
+    let run = def.task_launch(hostile).expect("a task form exists");
 
-    assert_eq!(launch.args.len(), 2);
-    assert_eq!(launch.args[1], hostile);
+    assert_eq!(run.launch.args.len(), 2);
+    assert_eq!(run.launch.args[1], hostile);
 }
 
 #[test]
@@ -433,8 +433,8 @@ args = ["exec", "--prompt={task}"]
     )
     .expect("the definition parses");
 
-    let launch = def.task_launch("build it").expect("a task form exists");
-    assert_eq!(launch.args, vec!["exec", "--prompt=build it"]);
+    let run = def.task_launch("build it").expect("a task form exists");
+    assert_eq!(run.launch.args, vec!["exec", "--prompt=build it"]);
 }
 
 #[test]
@@ -470,24 +470,155 @@ fn the_built_in_agents_that_can_be_delegated_to_say_so() {
 }
 
 #[test]
-fn a_windows_wrapper_survives_a_one_shot_run() {
-    // claude installs on Windows as a .cmd shim that has to be run through
-    // cmd.exe. A one-shot run reaches the agent the same way an interactive one
-    // does, or it runs cmd.exe and never the agent.
+fn a_windows_task_reaches_the_agent_on_standard_input() {
+    // claude installs on Windows as a .cmd shim that only cmd.exe can run,
+    // and cmd.exe reads its whole command line as shell syntax. The task
+    // goes to a file, which cmd.exe redirects into `claude -p`; the command
+    // line carries nothing of it.
     let dir = TempDir::new("windows-task-wrapper");
     write_missing_built_ins(dir.path()).expect("the built-ins are written");
     let registry = HarnessRegistry::load_from_dir(dir.path()).expect("they load");
 
-    let claude = registry.get("claude").expect("the built-in exists");
-    let launch = claude
-        .task_launch_for("windows", "write the tests")
-        .expect("claude can be delegated to on Windows");
+    let hostile = "x & echo DISPATCH_AUDIT_MARKER | %PATH% \"quoted\"\nsecond line";
+    for (id, expected) in [
+        (
+            "claude",
+            vec![
+                "/d",
+                "/v:off",
+                "/c",
+                "claude",
+                "-p",
+                "<%DISPATCH_TASK_FILE%",
+            ],
+        ),
+        (
+            "codex",
+            vec![
+                "/d",
+                "/v:off",
+                "/c",
+                "codex",
+                "exec",
+                "-",
+                "<%DISPATCH_TASK_FILE%",
+            ],
+        ),
+    ] {
+        let run = registry
+            .get(id)
+            .expect("the built-in exists")
+            .task_launch_for("windows", hostile)
+            .expect("it can be delegated to on Windows");
 
-    assert_eq!(launch.command, "cmd.exe");
+        assert_eq!(run.launch.command, "cmd.exe", "{id}");
+        assert_eq!(run.launch.args, expected, "{id}");
+        assert_eq!(run.input, TaskInput::File, "{id}");
+        assert!(
+            !run.launch.args.iter().any(|arg| arg.contains("MARKER")),
+            "{id}: the task reached the command line"
+        );
+    }
+}
+
+#[test]
+fn a_task_form_that_puts_the_task_on_cmds_command_line_is_refused_on_windows() {
+    // Exactly what every earlier Dispatch wrote. A user who never edited it
+    // gets the new one written over it; one who did is told what to change.
+    let old: HarnessDef =
+        toml::from_str(include_str!("../harnesses/superseded/claude-1.toml")).expect("it parses");
+
+    let reason = old
+        .task_refusal_for("windows")
+        .expect("the old Windows form is refused");
+    assert!(
+        reason.contains("claude.toml") && reason.contains("DISPATCH_TASK_FILE"),
+        "the refusal names the file and the fix: {reason}"
+    );
+
     assert_eq!(
-        launch.args,
-        vec!["/c", "claude", "-p", "write the tests"],
-        "the shim wrapper has to stay in front of the one-shot flags"
+        old.task_refusal_for("linux"),
+        None,
+        "no shell is involved there"
+    );
+
+    let current: HarnessDef =
+        toml::from_str(defaults::BUILT_INS[0].toml).expect("the built-in parses");
+    assert_eq!(current.task_refusal_for("windows"), None);
+}
+
+#[test]
+fn an_unedited_built_in_from_an_older_release_is_upgraded() {
+    let dir = TempDir::new("upgrade-unedited");
+    dir.write(
+        "claude.toml",
+        include_str!("../harnesses/superseded/claude-1.toml"),
+    );
+
+    let written = write_missing_built_ins(dir.path()).expect("writing succeeds");
+
+    assert!(
+        written.contains(&"claude"),
+        "the old file was replaced: {written:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("claude.toml")).expect("it reads"),
+        defaults::BUILT_INS[0].toml
+    );
+}
+
+#[test]
+fn an_older_built_in_checked_out_with_crlf_is_still_recognised() {
+    let dir = TempDir::new("upgrade-crlf");
+    dir.write(
+        "codex.toml",
+        &include_str!("../harnesses/superseded/codex-1.toml").replace('\n', "\r\n"),
+    );
+
+    let written = write_missing_built_ins(dir.path()).expect("writing succeeds");
+    assert!(written.contains(&"codex"), "{written:?}");
+}
+
+#[test]
+fn an_edited_built_in_from_an_older_release_is_left_alone() {
+    let dir = TempDir::new("upgrade-edited");
+    let edited = format!(
+        "{}\n# mine\n",
+        include_str!("../harnesses/superseded/claude-1.toml")
+    );
+    dir.write("claude.toml", &edited);
+
+    let written = write_missing_built_ins(dir.path()).expect("writing succeeds");
+
+    assert!(!written.contains(&"claude"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("claude.toml")).expect("it reads"),
+        edited
+    );
+}
+
+#[test]
+fn a_batch_file_named_as_the_command_puts_the_task_on_cmds_command_line_too() {
+    // Windows runs a .cmd or .bat through cmd.exe whatever starts it, so a
+    // task in its arguments is parsed exactly as it would be after `/c`.
+    let form = |command: &str| -> HarnessDef {
+        toml::from_str(&format!(
+            "id = \"shim\"\ndisplay_name = \"Shim\"\ncommand = '{command}'\n\n\
+             [task]\nargs = [\"-p\", \"{{task}}\"]\n"
+        ))
+        .expect("the definition parses")
+    };
+
+    for command in ["claude.cmd", r"C:\tools\RUN.BAT", "cmd"] {
+        assert!(
+            form(command).task_refusal_for("windows").is_some(),
+            "{command} runs through cmd.exe"
+        );
+    }
+    assert_eq!(
+        form("claude.exe").task_refusal_for("windows"),
+        None,
+        "an executable is started directly, and its arguments reach it whole"
     );
 }
 
@@ -497,14 +628,14 @@ fn a_platform_without_its_own_form_uses_the_default_one() {
     write_missing_built_ins(dir.path()).expect("the built-ins are written");
     let registry = HarnessRegistry::load_from_dir(dir.path()).expect("they load");
 
-    let launch = registry
+    let run = registry
         .get("claude")
         .expect("the built-in exists")
         .task_launch_for("linux", "write the tests")
         .expect("claude can be delegated to on Linux");
 
-    assert_eq!(launch.command, "claude");
-    assert_eq!(launch.args, vec!["-p", "write the tests"]);
+    assert_eq!(run.launch.command, "claude");
+    assert_eq!(run.launch.args, vec!["-p", "write the tests"]);
 }
 
 #[test]
@@ -566,9 +697,10 @@ fn an_icon_is_one_column_wide() {
 
 #[test]
 fn a_built_in_without_an_icon_still_gets_its_own() {
-    // Dispatch never rewrites a harness file that already exists, so every
-    // installation made before icons existed has four files with no `icon`
-    // key. Falling back on the id keeps those looking right.
+    // Dispatch upgrades only harness files it recognises as its own, and none
+    // from before icons existed is among them, so every installation made
+    // then has four files with no `icon` key. Falling back on the id keeps
+    // those looking right.
     let def: HarnessDef =
         toml::from_str("id = \"claude\"\ndisplay_name = \"Claude Code\"\ncommand = \"claude\"")
             .expect("it parses");

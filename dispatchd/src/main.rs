@@ -69,9 +69,10 @@ fn main() -> Result<()> {
         return bridge::run(&endpoint);
     }
 
-    // Written on first run and never overwritten, so local edits survive. The
-    // daemon is the process that starts agents, so it is the one that needs
-    // the definitions.
+    // Written on first run, and afterwards only while a file is still exactly
+    // as an earlier Dispatch wrote it, so local edits survive and fixes to
+    // untouched built-ins still arrive. The daemon is the process that starts
+    // agents, so it is the one that needs the definitions.
     let harness_dir =
         dispatch_os::paths::harnesses_dir().context("failed to locate the harness directory")?;
     let written = dispatch_config::write_missing_built_ins(&harness_dir)

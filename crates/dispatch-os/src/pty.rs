@@ -146,7 +146,10 @@ fn refuse_nul(command: &PtyCommand<'_>) -> std::io::Result<()> {
 /// before a quote -- or before the closing quote -- doubled. The rules
 /// `portable-pty` 0.9 followed, so every argument reaches a program as it
 /// did. They are not `cmd.exe`'s rules: nothing that has to reach a program
-/// intact can travel as an argument that `cmd.exe` parses again.
+/// intact can travel as an argument that `cmd.exe` parses again. That is why
+/// a task for an agent behind `cmd.exe` goes to its standard input
+/// (`dispatch_config::TaskInput::File`), and only `<%DISPATCH_TASK_FILE%`,
+/// which this leaves bare, names it on the command line.
 #[cfg_attr(
     not(windows),
     allow(

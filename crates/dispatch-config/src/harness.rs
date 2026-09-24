@@ -66,12 +66,55 @@ pub struct Launch {
     pub env: BTreeMap<String, String>,
 }
 
-/// One platform's arguments for a one-shot run.
+/// How a one-shot run is given its task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskInput {
+    /// `{task}` in the arguments is replaced by the task, as one argument.
+    ///
+    /// Safe wherever the program is started directly: an argument is not
+    /// parsed by anything on the way.
+    #[default]
+    Argument,
+    /// The task is written to a file named by [`TASK_FILE_ENV`], and the
+    /// arguments redirect that file into the program's standard input.
+    ///
+    /// For a program reached through `cmd.exe`, which reads its whole command
+    /// line as shell syntax: a task placed there could run its `&`, `|` and
+    /// `%VAR%` as commands, and cannot carry a newline at all. A file on
+    /// standard input is parsed by nothing.
+    File,
+}
+
+/// The variable naming a task's file, for a form whose input is
+/// [`TaskInput::File`].
+///
+/// On Windows its value is the path in double quotes, ready for `cmd.exe`'s
+/// `<`: the variable is expanded where it stands, so an unquoted path with a
+/// space in it -- `C:\Users\Ada Lovelace\…` -- would redirect from the part
+/// before the space. Elsewhere it is the bare path, for a shell to quote as
+/// `"$DISPATCH_TASK_FILE"`.
+pub const TASK_FILE_ENV: &str = "DISPATCH_TASK_FILE";
+
+/// A one-shot run, ready to start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRun {
+    /// What to start.
+    pub launch: Launch,
+    /// How the task reaches it.
+    pub input: TaskInput,
+}
+
+/// One platform's form for a one-shot run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskArgs {
     /// Arguments, with `{task}` standing for the task.
     #[serde(default)]
     pub args: Vec<String>,
+    /// How the task reaches the program: `{task}` in the arguments, or a
+    /// file on its standard input.
+    #[serde(default)]
+    pub input: TaskInput,
 }
 
 /// How to run a harness once, on one task, without a person at the keyboard.
@@ -85,6 +128,10 @@ pub struct TaskLaunch {
     /// Arguments for the one-shot form, with `{task}` standing for the task.
     #[serde(default)]
     pub args: Vec<String>,
+    /// How the task reaches the program: `{task}` in the arguments, or a
+    /// file on its standard input.
+    #[serde(default)]
+    pub input: TaskInput,
     /// Per-platform overrides, keyed by `std::env::consts::OS` exactly as
     /// `HarnessDef::platform` is. A platform whose interactive launch needs a
     /// wrapper needs it here too: the wrapper is how the executable is reached,
@@ -152,8 +199,9 @@ impl HarnessDef {
     /// The mark drawn beside this harness's panes.
     ///
     /// A file with no `icon` key falls back on its id before the generic
-    /// glyph: Dispatch never rewrites a harness file it already wrote, so
-    /// every installation made before icons existed has four of them.
+    /// glyph: Dispatch upgrades only harness files it recognises as its own,
+    /// and none from before icons existed is among them, so every
+    /// installation made then has four of them.
     #[must_use]
     pub fn icon(&self) -> &str {
         self.icon
@@ -196,31 +244,82 @@ impl HarnessDef {
         launch
     }
 
-    /// The launch for running `task` once on the current platform.
+    /// The run for doing `task` once on the current platform.
     #[must_use]
-    pub fn task_launch(&self, task: &str) -> Option<Launch> {
+    pub fn task_launch(&self, task: &str) -> Option<TaskRun> {
         self.task_launch_for(std::env::consts::OS, task)
     }
 
-    /// The launch for running `task` once on a named platform.
+    /// The run for doing `task` once on a named platform.
     ///
     /// Returns `None` when the harness has no one-shot form for that platform,
     /// including when its argument list is empty: without arguments there is no
     /// way to tell the agent what the task is, so there is nothing to run.
     #[must_use]
-    pub fn task_launch_for(&self, os: &str, task: &str) -> Option<Launch> {
+    pub fn task_launch_for(&self, os: &str, task: &str) -> Option<TaskRun> {
         let form = self.task.as_ref()?;
 
-        let args = match form.platform.get(os) {
-            Some(override_) => &override_.args,
-            None => &form.args,
+        let (args, input) = match form.platform.get(os) {
+            Some(override_) => (&override_.args, override_.input),
+            None => (&form.args, form.input),
         };
         if args.is_empty() {
             return None;
         }
 
         let mut launch = self.launch_for(os);
-        launch.args = args.iter().map(|arg| arg.replace("{task}", task)).collect();
-        Some(launch)
+        launch.args = match input {
+            TaskInput::Argument => args.iter().map(|arg| arg.replace("{task}", task)).collect(),
+            // Nothing is substituted: the task goes to a file, and the
+            // arguments only ever name the file.
+            TaskInput::File => args.clone(),
+        };
+
+        Some(TaskRun { launch, input })
     }
+
+    /// Why this harness's one-shot form must not run on `os`, if it must not.
+    ///
+    /// A form that puts the task on `cmd.exe`'s command line lets the task's
+    /// `&`, `|` and `%VAR%` run as commands. The harness file is the user's
+    /// and may predate Dispatch knowing that, so such a form is refused with
+    /// a way out rather than run.
+    #[must_use]
+    pub fn task_refusal_for(&self, os: &str) -> Option<String> {
+        if os != "windows" {
+            return None;
+        }
+
+        let form = self.task.as_ref()?;
+        let (args, input) = match form.platform.get(os) {
+            Some(override_) => (&override_.args, override_.input),
+            None => (&form.args, form.input),
+        };
+        let on_the_command_line =
+            input == TaskInput::Argument && args.iter().any(|arg| arg.contains("{task}"));
+        if !on_the_command_line || !runs_through_cmd(&self.launch_for(os).command) {
+            return None;
+        }
+
+        Some(format!(
+            "harness {id:?} would put the task on cmd.exe's command line, where characters \
+             like & and % run as commands. Change [task.platform.windows] in {id}.toml to \
+             redirect the task from %{TASK_FILE_ENV}% with input = \"file\" (the built-in \
+             claude.toml shows how), or delete {id}.toml if it is a built-in you never meant \
+             to edit, and restart the daemon",
+            id = self.id
+        ))
+    }
+}
+
+/// Whether `command` runs through `cmd.exe`: the program itself, or a batch
+/// file, which Windows runs with it.
+fn runs_through_cmd(command: &str) -> bool {
+    let name = std::path::Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
+        .to_ascii_lowercase();
+
+    name == "cmd" || name == "cmd.exe" || name.ends_with(".cmd") || name.ends_with(".bat")
 }
