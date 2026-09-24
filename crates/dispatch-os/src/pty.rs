@@ -171,6 +171,34 @@ fn quote_for_crt(arg: &str) -> String {
     quoted
 }
 
+/// `path` when it names a file, or else `path` with the first extension in
+/// `pathext` -- a `;`-separated list, as the variable is -- that makes it
+/// name one.
+///
+/// How Windows finds a program named without its extension: `claude` is run
+/// as `claude.exe`, or as `claude.cmd` when that is what an installer left.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "only the Windows spawn looks for its program; the tests run everywhere"
+    )
+)]
+fn find_with_pathext(path: &Path, pathext: &str) -> Option<std::path::PathBuf> {
+    if path.is_file() {
+        return Some(path.to_path_buf());
+    }
+    pathext
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .map(|extension| {
+            let mut candidate = path.as_os_str().to_owned();
+            candidate.push(extension);
+            std::path::PathBuf::from(candidate)
+        })
+        .find(|candidate| candidate.is_file())
+}
+
 #[cfg(unix)]
 mod imp {
     use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -264,7 +292,56 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::ErrorKind;
 
-    use super::{PtyCommand, quote_for_crt, refuse_nul, spawn};
+    use super::{PtyCommand, find_with_pathext, quote_for_crt, refuse_nul, spawn};
+
+    /// A fresh directory holding an empty file for each of `names`.
+    fn a_dir_with(label: &str, names: &[&str]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dispatch-os-pathext-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir is writable");
+        for name in names {
+            std::fs::write(dir.join(name), b"").expect("temp dir is writable");
+        }
+        dir
+    }
+
+    #[test]
+    fn a_program_path_is_completed_with_the_first_pathext_that_names_a_file() {
+        const PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+        let dir = a_dir_with(
+            "complete",
+            &["claude.CMD", "tool.EXE", "tool.COM", "exact", "exact.EXE"],
+        );
+        std::fs::create_dir_all(dir.join("folder")).expect("temp dir is writable");
+        std::fs::write(dir.join("folder.EXE"), b"").expect("temp dir is writable");
+
+        assert_eq!(
+            find_with_pathext(&dir.join("claude"), PATHEXT),
+            Some(dir.join("claude.CMD")),
+            "completed with the extension that names a file"
+        );
+        assert_eq!(
+            find_with_pathext(&dir.join("tool"), PATHEXT),
+            Some(dir.join("tool.COM")),
+            "in PATHEXT's order"
+        );
+        assert_eq!(
+            find_with_pathext(&dir.join("exact"), PATHEXT),
+            Some(dir.join("exact")),
+            "a file named exactly is taken as it is"
+        );
+        assert_eq!(
+            find_with_pathext(&dir.join("folder"), PATHEXT),
+            Some(dir.join("folder.EXE")),
+            "a directory is not a program"
+        );
+        assert_eq!(find_with_pathext(&dir.join("missing"), PATHEXT), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_nul_anywhere_in_a_command_is_refused() {

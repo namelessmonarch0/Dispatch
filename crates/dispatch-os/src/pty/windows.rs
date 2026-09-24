@@ -334,31 +334,29 @@ fn environment_block(environment: &BTreeMap<String, (OsString, OsString)>) -> Ve
     block
 }
 
-/// Finds `program` as `portable-pty` did: as given when it names a path, and
-/// otherwise in each `PATH` directory, as named and then with each `PATHEXT`
-/// extension.
+/// The file `program` names.
+///
+/// A path is taken as it is, or with the first `PATHEXT` extension that
+/// makes it name a file; a bare name is looked for the same way in each
+/// `PATH` directory in turn. `portable-pty` 0.9 did the same with two
+/// differences: it replaced an extension the name already had rather than
+/// adding one, and it looked for a relative path with a separator on `PATH`,
+/// where this finds it from the current directory, as `CreateProcessW` does.
 fn resolve(program: &str, environment: &BTreeMap<String, (OsString, OsString)>) -> PathBuf {
-    let given = Path::new(program);
-    if given.is_absolute() || given.components().count() > 1 {
-        return given.to_path_buf();
-    }
-
-    let extensions = environment
+    let pathext = environment
         .get("PATHEXT")
         .map(|(_, value)| value.to_string_lossy().into_owned())
         .unwrap_or_else(|| ".EXE".to_string());
 
+    let given = Path::new(program);
+    if given.is_absolute() || given.components().count() > 1 {
+        return super::find_with_pathext(given, &pathext).unwrap_or_else(|| given.to_path_buf());
+    }
+
     if let Some((_, path)) = environment.get("PATH") {
         for dir in std::env::split_paths(path) {
-            let exact = dir.join(program);
-            if exact.is_file() {
-                return exact;
-            }
-            for extension in extensions.split(';').filter(|e| !e.is_empty()) {
-                let candidate = dir.join(format!("{program}{extension}"));
-                if candidate.is_file() {
-                    return candidate;
-                }
+            if let Some(found) = super::find_with_pathext(&dir.join(program), &pathext) {
+                return found;
             }
         }
     }
