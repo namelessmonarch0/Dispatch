@@ -570,10 +570,13 @@ fn an_unedited_built_in_from_an_older_release_is_upgraded() {
 #[test]
 fn an_older_built_in_checked_out_with_crlf_is_still_recognised() {
     let dir = TempDir::new("upgrade-crlf");
-    dir.write(
-        "codex.toml",
-        &include_str!("../harnesses/superseded/codex-1.toml").replace('\n', "\r\n"),
-    );
+    // Made LF first: a Windows checkout already has CRLF in what
+    // `include_str!` reads, and doubling its carriage returns would make a
+    // file no checkout ever wrote.
+    let crlf = include_str!("../harnesses/superseded/codex-1.toml")
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n");
+    dir.write("codex.toml", &crlf);
 
     let written = write_missing_built_ins(dir.path()).expect("writing succeeds");
     assert!(written.contains(&"codex"), "{written:?}");
