@@ -56,6 +56,22 @@ fn harnesses(dir: &std::path::Path) -> HarnessRegistry {
     };
     std::fs::write(dir.join("flood.toml"), flood).expect("temp dir is writable");
 
+    // Prints the numbers from one to COUNTED, one to a line, and then waits:
+    // output in which every byte has one place, so what a client is replayed
+    // can be held against exactly what the pane printed. Through `cat`, so it
+    // arrives in large writes: `seq` writing to a terminal writes a line at a
+    // time, and a pane is handed a bounded number of reads per tick.
+    let count = if cfg!(windows) {
+        format!(
+            "id = \"count\"\ndisplay_name = \"Count\"\ncommand = \"cmd.exe\"\nargs = [\"/c\", \"(for /l %i in (1,1,{COUNTED}) do @echo %i) & ping -n 30 127.0.0.1 >nul\"]\n"
+        )
+    } else {
+        format!(
+            "id = \"count\"\ndisplay_name = \"Count\"\ncommand = \"sh\"\nargs = [\"-c\", \"seq 1 {COUNTED} | cat; sleep 30\"]\n"
+        )
+    };
+    std::fs::write(dir.join("count.toml"), count).expect("temp dir is writable");
+
     // A pane with a grandchild, so shutdown can be seen to end the whole tree.
     let tree = if cfg!(windows) {
         "id = \"tree\"\ndisplay_name = \"Tree\"\ncommand = \"cmd.exe\"\nargs = [\"/c\", \"ping -n 30 127.0.0.1 >nul\"]\n"
@@ -66,6 +82,13 @@ fn harnesses(dir: &std::path::Path) -> HarnessRegistry {
 
     HarnessRegistry::load_from_dir(dir).expect("loading succeeds")
 }
+
+/// How far the `count` harness counts.
+///
+/// About 2 MB of output: well past what a client that never reads can hold
+/// in its socket and its outbox, so it is hung up, and far past the history
+/// a late client is replayed.
+const COUNTED: u32 = 300_000;
 
 /// A temporary directory that cleans itself up.
 struct TempDir(PathBuf);
@@ -2663,6 +2686,16 @@ fn stops_listening(mut writer: RawWriter, patience: Duration) -> bool {
 /// Connects as a well-behaved interface client and collects what arrives in
 /// `window`.
 fn subscribe_and_collect(endpoint: &Path, window: Duration) -> Vec<ServerMessage> {
+    subscribe_and_collect_until(endpoint, window, |_| false)
+}
+
+/// Connects as a well-behaved interface client and collects what arrives
+/// until `done` holds of it, or `window` has passed.
+fn subscribe_and_collect_until(
+    endpoint: &Path,
+    window: Duration,
+    done: impl Fn(&[ServerMessage]) -> bool,
+) -> Vec<ServerMessage> {
     let (mut reader, mut writer) = raw_client(endpoint);
     Frame::write(&mut writer, &hello()).expect("writing succeeds");
     Frame::write(&mut writer, &ClientMessage::Subscribe).expect("writing succeeds");
@@ -2682,6 +2715,9 @@ fn subscribe_and_collect(endpoint: &Path, window: Duration) -> Vec<ServerMessage
         match hearing.recv_timeout(left) {
             Ok(message) => seen.push(message),
             Err(_) => break,
+        }
+        if done(&seen) {
+            break;
         }
     }
     drop(writer);
@@ -2766,6 +2802,35 @@ fn a_client_that_never_reads_costs_no_more_than_its_budget() {
     );
 }
 
+/// Every byte of pane output among `messages`, in the order it arrived.
+#[cfg(unix)]
+fn pane_output(messages: &[ServerMessage]) -> Vec<u8> {
+    messages
+        .iter()
+        .filter_map(|m| match m {
+            ServerMessage::PaneOutput { bytes, .. } => Some(bytes.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect()
+}
+
+/// `bytes` without the carriage returns a terminal puts before each newline.
+#[cfg(unix)]
+fn without_returns(bytes: &[u8]) -> Vec<u8> {
+    bytes.iter().copied().filter(|&b| b != b'\r').collect()
+}
+
+/// What the `count` harness prints, carriage returns aside.
+#[cfg(unix)]
+fn counted() -> Vec<u8> {
+    (1..=COUNTED)
+        .map(|n| format!("{n}\n"))
+        .collect::<String>()
+        .into_bytes()
+}
+
 #[test]
 #[cfg(unix)]
 fn a_client_that_stops_reading_is_hung_up_and_can_come_back() {
@@ -2784,7 +2849,7 @@ fn a_client_that_stops_reading_is_hung_up_and_can_come_back() {
         &mut writer,
         &ClientMessage::SpawnPane {
             project: served.project,
-            harness: "flood".into(),
+            harness: "count".into(),
             size: (80, 24),
         },
     )
@@ -2797,15 +2862,55 @@ fn a_client_that_stops_reading_is_hung_up_and_can_come_back() {
         "a client that stopped reading is still connected"
     );
 
-    // Coming back is an ordinary late subscription: the pane is described
-    // and what it printed recently is replayed.
-    let seen = subscribe_and_collect(&served.endpoint, Duration::from_millis(500));
+    // Coming back is an ordinary late subscription: the pane is described,
+    // and what was missed is replayed -- as much as the daemon keeps, in the
+    // order it was printed, with the pane's next output carrying on from
+    // exactly where the replay stops.
+    let printed = counted();
+    let last = format!("{COUNTED}\n");
+    // Only the newest messages are looked at: the whole output, gathered
+    // afresh for every message, is quadratic in a replay this size.
+    let seen = subscribe_and_collect_until(&served.endpoint, Duration::from_secs(20), |m| {
+        let start = m.len().saturating_sub(4);
+        without_returns(&pane_output(&m[start..])).ends_with(last.as_bytes())
+    });
     assert!(
         seen.iter()
-            .any(|m| matches!(m, ServerMessage::PaneSpawned { harness, .. } if harness == "flood")),
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { harness, .. } if harness == "count")),
         "the reconnected client is told about the pane"
     );
-    assert!(output_bytes(&seen) > 0, "and replayed what it printed");
+
+    let replay = seen
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::PaneOutput { bytes, .. } => Some(bytes.len()),
+            _ => None,
+        })
+        .expect("the pane's history is replayed");
+    let received = without_returns(&pane_output(&seen));
+    assert!(
+        received.ends_with(last.as_bytes()),
+        "the pane's output stopped arriving after {} bytes",
+        received.len()
+    );
+    assert!(
+        received.len() <= printed.len() && printed.ends_with(&received),
+        "the {} bytes a late client was sent are not the last {} the pane printed, in order; \
+         the first to differ is at {:?}",
+        received.len(),
+        received.len(),
+        received
+            .iter()
+            .rev()
+            .zip(printed.iter().rev())
+            .position(|(got, want)| got != want)
+            .map(|from_end| received.len() - 1 - from_end)
+    );
+    assert!(
+        replay == crate::pane::HISTORY_BYTES || received == printed,
+        "the replay held back part of the history: {replay} bytes of {}",
+        crate::pane::HISTORY_BYTES
+    );
 }
 
 #[test]
