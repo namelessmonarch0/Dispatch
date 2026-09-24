@@ -51,7 +51,7 @@ impl Drop for TaskFile {
         if let Err(error) = std::fs::remove_file(&self.path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            tracing::debug!(%error, path = %self.path.display(), "failed to remove a task's file");
+            tracing::warn!(%error, path = %self.path.display(), "failed to remove a task's file");
         }
     }
 }
