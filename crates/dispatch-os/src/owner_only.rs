@@ -190,17 +190,25 @@ const LAID_OUT_AS_ALLOWED: [u32; 4] = {
     ]
 };
 
-/// Each entry of the DACL on `handle`.
+/// A DACL as a test compares it.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Dacl {
+    /// Whether it is protected: nothing a parent holds is inherited into it.
+    pub(crate) protected: bool,
+    /// Its entries, in order.
+    pub(crate) entries: Vec<Ace>,
+}
+
+/// Each entry of the DACL on `handle`, a kernel object.
 ///
 /// A NULL DACL -- no list at all, which admits everyone -- is an error,
 /// so a test expecting entries fails on it rather than reading one.
 #[cfg(test)]
 pub(crate) fn dacl_of(handle: isize) -> std::io::Result<Vec<Ace>> {
+    use windows_sys::Win32::Security::ACL;
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
-    use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
-        DACL_SECURITY_INFORMATION, GetAce, GetAclInformation,
-    };
+    use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
 
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -222,19 +230,89 @@ pub(crate) fn dacl_of(handle: isize) -> std::io::Result<Vec<Ace>> {
         return Err(std::io::Error::from_raw_os_error(status as i32));
     }
 
+    // SAFETY: both came from the successful call above.
+    unsafe { read_dacl(descriptor, dacl) }.map(|dacl| dacl.entries)
+}
+
+/// The DACL on the file or directory at `path`, and whether it is
+/// protected.
+#[cfg(test)]
+pub(crate) fn dacl_of_path(path: &std::path::Path) -> std::io::Result<Dacl> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Security::ACL;
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide` is NUL-terminated and outlives the call; every
+    // out-pointer is valid; on success `descriptor` is LocalAlloc'd and
+    // `dacl`, unless null, points into it.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
+    }
+
+    // SAFETY: both came from the successful call above.
+    unsafe { read_dacl(descriptor, dacl) }
+}
+
+/// Reads `dacl` out of `descriptor`, then frees `descriptor`.
+///
+/// A NULL DACL -- no list at all, which admits everyone -- is an error, so
+/// a test expecting entries fails on it rather than reading one.
+///
+/// # Safety
+///
+/// `descriptor` must be a LocalAlloc'd descriptor that nothing else frees,
+/// and `dacl` null or its DACL.
+#[cfg(test)]
+unsafe fn read_dacl(
+    descriptor: PSECURITY_DESCRIPTOR,
+    dacl: *mut windows_sys::Win32::Security::ACL,
+) -> std::io::Result<Dacl> {
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation, GetAce,
+        GetAclInformation, GetSecurityDescriptorControl, SE_DACL_PROTECTED,
+    };
+
     // Read inside a closure so the descriptor `dacl` points into is freed
     // on every path out, failures included.
-    let entries = (|| {
+    let read = (|| {
         if dacl.is_null() {
             return Err(std::io::Error::other(
                 "the object has a NULL DACL, which admits everyone",
             ));
         }
 
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        // SAFETY: the caller vouches for `descriptor`; both out-pointers
+        // are valid.
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
         let mut size = ACL_SIZE_INFORMATION::default();
-        // SAFETY: `dacl` is the non-null DACL the call above returned,
-        // and `size` is an ACL_SIZE_INFORMATION of exactly the length
-        // passed.
+        // SAFETY: `dacl` is the non-null DACL the caller vouches for, and
+        // `size` is an ACL_SIZE_INFORMATION of exactly the length passed.
         let sized = unsafe {
             GetAclInformation(
                 dacl,
@@ -282,11 +360,14 @@ pub(crate) fn dacl_of(handle: isize) -> std::io::Result<Vec<Ace>> {
                 sid: sid?,
             });
         }
-        Ok(entries)
+        Ok(Dacl {
+            protected: control & SE_DACL_PROTECTED != 0,
+            entries,
+        })
     })();
 
-    // SAFETY: allocated by GetSecurityInfo, freed exactly once, and
+    // SAFETY: the caller vouches it is LocalAlloc'd and freed only here;
     // nothing reads `dacl` after this.
     unsafe { LocalFree(descriptor as HLOCAL) };
-    entries
+    read
 }

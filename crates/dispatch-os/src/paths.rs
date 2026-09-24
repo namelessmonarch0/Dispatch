@@ -127,6 +127,15 @@ pub fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
+/// Creates `path`, and any directory above it, for this user alone.
+///
+/// Where a delegated task's file is written: the task is whatever its user
+/// typed, and the directory is the first thing standing between it and
+/// every other account on the machine.
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
 /// `path` as a shell's `<` needs it in the variable that names it.
 ///
 /// Quoted on Windows, where `cmd.exe` expands the variable in place and a
@@ -317,6 +326,103 @@ mod tests {
         );
         #[cfg(unix)]
         assert_eq!(mode.expect("the file existed"), 0o600);
+    }
+
+    /// A directory of the test's own, gone when the returned guard is.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+
+            let path = std::env::temp_dir().join(format!(
+                "dispatch-os-paths-{label}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("temp dir is writable");
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_private_directory_is_its_owners_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| {
+            std::fs::metadata(path)
+                .expect("it exists")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        let scratch = Scratch::new("private-dir");
+        let fresh = scratch.0.join("made").join("tasks");
+        create_private_dir(&fresh).expect("the directory is made");
+        assert_eq!(mode(&fresh), 0o700, "made open to others");
+
+        // Made earlier, by something less careful: this user's own, so it
+        // is narrowed rather than trusted.
+        let loose = scratch.0.join("loose");
+        std::fs::create_dir(&loose).expect("temp dir is writable");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755))
+            .expect("permissions change");
+        create_private_dir(&loose).expect("an existing directory is fine");
+        assert_eq!(mode(&loose), 0o700, "left open to others");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_private_directory_admits_its_owner_alone() {
+        let scratch = Scratch::new("private-dir");
+        let dir = scratch.0.join("made").join("tasks");
+        create_private_dir(&dir).expect("the directory is made");
+
+        assert_eq!(
+            crate::owner_only::dacl_of_path(&dir).expect("the DACL reads back"),
+            owner_alone(),
+            "the directory admits somebody else, or takes what its parent admits"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_private_file_admits_its_owner_alone() {
+        let scratch = Scratch::new("private-file");
+        let path = scratch.0.join("task.txt");
+        drop(create_private(&path).expect("the file is made"));
+
+        assert_eq!(
+            crate::owner_only::dacl_of_path(&path).expect("the DACL reads back"),
+            owner_alone(),
+            "the file admits somebody else, or takes what its directory admits"
+        );
+    }
+
+    /// A protected DACL with one entry: this user, allowed everything.
+    ///
+    /// `GA` is not stored as written: a file's descriptor is assigned
+    /// through the file generic mapping, so GENERIC_ALL lands as the
+    /// FILE_ALL_ACCESS it maps to.
+    #[cfg(windows)]
+    fn owner_alone() -> crate::owner_only::Dacl {
+        crate::owner_only::Dacl {
+            protected: true,
+            entries: vec![crate::owner_only::Ace {
+                kind: crate::owner_only::ACCESS_ALLOWED,
+                mask: windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS,
+                sid: crate::owner_only::current_user_sid().expect("this process has a user"),
+            }],
+        }
     }
 
     #[test]

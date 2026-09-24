@@ -18,7 +18,7 @@ pub struct TaskFile {
 impl TaskFile {
     /// Writes `task` to a new file in `dir` that only this user can read.
     pub fn write(dir: &Path, request: RequestId, task: &str) -> std::io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        dispatch_os::paths::create_private_dir(dir)?;
 
         let path = dir.join(format!("dispatch-task-{request}.txt"));
         let mut handle = dispatch_os::paths::create_private(&path)?;
