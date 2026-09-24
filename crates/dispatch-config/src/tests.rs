@@ -664,6 +664,15 @@ fn an_older_built_in_checked_out_with_crlf_is_still_recognised() {
 
     let written = write_missing_built_ins(dir.path()).expect("writing succeeds");
     assert!(written.contains(&"codex"), "{written:?}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("codex.toml")).expect("it reads"),
+        defaults::BUILT_INS
+            .iter()
+            .find(|b| b.id == "codex")
+            .expect("codex ships")
+            .toml,
+        "the file holds the current body, not the old one or a mix"
+    );
 }
 
 #[test]
