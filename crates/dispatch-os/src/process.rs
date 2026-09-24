@@ -467,6 +467,14 @@ mod tests {
         // Reap the shell so it does not linger as a zombie and report alive.
         child.wait().expect("the shell can be reaped");
 
+        // Polled, as every sibling test polls: the group has been signalled,
+        // but a killed process answers `kill(pid, 0)` until whoever inherited
+        // it reaps it, and on macOS that is launchd, on its own schedule.
+        const PATIENCE: Duration = Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while pid_is_alive(grandchild) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(
             !pid_is_alive(grandchild),
             "the grandchild outlived its process group"
