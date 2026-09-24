@@ -798,7 +798,7 @@ mod imp {
         SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
+        FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION,
     };
     use windows_sys::Win32::System::IO::CancelIoEx;
     use windows_sys::Win32::System::Pipes::{
@@ -1137,6 +1137,8 @@ mod imp {
     /// Opens the daemon's pipe for `path`, waiting out a busy one, and
     /// refuses it unless this user owns it.
     pub(super) fn connect(path: &Path) -> Result<Stream, IpcError> {
+        use std::os::windows::fs::OpenOptionsExt;
+
         let name = pipe_name(path);
         let deadline = std::time::Instant::now() + BUSY_PATIENCE;
 
@@ -1144,6 +1146,13 @@ mod imp {
             let opened = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
+                // Identification only: whoever serves the pipe may learn
+                // which user this is, but not act as that user. The client's
+                // identity is handed over as the pipe opens, before the owner
+                // check below can refuse a pipe someone else created, and a
+                // squatter holding SeImpersonatePrivilege could otherwise act
+                // with it. The daemon never impersonates, so nothing is lost.
+                .security_qos_flags(SECURITY_IDENTIFICATION)
                 .open(&name)
                 .map(Stream::new);
 
