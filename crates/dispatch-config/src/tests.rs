@@ -526,7 +526,7 @@ fn a_task_form_that_puts_the_task_on_cmds_command_line_is_refused_on_windows() {
     // Exactly what every earlier Dispatch wrote. A user who never edited it
     // gets the new one written over it; one who did is told what to change.
     let old: HarnessDef =
-        toml::from_str(include_str!("../harnesses/superseded/claude-1.toml")).expect("it parses");
+        toml::from_str(include_str!("../harnesses/superseded/claude-5.toml")).expect("it parses");
 
     let reason = old
         .task_refusal_for("windows")
@@ -581,7 +581,7 @@ fn an_unedited_built_in_from_an_older_release_is_upgraded() {
     let dir = TempDir::new("upgrade-unedited");
     dir.write(
         "claude.toml",
-        include_str!("../harnesses/superseded/claude-1.toml"),
+        include_str!("../harnesses/superseded/claude-5.toml"),
     );
 
     let written = write_missing_built_ins(dir.path()).expect("writing succeeds");
@@ -597,12 +597,67 @@ fn an_unedited_built_in_from_an_older_release_is_upgraded() {
 }
 
 #[test]
+fn every_body_an_earlier_dispatch_wrote_is_upgraded() {
+    // Byte for byte what each release wrote, oldest first: an installation
+    // made at any of them and never edited has one of these, and the unsafe
+    // Windows form in all but the first.
+    let written_before: [(&str, [&str; 5]); 2] = [
+        (
+            "claude",
+            [
+                include_str!("../harnesses/superseded/claude-1.toml"),
+                include_str!("../harnesses/superseded/claude-2.toml"),
+                include_str!("../harnesses/superseded/claude-3.toml"),
+                include_str!("../harnesses/superseded/claude-4.toml"),
+                include_str!("../harnesses/superseded/claude-5.toml"),
+            ],
+        ),
+        (
+            "codex",
+            [
+                include_str!("../harnesses/superseded/codex-1.toml"),
+                include_str!("../harnesses/superseded/codex-2.toml"),
+                include_str!("../harnesses/superseded/codex-3.toml"),
+                include_str!("../harnesses/superseded/codex-4.toml"),
+                include_str!("../harnesses/superseded/codex-5.toml"),
+            ],
+        ),
+    ];
+
+    for (id, bodies) in written_before {
+        let current = defaults::BUILT_INS
+            .iter()
+            .find(|b| b.id == id)
+            .expect("it ships")
+            .toml;
+        for (release, body) in bodies.iter().enumerate() {
+            let dir = TempDir::new("upgrade-every-body");
+            dir.write(&format!("{id}.toml"), body);
+
+            let written = write_missing_built_ins(dir.path()).expect("writing succeeds");
+
+            assert!(
+                written.contains(&id),
+                "{id}-{} was not recognised: {written:?}",
+                release + 1
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(format!("{id}.toml"))).expect("it reads"),
+                current,
+                "{id}-{}",
+                release + 1
+            );
+        }
+    }
+}
+
+#[test]
 fn an_older_built_in_checked_out_with_crlf_is_still_recognised() {
     let dir = TempDir::new("upgrade-crlf");
     // Made LF first: a Windows checkout already has CRLF in what
     // `include_str!` reads, and doubling its carriage returns would make a
     // file no checkout ever wrote.
-    let crlf = include_str!("../harnesses/superseded/codex-1.toml")
+    let crlf = include_str!("../harnesses/superseded/codex-5.toml")
         .replace("\r\n", "\n")
         .replace('\n', "\r\n");
     dir.write("codex.toml", &crlf);
@@ -616,7 +671,7 @@ fn an_edited_built_in_from_an_older_release_is_left_alone() {
     let dir = TempDir::new("upgrade-edited");
     let edited = format!(
         "{}\n# mine\n",
-        include_str!("../harnesses/superseded/claude-1.toml")
+        include_str!("../harnesses/superseded/claude-5.toml")
     );
     dir.write("claude.toml", &edited);
 
@@ -805,10 +860,9 @@ fn an_icon_is_one_column_wide() {
 
 #[test]
 fn a_built_in_without_an_icon_still_gets_its_own() {
-    // Dispatch upgrades only harness files it recognises as its own, and none
-    // from before icons existed is among them, so every installation made
-    // then has four files with no `icon` key. Falling back on the id keeps
-    // those looking right.
+    // An installation made before icons existed keeps files with no `icon`
+    // key wherever they are not upgraded: agy and opencode, and any the user
+    // edited. Falling back on the id keeps those looking right.
     let def: HarnessDef =
         toml::from_str("id = \"claude\"\ndisplay_name = \"Claude Code\"\ncommand = \"claude\"")
             .expect("it parses");

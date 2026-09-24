@@ -1,4 +1,5 @@
 id = "claude"
+icon = ""
 display_name = "Claude Code"
 command = "claude"
 args = []
@@ -8,6 +9,12 @@ args = []
 [platform.windows]
 command = "cmd.exe"
 args = ["/c", "claude"]
+
+[task]
+args = ["-p", "{task}"]
+
+[task.platform.windows]
+args = ["/c", "claude", "-p", "{task}"]
 
 [[settings]]
 key = "model"

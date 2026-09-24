@@ -206,9 +206,9 @@ impl HarnessDef {
     /// The mark drawn beside this harness's panes.
     ///
     /// A file with no `icon` key falls back on its id before the generic
-    /// glyph: Dispatch upgrades only harness files it recognises as its own,
-    /// and none from before icons existed is among them, so every
-    /// installation made then has four of them.
+    /// glyph: an installation made before icons existed keeps its files
+    /// without one wherever they are not upgraded -- `agy` and `opencode`,
+    /// and any the user edited.
     #[must_use]
     pub fn icon(&self) -> &str {
         self.icon

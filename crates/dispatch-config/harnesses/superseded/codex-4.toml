@@ -1,4 +1,5 @@
 id = "codex"
+icon = ""
 display_name = "Codex"
 command = "codex"
 args = []
@@ -6,6 +7,12 @@ args = []
 [platform.windows]
 command = "cmd.exe"
 args = ["/c", "codex"]
+
+[task]
+args = ["exec", "{task}"]
+
+[task.platform.windows]
+args = ["/c", "codex", "exec", "{task}"]
 
 [[settings]]
 key = "model"
