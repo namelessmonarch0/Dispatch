@@ -1386,7 +1386,9 @@ mod windows_tests {
         terminate_tree(helper.id(), DEFAULT_GRACE).expect("the helper's job is ended");
         let _ = helper.wait();
 
-        let outlived = !detached.has_exited();
+        // Given a while to die rather than asked once: a job counts no live
+        // processes a moment before each one's handle is signalled.
+        let outlived = !eventually(Duration::from_secs(2), || detached.has_exited());
         detached.end();
         assert!(
             outlived,
