@@ -659,9 +659,11 @@ fn a_dropped_pane_lets_go_of_a_terminal_something_else_still_holds() {
     // A process that leaves the pane's session -- so ending the pane does not
     // end it -- and prints to the terminal until printing fails, then says
     // so. On Linux printing fails only once nothing holds the terminal's
-    // other side; macOS revokes the terminal from everyone as soon as the
-    // pane's session leader exits, so there this passes either way. perl,
-    // because macOS has no setsid(1); it gives up after 20 s regardless.
+    // other side. macOS revokes the terminal from everyone as soon as the
+    // pane's session leader exits, so there this passes either way -- and
+    // the shell waits, so that a revoke before the first print cannot fail
+    // the test before the pane is dropped. perl, because macOS has no
+    // setsid(1); it gives up after 20 s regardless.
     let dir = std::env::temp_dir().join(format!("dispatch-pty-held-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp dir is writable");
@@ -669,7 +671,7 @@ fn a_dropped_pane_lets_go_of_a_terminal_something_else_still_holds() {
     let script = format!(
         "perl -e 'use POSIX; exit 0 if fork; POSIX::setsid(); $SIG{{HUP}} = \"IGNORE\"; $| = 1; \
          for (1..400) {{ unless (print \"tick\\n\") {{ open(my $f, \">\", $ARGV[0]); print $f \"gone\"; exit 0 }} \
-         select(undef, undef, undef, 0.05) }}' \"{}\"",
+         select(undef, undef, undef, 0.05) }}' \"{}\"; sleep 30",
         gone.display()
     );
 
