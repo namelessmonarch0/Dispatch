@@ -218,23 +218,14 @@ impl Pty {
     /// Never blocks: a pane with nothing to say costs one failed receive.
     /// What is left waits for the next call.
     pub fn drain(&mut self) -> Vec<u8> {
-        let mut output = Vec::new();
-
-        while output.len() < DRAIN_BUDGET {
-            match self.events.try_recv() {
-                Ok(PtyEvent::Output(bytes)) => output.extend_from_slice(&bytes),
-                Ok(PtyEvent::Exited(code)) => self.state = RunState::Exited(code),
-                Err(TryRecvError::Empty) => break,
-                // Both senders are gone, which happens only once the reader has
-                // reached end-of-file and the waiter has reported the exit.
-                Err(TryRecvError::Disconnected) => {
-                    self.finished = true;
-                    break;
-                }
-            }
+        let drained = drain_from(&self.events, DRAIN_BUDGET);
+        if let Some(code) = drained.exited {
+            self.state = RunState::Exited(code);
         }
-
-        output
+        if drained.finished {
+            self.finished = true;
+        }
+        drained.output
     }
 
     /// Whether the child exited *and* everything it printed has been delivered.
@@ -487,6 +478,46 @@ fn answer_inherit_cursor_handshake(writer: &mut Box<dyn Write + Send>) {
     if let Err(error) = writer.write_all(b"\x1b[1;1R").and_then(|()| writer.flush()) {
         tracing::warn!(%error, "failed to answer the ConPTY inherit-cursor handshake");
     }
+}
+
+/// What one pass over a pane's events found.
+struct Drained {
+    /// The output taken.
+    output: Vec<u8>,
+    /// The exit status, when the exit was among the events taken.
+    exited: Option<i32>,
+    /// Whether the channel was found closed: nothing more will ever arrive.
+    finished: bool,
+}
+
+/// Takes events until `budget` bytes of output are in hand, or none are
+/// waiting.
+///
+/// Apart from [`Pty`] so a test can fill the channel itself: a real pane
+/// cannot be made to have a known amount waiting at the moment it is
+/// drained.
+fn drain_from(events: &Receiver<PtyEvent>, budget: usize) -> Drained {
+    let mut drained = Drained {
+        output: Vec::new(),
+        exited: None,
+        finished: false,
+    };
+
+    while drained.output.len() < budget {
+        match events.try_recv() {
+            Ok(PtyEvent::Output(bytes)) => drained.output.extend_from_slice(&bytes),
+            Ok(PtyEvent::Exited(code)) => drained.exited = Some(code),
+            Err(TryRecvError::Empty) => break,
+            // Both senders are gone, which happens only once the reader has
+            // reached end-of-file and the waiter has reported the exit.
+            Err(TryRecvError::Disconnected) => {
+                drained.finished = true;
+                break;
+            }
+        }
+    }
+
+    drained
 }
 
 /// Reads the pseudoterminal until end-of-file, forwarding bytes.

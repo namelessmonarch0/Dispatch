@@ -484,3 +484,42 @@ fn a_flood_is_handed_over_a_budget_at_a_time() {
 
     assert_eq!(received, TOTAL, "every byte arrived, none twice");
 }
+
+#[test]
+fn a_drain_stops_at_its_budget_and_the_next_takes_the_rest() {
+    // The flood test above cannot tell a drain that keeps to its budget from
+    // one that takes everything: a real pane seldom has more than a budget
+    // waiting at the moment it is drained. Here the channel is filled before
+    // anything drains it. Chunks of 5000 bytes, so one of them crosses the
+    // budget rather than landing on it.
+    const CHUNK: usize = 5000;
+    const CHUNKS: usize = 30;
+
+    let (tx, events) = sync_channel(OUTPUT_CHUNKS);
+    let mut sent = Vec::new();
+    for i in 0..CHUNKS {
+        let chunk = vec![u8::try_from(i).expect("few chunks"); CHUNK];
+        sent.extend_from_slice(&chunk);
+        tx.try_send(PtyEvent::Output(chunk))
+            .expect("the channel has room for every chunk");
+    }
+    assert!(
+        sent.len() > DRAIN_BUDGET + CHUNK,
+        "more than one drain's worth is waiting"
+    );
+
+    let first = drain_from(&events, DRAIN_BUDGET).output;
+    assert!(
+        (DRAIN_BUDGET..=DRAIN_BUDGET + CHUNK).contains(&first.len()),
+        "one drain handed over {} of {} bytes",
+        first.len(),
+        sent.len()
+    );
+
+    let second = drain_from(&events, DRAIN_BUDGET).output;
+    assert_eq!(
+        [first, second].concat(),
+        sent,
+        "the next drain hands over the rest, in order"
+    );
+}
