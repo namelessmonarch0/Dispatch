@@ -160,7 +160,8 @@ pub fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
 /// On Unix it is made 0700, and one that already exists is narrowed to
 /// that if this user owns it -- something less careful may have made it --
 /// and refused if another user does, since whoever owns a directory decides
-/// what happens to the files in it. On Windows a new one gets a protected
+/// what happens to the files in it. A link where the directory should be is
+/// refused outright, never followed. On Windows a new one gets a protected
 /// DACL admitting this user alone; one that exists is left as it is, since
 /// each file in it is made private on its own.
 pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
@@ -178,7 +179,18 @@ pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
             Err(error) => return Err(error),
         }
 
-        let metadata = std::fs::metadata(path)?;
+        // Not followed: a link here would have its target narrowed, and a
+        // task written wherever it points.
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} is not a directory of Dispatch's own: it is a link or a file",
+                    path.display()
+                ),
+            ));
+        }
         // SAFETY: geteuid has no preconditions and cannot fail.
         let me = unsafe { libc::geteuid() };
         if metadata.uid() != me {
@@ -517,6 +529,30 @@ mod tests {
             .expect("permissions change");
         create_private_dir(&loose).expect("an existing directory is fine");
         assert_eq!(mode(&loose), 0o700, "left open to others");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_link_where_a_private_directory_should_be_is_refused() {
+        // Narrowing it would narrow whatever it points at, and writing a task
+        // there would write it wherever that is.
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = Scratch::new("private-dir-link");
+        let target = scratch.0.join("elsewhere");
+        std::fs::create_dir(&target).expect("temp dir is writable");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("permissions change");
+        let link = scratch.0.join("tasks");
+        std::os::unix::fs::symlink(&target, &link).expect("the file system links");
+
+        create_private_dir(&link).expect_err("a link is not a private directory");
+
+        let mode = std::fs::metadata(&target)
+            .expect("the target is still there")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "the link's target was changed");
     }
 
     #[test]

@@ -3695,6 +3695,26 @@ fn a_daemon_that_starts_serving_clears_away_task_files_left_behind() {
 }
 
 #[test]
+#[cfg(unix)]
+fn the_sweep_never_reads_through_a_linked_directory() {
+    // What a link names is somebody's choice, not Dispatch's directory.
+    let dir = TempDir::new("sweep-link");
+    let elsewhere = dir.0.join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("temp dir is writable");
+    let left = elsewhere.join(format!(
+        "dispatch-task-{}.txt",
+        dispatch_core::RequestId::new()
+    ));
+    std::fs::write(&left, "a task").expect("temp dir is writable");
+    let tasks = dir.0.join("tasks");
+    std::os::unix::fs::symlink(&elsewhere, &tasks).expect("the file system links");
+
+    crate::task_file::sweep(&tasks);
+
+    assert!(left.exists(), "the sweep reached through the link");
+}
+
+#[test]
 fn an_argument_form_is_never_handed_a_task_file() {
     // Its task is in its arguments. A DISPATCH_TASK_FILE in its environment
     // could only be stale -- inherited, or set in the harness file -- and a

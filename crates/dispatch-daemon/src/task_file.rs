@@ -126,6 +126,12 @@ impl Drop for TaskFile {
 /// these to anybody. Only names exactly as [`TaskFile::write`] makes them
 /// are touched, so a file of the user's that happens to be there is not.
 pub fn sweep(dir: &Path) {
+    // What a link names is somebody's choice, not Dispatch's directory.
+    if std::fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        tracing::warn!(dir = %dir.display(), "not sweeping task files through a link");
+        return;
+    }
+
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
