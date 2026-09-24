@@ -1,8 +1,9 @@
 //! Local transport between a Dispatch client and `dispatchd`.
 //!
-//! A Unix domain socket on POSIX, a named pipe on Windows. Both are
-//! local-only and carry the operating system's own access control, which is
-//! what keeps another user off a daemon that can run arbitrary commands.
+//! A Unix domain socket on POSIX, readable and writable by its owner alone;
+//! a named pipe on Windows, whose DACL admits its owner alone and which
+//! refuses clients on other machines. That access control is what keeps
+//! another user off a daemon that can run arbitrary commands.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -778,7 +779,15 @@ mod imp {
 
     use windows_sys::Win32::Foundation::{
         ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY,
-        ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+        ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+        TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
@@ -786,15 +795,16 @@ mod imp {
     use windows_sys::Win32::System::IO::CancelIoEx;
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     use super::IpcError;
 
     /// Named pipes are addressed by name rather than by a filesystem path, so
     /// the endpoint is hashed into one. Two configurations therefore get two
     /// pipes, matching how the Unix socket lives under the config directory.
-    fn pipe_name(path: &Path) -> String {
+    pub(super) fn pipe_name(path: &Path) -> String {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for byte in path.display().to_string().bytes() {
             hash ^= u64::from(byte);
@@ -878,13 +888,16 @@ mod imp {
         /// Stored as a raw handle because `HANDLE` is a pointer and therefore
         /// not `Send`; the pipe is owned solely by this listener.
         pending: Mutex<isize>,
+        /// Who may open each instance: this user, and nobody else.
+        security: OwnerOnly,
     }
 
     // SAFETY: the handle is owned exclusively by this listener and is only
-    // touched under the mutex.
+    // touched under the mutex; the descriptor is `Send` on its own terms.
     unsafe impl Send for Listener {}
     // SAFETY: as above — every access to the handle goes through the mutex, so
-    // sharing the listener between threads cannot race on it.
+    // sharing the listener between threads cannot race on it, and the
+    // descriptor is only ever read.
     unsafe impl Sync for Listener {}
 
     impl Drop for Listener {
@@ -900,11 +913,144 @@ mod imp {
         }
     }
 
-    /// Creates one pipe instance.
+    /// A security descriptor admitting the user this process runs as, and
+    /// nobody else.
+    ///
+    /// SDDL `D:P(A;;GA;;;<sid>)`: a protected DACL, so nothing is inherited
+    /// into it, whose one entry grants everything to this user. The null
+    /// descriptor it replaces took the default DACL, which also lets Everyone
+    /// and anonymous logons open the pipe for reading.
+    pub(super) struct OwnerOnly(PSECURITY_DESCRIPTOR);
+
+    // SAFETY: the descriptor is never changed after it is built, and is freed
+    // exactly once, on drop.
+    unsafe impl Send for OwnerOnly {}
+    // SAFETY: as above -- shared use only ever reads it.
+    unsafe impl Sync for OwnerOnly {}
+
+    impl OwnerOnly {
+        pub(super) fn new() -> std::io::Result<Self> {
+            let sid = current_user_sid()?;
+            let sddl: Vec<u16> = format!("D:P(A;;GA;;;{sid})")
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+
+            let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            // SAFETY: `sddl` is NUL-terminated and outlives the call; on
+            // success `descriptor` is a LocalAlloc'd descriptor that `Drop`
+            // frees.
+            let converted = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            };
+            if converted == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            Ok(Self(descriptor))
+        }
+
+        /// What `CreateNamedPipeW` takes: it points into `self`, so it is
+        /// good only while this descriptor lives.
+        fn attributes(&self) -> SECURITY_ATTRIBUTES {
+            SECURITY_ATTRIBUTES {
+                nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
+                    .expect("a small struct"),
+                lpSecurityDescriptor: self.0,
+                bInheritHandle: 0,
+            }
+        }
+    }
+
+    impl Drop for OwnerOnly {
+        fn drop(&mut self) {
+            // SAFETY: the descriptor came from LocalAlloc via the conversion
+            // above and is freed exactly once, here.
+            unsafe { LocalFree(self.0 as HLOCAL) };
+        }
+    }
+
+    /// The SID of the user this process runs as, as a string (`S-1-5-21-…`).
+    pub(super) fn current_user_sid() -> std::io::Result<String> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+        let mut raw: HANDLE = std::ptr::null_mut();
+        // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no
+        // closing; `raw` receives a token handle owned below.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a handle this call just opened, owned from here on.
+        let token = unsafe { OwnedHandle::from_raw_handle(raw as _) };
+
+        let mut needed = 0u32;
+        // SAFETY: a null buffer of length zero only asks how much is needed.
+        unsafe {
+            GetTokenInformation(
+                token.as_raw_handle() as HANDLE,
+                TokenUser,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            )
+        };
+
+        // u64s, not bytes: TOKEN_USER holds a pointer and must be aligned.
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+        // SAFETY: `buffer` holds at least `needed` bytes.
+        let read = unsafe {
+            GetTokenInformation(
+                token.as_raw_handle() as HANDLE,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        };
+        if read == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // SAFETY: on success the buffer begins with a TOKEN_USER whose SID
+        // points into the same buffer, which outlives its use here.
+        let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        sid_string(user.User.Sid)
+    }
+
+    /// `sid` as a string (`S-1-5-21-…`).
+    pub(super) fn sid_string(sid: PSID) -> std::io::Result<String> {
+        let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+        // SAFETY: `sid` is valid for the call; `text` receives a LocalAlloc'd
+        // string freed below.
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // SAFETY: `text` is the NUL-terminated string the call returned.
+        let string = unsafe {
+            let length = (0..).take_while(|&i| *text.add(i) != 0).count();
+            String::from_utf16_lossy(std::slice::from_raw_parts(text, length))
+        };
+        // SAFETY: allocated by ConvertSidToStringSidW, freed exactly once.
+        unsafe { LocalFree(text as HLOCAL) };
+
+        Ok(string)
+    }
+
+    /// Creates one pipe instance, open to `security`'s user alone.
     ///
     /// `first` asks the kernel to fail if an instance already exists, which is
     /// how a second daemon is detected without a lock file of its own.
-    fn create_instance(name: &str, first: bool) -> Result<isize, std::io::Error> {
+    pub(super) fn create_instance(
+        name: &str,
+        first: bool,
+        security: &OwnerOnly,
+    ) -> Result<isize, std::io::Error> {
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
 
         let mut flags = PIPE_ACCESS_DUPLEX;
@@ -912,20 +1058,24 @@ mod imp {
             flags |= FILE_FLAG_FIRST_PIPE_INSTANCE;
         }
 
-        // SAFETY: `wide` is a NUL-terminated wide string that outlives the
-        // call. A null security descriptor gives the pipe the default, which
-        // grants access to the creating user only -- the same boundary the
-        // Unix socket's 0600 mode provides.
+        let attributes = security.attributes();
+
+        // SAFETY: `wide` is a NUL-terminated wide string and `attributes`
+        // points at a descriptor `security` keeps alive; both outlive the
+        // call.
         let handle = unsafe {
             CreateNamedPipeW(
                 wide.as_ptr(),
                 flags,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                // Local clients only: a client on another machine reaches a
+                // named pipe through SMB, and nothing Dispatch speaks is meant
+                // to cross it.
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 PIPE_UNLIMITED_INSTANCES,
                 64 * 1024,
                 64 * 1024,
                 0,
-                std::ptr::null(),
+                &attributes,
             )
         };
 
@@ -980,20 +1130,24 @@ mod imp {
 
     pub(super) fn bind(path: &Path) -> Result<Listener, IpcError> {
         let name = pipe_name(path);
+        let security =
+            OwnerOnly::new().map_err(|e| IpcError::io("building the pipe's access list", e))?;
 
         // Unlike a Unix socket there is no file to go stale: a pipe exists
         // only while its server holds it, so a refusal here means a daemon is
         // genuinely running.
-        let pending = create_instance(&name, true).map_err(|e| match e.raw_os_error() {
-            Some(code) if code == ERROR_ACCESS_DENIED as i32 => {
-                IpcError::AlreadyRunning(name.clone())
-            }
-            _ => IpcError::io(format!("listening on {name}"), e),
-        })?;
+        let pending =
+            create_instance(&name, true, &security).map_err(|e| match e.raw_os_error() {
+                Some(code) if code == ERROR_ACCESS_DENIED as i32 => {
+                    IpcError::AlreadyRunning(name.clone())
+                }
+                _ => IpcError::io(format!("listening on {name}"), e),
+            })?;
 
         Ok(Listener {
             name,
             pending: Mutex::new(pending),
+            security,
         })
     }
 
@@ -1039,7 +1193,7 @@ mod imp {
 
         // Open the next instance before handing this one over, so the pipe is
         // never absent between clients.
-        *pending = create_instance(&listener.name, false)
+        *pending = create_instance(&listener.name, false, &listener.security)
             .map_err(|e| IpcError::io(format!("reopening {}", listener.name), e))?;
 
         // SAFETY: the handle is a connected instance and ownership moves into
@@ -1138,6 +1292,92 @@ mod imp {
         drop(finished);
         let _ = watchdog.join();
         half
+    }
+
+    /// `ACCESS_ALLOWED_ACE_TYPE`, as the `u8` an ACE header carries.
+    #[cfg(test)]
+    pub(super) const ACCESS_ALLOWED: u8 =
+        windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE as u8;
+
+    /// Closes a pipe instance a test created directly.
+    #[cfg(test)]
+    pub(super) fn close_for_test(handle: isize) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        // SAFETY: a handle from `create_instance`, closed exactly once.
+        unsafe { CloseHandle(handle as HANDLE) };
+    }
+
+    /// Each entry of the DACL on `handle`, as (ACE type, SID string).
+    #[cfg(test)]
+    pub(super) fn dacl_of(handle: isize) -> std::io::Result<Vec<(u8, String)>> {
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+        use windows_sys::Win32::Security::{
+            ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+            DACL_SECURITY_INFORMATION, GetAce, GetAclInformation,
+        };
+
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: every out-pointer is valid; on success `descriptor` is
+        // LocalAlloc'd and `dacl` points into it.
+        let status = unsafe {
+            GetSecurityInfo(
+                handle as HANDLE,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(std::io::Error::from_raw_os_error(status as i32));
+        }
+
+        // Read inside a closure so the descriptor `dacl` points into is freed
+        // on every path out, failures included.
+        let entries = (|| {
+            let mut size = ACL_SIZE_INFORMATION::default();
+            // SAFETY: `dacl` is the DACL the call above returned, and `size`
+            // is an ACL_SIZE_INFORMATION of exactly the length passed.
+            let sized = unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&raw mut size).cast(),
+                    u32::try_from(std::mem::size_of::<ACL_SIZE_INFORMATION>()).expect("small"),
+                    AclSizeInformation,
+                )
+            };
+            if sized == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            let mut entries = Vec::new();
+            for index in 0..size.AceCount {
+                let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+                // SAFETY: `index` is within the count the ACL reported.
+                if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // SAFETY: every ACE starts with a header; an allowed ACE keeps
+                // its SID where ACCESS_ALLOWED_ACE says, and any other type
+                // fails the equality the test makes.
+                let (kind, sid) = unsafe {
+                    let header = &*ace.cast::<ACE_HEADER>();
+                    let sid = (&raw const (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart) as PSID;
+                    (header.AceType, sid)
+                };
+                entries.push((kind, sid_string(sid)?));
+            }
+            Ok(entries)
+        })();
+
+        // SAFETY: allocated by GetSecurityInfo, freed exactly once, and
+        // nothing reads `dacl` after this.
+        unsafe { LocalFree(descriptor as HLOCAL) };
+        entries
     }
 }
 
@@ -1949,5 +2189,89 @@ mod tests {
             "the closer still aims at a pid its command no longer holds"
         );
         closer.close();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn the_pipe_admits_its_owner_and_nobody_else() {
+        // The null descriptor this replaces took the default DACL, which
+        // also let Everyone and anonymous logons open the pipe to read.
+        let name = format!(r"\\.\pipe\dispatchd-test-owner-{}", std::process::id());
+        let security = imp::OwnerOnly::new().expect("the descriptor builds");
+        let pipe = imp::create_instance(&name, true, &security).expect("the pipe is created");
+
+        let entries = imp::dacl_of(pipe).expect("the DACL reads back");
+        imp::close_for_test(pipe);
+
+        let me = imp::current_user_sid().expect("this process has a user");
+        assert_eq!(
+            entries,
+            vec![(imp::ACCESS_ALLOWED, me)],
+            "exactly one entry, allowing this user"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_read_only_handle_that_says_nothing_holds_up_nobody() {
+        // The shape the audit described: open for reading only, which can
+        // never write a preamble, and hold it. It used to park the accept
+        // loop for good.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("read-only");
+
+        let listener = Listener::bind().expect("binding succeeds");
+        let name = imp::pipe_name(&endpoint().expect("resolves"));
+
+        let (served, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (reader, _writer) = listener.accept().expect("accepting succeeds").split();
+            let _ = served.send(reading(reader).recv_timeout(PATIENCE));
+        });
+
+        let mut silent = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&name)
+            .expect("the owner may open it");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        let (_reader, mut writer) = Connection::connect().expect("connecting succeeds").split();
+        writer.write_all(b"next").expect("writing succeeds");
+        writer.flush().expect("flushing succeeds");
+        assert_eq!(done.recv_timeout(PATIENCE), Ok(Ok(*b"next")));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let (ended, end) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            let _ = silent.read(&mut byte);
+            let _ = ended.send(());
+        });
+        assert!(
+            end.recv_timeout(PATIENCE).is_ok(),
+            "the silent read-only handle was never let go"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_client_addressing_the_pipe_as_another_machine_would_is_refused() {
+        // `\\localhost\pipe\…` goes through the SMB redirector, which is what
+        // a client on another machine does. Without the Server service
+        // running this fails regardless; with it, only
+        // PIPE_REJECT_REMOTE_CLIENTS refuses it.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("remote");
+
+        let _listener = Listener::bind().expect("binding succeeds");
+        let local = imp::pipe_name(&endpoint().expect("resolves"));
+        let remote = local.replacen(r"\\.\", r"\\localhost\", 1);
+
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&remote);
+        assert!(opened.is_err(), "a remote-style open reached the pipe");
     }
 }
