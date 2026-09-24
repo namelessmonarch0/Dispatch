@@ -114,6 +114,33 @@ pub(super) fn spawn(
     drop(input_read);
     drop(output_write);
 
+    let (process, pid) = match start(command, console) {
+        Ok(started) => started,
+        Err(error) => {
+            // The output's reading end first. Before Windows 11 24H2,
+            // closing a pseudoconsole waits until what it still has to say
+            // is read or its pipe is broken, and nothing is reading it yet.
+            drop(output_read);
+            drop(terminal);
+            return Err(error);
+        }
+    };
+
+    let mut writer = std::fs::File::from(input_write);
+    answer_inherit_cursor(&mut writer);
+
+    Ok(super::PtyProcess {
+        reader: Box::new(std::fs::File::from(output_read)),
+        writer: Box::new(writer),
+        terminal: super::Terminal(terminal),
+        child: super::Child(Child(process)),
+        pid: Some(pid),
+    })
+}
+
+/// Starts `command` attached to `console`, inside a job of its own, and
+/// returns the process and its pid.
+fn start(command: &super::PtyCommand<'_>, console: HPCON) -> std::io::Result<(OwnedHandle, u32)> {
     let mut attributes = AttributeList::with_pseudoconsole(console)?;
 
     // SAFETY: an all-zero STARTUPINFOEXW is valid; the fields that matter are
@@ -185,16 +212,7 @@ pub(super) fn spawn(
         return Err(error);
     }
 
-    let mut writer = std::fs::File::from(input_write);
-    answer_inherit_cursor(&mut writer);
-
-    Ok(super::PtyProcess {
-        reader: Box::new(std::fs::File::from(output_read)),
-        writer: Box::new(writer),
-        terminal: super::Terminal(terminal),
-        child: super::Child(Child(process)),
-        pid: Some(info.dwProcessId),
-    })
+    Ok((process, info.dwProcessId))
 }
 
 /// Answers the pseudoconsole's inherit-cursor question.
