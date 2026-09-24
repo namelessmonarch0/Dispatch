@@ -449,10 +449,15 @@ fn a_finished_pty_is_one_whose_output_is_complete() {
 #[test]
 #[cfg(unix)]
 fn a_flood_is_handed_over_a_budget_at_a_time() {
-    // Three megabytes as fast as the shell can print them, drained slowly.
-    // Before, the first drain took whatever had piled up in an unbounded
-    // channel; now each takes a bounded slice, and nothing is lost.
-    const TOTAL: usize = 3_000_000;
+    // A megabyte, enough to cross DRAIN_BUDGET (128 KiB) many times over,
+    // printed as fast as the shell can and drained slowly. Before, the first
+    // drain took whatever had piled up in an unbounded channel; now each
+    // takes a bounded slice, and nothing is lost. The loop gets its own
+    // deadline instead of the shared 10 s TIMEOUT: macOS CI runners push PTY
+    // output slowly, and 30 s is generous enough to outlast that without
+    // masking a real regression.
+    const TOTAL: usize = 1_000_000;
+    const LOOP_DEADLINE: Duration = Duration::from_secs(30);
     let mut pty = Pty::spawn(
         &shell(&format!("head -c {TOTAL} /dev/zero | tr '\\0' x")),
         &cwd(),
@@ -460,7 +465,7 @@ fn a_flood_is_handed_over_a_budget_at_a_time() {
     )
     .expect("the shell starts");
 
-    let deadline = std::time::Instant::now() + TIMEOUT;
+    let deadline = std::time::Instant::now() + LOOP_DEADLINE;
     let mut received = 0;
     while received < TOTAL {
         assert!(
