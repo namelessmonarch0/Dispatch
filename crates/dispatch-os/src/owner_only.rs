@@ -36,10 +36,14 @@ unsafe impl Sync for OwnerOnly {}
 impl OwnerOnly {
     pub(crate) fn new() -> std::io::Result<Self> {
         let sid = current_user_sid()?;
-        let sddl: Vec<u16> = format!("O:{sid}D:P(A;;GA;;;{sid})")
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+        Self::from_sddl(&format!("O:{sid}D:P(A;;GA;;;{sid})"))
+    }
+
+    /// A descriptor spelled out in SDDL: [`OwnerOnly::new`]'s, or for a
+    /// test, one naming another owner -- a pipe another account made, as
+    /// near as one account can make it.
+    pub(crate) fn from_sddl(sddl: &str) -> std::io::Result<Self> {
+        let sddl: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
 
         let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         // SAFETY: `sddl` is NUL-terminated and outlives the call; on

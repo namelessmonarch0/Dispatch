@@ -2417,4 +2417,50 @@ mod tests {
             "the pipe is owned by someone other than the user who created it"
         );
     }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_daemon_finding_its_pipe_held_by_another_owner_says_whose_it_is() {
+        // Pipe names are machine-wide, so another account can create the
+        // daemon's before it starts. That is not a daemon already running,
+        // and saying it was sends the user looking for one that is not
+        // there.
+        use windows_sys::Win32::Foundation::ERROR_INVALID_OWNER;
+
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("squatted");
+        let name = imp::pipe_name(&endpoint().expect("resolves"));
+
+        // A second account is not to be had on CI. The Administrators group
+        // stands in for one: an elevated process, as CI's is, may name it as
+        // an object's owner, and it is not this user. The access list still
+        // admits this user, as a squatter's would, or there would be nothing
+        // to connect to and ask.
+        let me = crate::owner_only::current_user_sid().expect("this process has a user");
+        let squatter = crate::owner_only::OwnerOnly::from_sddl(&format!("O:BAD:P(A;;GA;;;{me})"))
+            .expect("the descriptor builds");
+        let held = match imp::create_instance(&name, true, &squatter) {
+            Ok(held) => held,
+            Err(error) if error.raw_os_error() == Some(ERROR_INVALID_OWNER as i32) => {
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "CI runs elevated, so the Administrators group can own a pipe: {error}"
+                );
+                eprintln!("skipped: not elevated, so no pipe here can be owned by anyone else");
+                return;
+            }
+            Err(error) => panic!("the squatter's pipe could not be created: {error}"),
+        };
+
+        let bound = Listener::bind();
+        // SAFETY: created just above, closed nowhere else, and nothing uses
+        // it after this.
+        unsafe { imp::close_for_test(held) };
+
+        let error = bound.expect_err("a pipe someone else holds is not this daemon's to serve");
+        assert!(
+            matches!(&error, IpcError::ForeignOwner { owner, .. } if owner == "S-1-5-32-544"),
+            "expected ForeignOwner naming the Administrators group, got {error:?}"
+        );
+    }
 }
