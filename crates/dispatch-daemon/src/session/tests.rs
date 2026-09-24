@@ -3307,9 +3307,11 @@ fn assert_a_task_reaches_the_capture_exactly(
 
     let registry = HarnessRegistry::load_from_dir(&harness_dir).expect("loading succeeds");
     let mut daemon = Daemon::new(registry, "test-device");
-    // A space, as in many Windows profile paths: the file's path has to
-    // survive cmd.exe whole.
-    let task_dir = dir.0.join("task files");
+    // Every character cmd.exe would act on outside quotes -- a space, as in
+    // many Windows profile paths, `&`, `(`, `)`, `^`, a `%VAR%` and a
+    // `!VAR!` -- so the file's path is shown to reach cmd.exe's `<` whole,
+    // quoted and expanded once.
+    let task_dir = dir.0.join("task files & (x) ^ %PATH% !y!");
     daemon.set_task_dir(task_dir.clone());
     let project =
         daemon.open_project(dispatch_os::paths::resolve(&dir.0).expect("the temp dir resolves"));
