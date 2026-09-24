@@ -154,43 +154,33 @@ pub fn default_name(target: &str) -> Option<String> {
 /// No file means nothing is registered, which is what a first run looks like
 /// rather than a failure.
 pub fn load(dir: &Path) -> Result<Vec<Machine>, ConfigError> {
-    let path = dir.join(FILE);
-
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => return Err(ConfigError::Io { path, source }),
-    };
-
-    let saved: Saved = toml::from_str(&text).map_err(|source| ConfigError::Toml {
-        path: path.clone(),
-        source,
-    })?;
-
-    Ok(saved.machines)
+    Ok(crate::store::read::<Saved>(dir, FILE)?.machines)
 }
 
 /// Writes the list, replacing whatever was there.
 pub fn save(dir: &Path, machines: &[Machine]) -> Result<(), ConfigError> {
-    std::fs::create_dir_all(dir).map_err(|source| ConfigError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
-
-    let path = dir.join(FILE);
-    let text = toml::to_string_pretty(&Saved {
-        machines: machines.to_vec(),
+    crate::store::update(dir, FILE, |saved: &mut Saved| {
+        saved.machines = machines.to_vec();
+        Ok(((), true))
     })
-    .expect("a list of machines serialises");
-
-    std::fs::write(&path, text).map_err(|source| ConfigError::Io { path, source })
 }
 
 /// Whether `name` could be registered now.
 ///
 /// Its own step so a caller can ask before spending thirty seconds proving the
-/// machine answers, only to be told the name was taken.
+/// machine answers, only to be told the name was taken. [`add`] asks again,
+/// inside the change, because the answer can change in those thirty seconds.
 pub fn check(dir: &Path, name: &str, this_host: &str) -> Result<(), ConfigError> {
+    refusal(dir, name, this_host, &load(dir)?)
+}
+
+/// Why `name` cannot join `registered`, if it cannot.
+fn refusal(
+    dir: &Path,
+    name: &str,
+    this_host: &str,
+    registered: &[Machine],
+) -> Result<(), ConfigError> {
     let refuse = |reason: String| ConfigError::Machine {
         path: dir.join(FILE),
         reason,
@@ -209,7 +199,7 @@ pub fn check(dir: &Path, name: &str, this_host: &str) -> Result<(), ConfigError>
         return Err(refuse(format!("{name} is this machine's own name")));
     }
 
-    if load(dir)?.iter().any(|machine| machine.name == name) {
+    if registered.iter().any(|machine| machine.name == name) {
         return Err(refuse(format!("{name} is already registered")));
     }
 
@@ -227,27 +217,28 @@ pub fn add(dir: &Path, machine: Machine, this_host: &str) -> Result<(), ConfigEr
             reason: format!("{:?} is not an ssh target", machine.target),
         });
     }
-    check(dir, &machine.name, this_host)?;
 
-    let mut machines = load(dir)?;
-    machines.push(machine);
-    save(dir, &machines)
+    crate::store::update(dir, FILE, |saved: &mut Saved| {
+        // Against the list as it is under the lock, not as the caller's
+        // earlier `check` saw it: two adds of one name that both passed that
+        // check would otherwise both be saved.
+        refusal(dir, &machine.name, this_host, &saved.machines)?;
+        saved.machines.push(machine);
+        Ok(((), true))
+    })
 }
 
 /// Takes the machine called `name` off the list.
 ///
 /// Answers whether it was there to take off.
 pub fn remove(dir: &Path, name: &str) -> Result<bool, ConfigError> {
-    let mut machines = load(dir)?;
-    let before = machines.len();
+    crate::store::update(dir, FILE, |saved: &mut Saved| {
+        let before = saved.machines.len();
+        saved.machines.retain(|machine| machine.name != name);
 
-    machines.retain(|machine| machine.name != name);
-    if machines.len() == before {
-        return Ok(false);
-    }
-
-    save(dir, &machines)?;
-    Ok(true)
+        let removed = saved.machines.len() != before;
+        Ok((removed, removed))
+    })
 }
 
 #[cfg(test)]

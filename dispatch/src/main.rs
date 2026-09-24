@@ -127,7 +127,9 @@ fn main() -> Result<ExitCode> {
         None => {}
     }
 
-    // Written on first run and never overwritten, so local edits survive.
+    // Written on first run, and afterwards only while a file is still exactly
+    // as an earlier Dispatch wrote it, so local edits survive and fixes to
+    // untouched built-ins still arrive.
     let harness_dir =
         dispatch_os::paths::harnesses_dir().context("failed to locate the harness directory")?;
     let written = dispatch_config::write_missing_built_ins(&harness_dir)

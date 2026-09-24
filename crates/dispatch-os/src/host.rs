@@ -46,7 +46,7 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
-    use windows_sys::Win32::System::SystemInformation::GetComputerNameW;
+    use windows_sys::Win32::System::WindowsProgramming::GetComputerNameW;
 
     /// `MAX_COMPUTERNAME_LENGTH` (15) plus the NUL terminator.
     const BUF_LEN: usize = 16;

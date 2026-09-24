@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use super::IpcError;
 
@@ -31,8 +32,21 @@ const TO_SERVER: u8 = 0x01;
 /// The client reads here; the server writes.
 const TO_CLIENT: u8 = 0x02;
 
+/// How long a half waits for its partner.
+///
+/// A client connects its two halves back to back, microseconds apart; ten
+/// seconds is a client that died between them, and its half is let go.
+pub(super) const HALF_PATIENCE: Duration = Duration::from_secs(10);
+
+/// How many halves may wait at once.
+///
+/// Each is an open connection. Past this the oldest goes, so a burst of
+/// clients that each connect once and die costs a bounded table, not one
+/// entry per corpse.
+pub(super) const MAX_WAITING: usize = 64;
+
 /// Names the two halves of one connection to each other.
-type Token = [u8; TOKEN_BYTES];
+pub(super) type Token = [u8; TOKEN_BYTES];
 
 /// Mints a token that no concurrent connect will repeat.
 ///
@@ -102,7 +116,14 @@ pub(super) fn listen_for<S: Read>(stream: &mut S) -> Result<(Token, u8), IpcErro
 
 /// Halves waiting for the connection they belong with.
 pub(super) struct Halves<S> {
-    waiting: HashMap<Token, (u8, S)>,
+    waiting: HashMap<Token, Waiting<S>>,
+}
+
+/// One half, and since when it has waited.
+struct Waiting<S> {
+    role: u8,
+    stream: S,
+    since: Instant,
 }
 
 impl<S> Halves<S> {
@@ -112,27 +133,56 @@ impl<S> Halves<S> {
         }
     }
 
-    /// Files one half, returning `(reader, writer)` from the *server's* side
-    /// once both halves of a token are in.
+    /// Files one half at `now`, returning `(reader, writer)` from the
+    /// *server's* side once both halves of a token are in.
     ///
     /// A second half claiming a role its partner already claimed is a broken
-    /// client, so both are dropped rather than one of them believed.
-    pub(super) fn offer(&mut self, token: Token, role: u8, stream: S) -> Option<(S, S)> {
-        let Some((held_role, held)) = self.waiting.remove(&token) else {
-            self.waiting.insert(token, (role, stream));
-            return None;
-        };
+    /// client, so both are dropped rather than one of them believed. Halves
+    /// older than [`HALF_PATIENCE`] are let go first, and the oldest is let go
+    /// to keep the table at [`MAX_WAITING`].
+    pub(super) fn offer(
+        &mut self,
+        token: Token,
+        role: u8,
+        stream: S,
+        now: Instant,
+    ) -> Option<(S, S)> {
+        self.waiting
+            .retain(|_, half| now.saturating_duration_since(half.since) < HALF_PATIENCE);
 
-        if held_role == role {
-            return None;
+        if let Some(held) = self.waiting.remove(&token) {
+            if held.role == role {
+                return None;
+            }
+
+            // The server reads what the client writes, and writes what it reads.
+            return if role == TO_SERVER {
+                Some((stream, held.stream))
+            } else {
+                Some((held.stream, stream))
+            };
         }
 
-        // The server reads what the client writes, and writes what it reads.
-        if role == TO_SERVER {
-            Some((stream, held))
-        } else {
-            Some((held, stream))
+        if self.waiting.len() >= MAX_WAITING {
+            let oldest = self
+                .waiting
+                .iter()
+                .min_by_key(|(_, half)| half.since)
+                .map(|(token, _)| *token);
+            if let Some(oldest) = oldest {
+                self.waiting.remove(&oldest);
+            }
         }
+
+        self.waiting.insert(
+            token,
+            Waiting {
+                role,
+                stream,
+                since: now,
+            },
+        );
+        None
     }
 }
 
@@ -180,12 +230,14 @@ mod tests {
             }
 
             assert!(
-                halves.offer(token, order[0].0, order[0].1).is_none(),
+                halves
+                    .offer(token, order[0].0, order[0].1, Instant::now())
+                    .is_none(),
                 "one half alone is not a pair"
             );
 
             let (reader, writer) = halves
-                .offer(token, order[1].0, order[1].1)
+                .offer(token, order[1].0, order[1].1, Instant::now())
                 .expect("the second half completes the pair");
 
             assert_eq!(reader, "from the client");
@@ -199,16 +251,24 @@ mod tests {
         let mut halves = Halves::new();
         let (first, second) = (token(), token());
 
-        assert!(halves.offer(first, TO_SERVER, "first reads").is_none());
-        assert!(halves.offer(second, TO_SERVER, "second reads").is_none());
+        assert!(
+            halves
+                .offer(first, TO_SERVER, "first reads", Instant::now())
+                .is_none()
+        );
+        assert!(
+            halves
+                .offer(second, TO_SERVER, "second reads", Instant::now())
+                .is_none()
+        );
 
         let (reader, _) = halves
-            .offer(second, TO_CLIENT, "second writes")
+            .offer(second, TO_CLIENT, "second writes", Instant::now())
             .expect("the second client pairs");
         assert_eq!(reader, "second reads");
 
         let (reader, _) = halves
-            .offer(first, TO_CLIENT, "first writes")
+            .offer(first, TO_CLIENT, "first writes", Instant::now())
             .expect("the first client pairs");
         assert_eq!(reader, "first reads");
     }
@@ -220,13 +280,21 @@ mod tests {
         let mut halves = Halves::new();
         let token = token();
 
-        assert!(halves.offer(token, TO_SERVER, "one").is_none());
         assert!(
-            halves.offer(token, TO_SERVER, "two").is_none(),
+            halves
+                .offer(token, TO_SERVER, "one", Instant::now())
+                .is_none()
+        );
+        assert!(
+            halves
+                .offer(token, TO_SERVER, "two", Instant::now())
+                .is_none(),
             "a duplicate role is not a pair"
         );
         assert!(
-            halves.offer(token, TO_CLIENT, "three").is_none(),
+            halves
+                .offer(token, TO_CLIENT, "three", Instant::now())
+                .is_none(),
             "both duplicates must have been dropped, leaving nothing to pair with"
         );
     }
@@ -260,5 +328,47 @@ mod tests {
         // The server must be able to tell this from a complete half.
         let short = [TO_SERVER, 0x00, 0x01];
         listen_for(&mut short.as_slice()).expect_err("a truncated preamble cannot be filed");
+    }
+
+    #[test]
+    fn a_half_whose_partner_never_comes_is_let_go() {
+        // A client that died between its two connects used to leave its
+        // first half in the table for the life of the daemon.
+        let mut halves = Halves::new();
+        let start = Instant::now();
+        let token = token();
+
+        assert!(halves.offer(token, TO_SERVER, "early", start).is_none());
+
+        let late = start + HALF_PATIENCE + Duration::from_secs(1);
+        assert!(
+            halves.offer(token, TO_CLIENT, "late", late).is_none(),
+            "a partner arriving after the wait is over finds nothing to pair with"
+        );
+    }
+
+    #[test]
+    fn only_so_many_halves_wait_at_once() {
+        let mut halves = Halves::new();
+        let now = Instant::now();
+
+        let first = token();
+        assert!(halves.offer(first, TO_SERVER, 0, now).is_none());
+        let mut last = first;
+        for i in 1..=MAX_WAITING {
+            last = token();
+            let at = now + Duration::from_millis(u64::try_from(i).expect("small"));
+            assert!(halves.offer(last, TO_SERVER, i, at).is_none());
+        }
+
+        let later = now + Duration::from_secs(1);
+        assert!(
+            halves.offer(first, TO_CLIENT, 1000, later).is_none(),
+            "the oldest was let go to make room"
+        );
+        assert!(
+            halves.offer(last, TO_CLIENT, 1001, later).is_some(),
+            "the newest is still waiting"
+        );
     }
 }

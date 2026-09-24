@@ -299,6 +299,7 @@ impl Harness {
             command: env!("CARGO_BIN_EXE_dispatch").to_string(),
             args,
             env: fixture.env(),
+            ..Default::default()
         };
 
         let session = PtySession::spawn(&launch, fixture.config.path(), size)
@@ -1241,7 +1242,7 @@ fn kill_bridge_to(endpoint: &std::path::Path) {
 }
 
 #[test]
-#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+#[cfg(unix)]
 fn a_machine_reached_over_a_bridge_outlives_its_transport() {
     // The slice's claim: the transport can die without the agents dying,
     // because the agents were never the transport's.

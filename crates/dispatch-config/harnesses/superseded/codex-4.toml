@@ -1,5 +1,5 @@
 id = "codex"
-icon = ""
+icon = ""
 display_name = "Codex"
 command = "codex"
 args = []
@@ -11,11 +11,8 @@ args = ["/c", "codex"]
 [task]
 args = ["exec", "{task}"]
 
-# See claude.toml: the task reaches codex on standard input, never on
-# cmd.exe's command line. `-` tells `codex exec` to read it from there.
 [task.platform.windows]
-args = ["/d", "/v:off", "/c", "codex", "exec", "-", "<%DISPATCH_TASK_FILE%"]
-input = "file"
+args = ["/c", "codex", "exec", "{task}"]
 
 [[settings]]
 key = "model"

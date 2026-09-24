@@ -71,3 +71,44 @@ jobs:
           # matters most on the platform that cannot be reproduced locally.
           RUST_LOG: debug
         run: cargo test --workspace --no-fail-fast --target ${{ matrix.target }}
+
+  msrv:
+    name: msrv (1.89)
+    # The floor `rust-version` advertises, built exactly. `stable` moves every
+    # six weeks and would never notice a let chain or a new std API arriving
+    # under a floor that says otherwise -- which is how 1.85 went stale.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.89
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+  advisories:
+    name: advisories
+    # `cargo audit` alone exits 0 on unsound and unmaintained crates -- which
+    # is how two lru soundness advisories sat in the lockfile unnoticed.
+    # `--deny warnings` makes every class fail; exceptions live, dated, in
+    # .cargo/audit.toml.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit
+        run: cargo audit --deny warnings

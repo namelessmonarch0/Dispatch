@@ -3,21 +3,24 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
-use dispatch_config::{DelegationLimits, HarnessRegistry};
+use dispatch_config::{DelegationLimits, HarnessRegistry, TaskInput, TaskRun};
 use dispatch_core::{PaneId, PaneStatus, Project, ProjectId, ProjectSource, RequestId};
-use dispatch_os::ipc::{Connection, Listener};
+use dispatch_os::ipc::{Closer, Connection, Listener};
 use dispatch_proto::{
     ClientMessage, DelegateOutcome, Frame, FrameError, PaneUpdate, ProtocolError, Role,
     ServerMessage,
 };
 use dispatch_pty::{Pty, RunState, Size};
 
+use crate::budgets::Budgets;
 use crate::delegation::Pending;
+use crate::outbox::{Inbox, Outbox, Refused};
 use crate::pane::DaemonPane;
+use crate::task_file::{Leftovers, TaskFile};
 
 /// How much of a subagent's output its caller is given.
 ///
@@ -42,6 +45,122 @@ const TICK: Duration = Duration::from_millis(8);
 /// path there, not a fallback, and it has to be long enough for ConPTY's pipe to
 /// catch up with the process object.
 const TAIL_GRACE: Duration = Duration::from_millis(250);
+
+/// How often task files that could not be removed are tried again.
+///
+/// Often enough that one outlives the process holding it by about this
+/// long, and seldom enough that a file that keeps refusing costs nothing.
+const RETRY_LEFTOVERS: Duration = Duration::from_secs(1);
+
+/// How long a stopping daemon keeps trying to remove task files its panes'
+/// processes, just ended, still held.
+const LEFTOVERS_AT_SHUTDOWN: Duration = Duration::from_secs(2);
+
+/// How many events may wait for the loop.
+///
+/// Full, a client's reader thread waits to hand its next request over, and
+/// the socket behind it fills: a client sending faster than the daemon acts
+/// is slowed down rather than queued for.
+const EVENT_BACKLOG: usize = 1024;
+
+/// When the frame a client is part-way through began, while it is
+/// part-way through one.
+///
+/// Set by the client's reader thread, read by the loop, so a client that
+/// starts a frame and stops can be told from one that is merely idle.
+#[derive(Clone, Default)]
+struct FrameClock(Arc<std::sync::Mutex<Option<Instant>>>);
+
+impl FrameClock {
+    fn start(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
+
+    fn finish(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn since(&self) -> Option<Instant> {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Adds each of `extra` that `env` does not already name.
+///
+/// Named as this platform names variables: on Windows a harness's `Path`
+/// is the daemon's `PATH`, so the harness's spelling stays and the
+/// daemon's is not added beside it for the spawn to choose between.
+fn add_missing(env: &mut BTreeMap<String, String>, extra: BTreeMap<String, String>) {
+    for (name, value) in extra {
+        if !env
+            .keys()
+            .any(|existing| dispatch_os::pty::same_variable(existing, &name))
+        {
+            env.insert(name, value);
+        }
+    }
+}
+
+/// Where task files go unless a test says otherwise.
+///
+/// Dispatch's own directory for them, the user's alone. With no home
+/// directory to put that under, a directory of Dispatch's own inside the
+/// temporary directory: `create_private_dir` refuses it if another user
+/// made it first, which it could not do for the temporary directory itself.
+fn default_task_dir() -> PathBuf {
+    match dispatch_os::paths::task_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            let fallback = std::env::temp_dir().join("dispatch-tasks");
+            tracing::warn!(
+                %error,
+                dir = %fallback.display(),
+                "no directory of Dispatch's own for task files; using one in the temporary directory"
+            );
+            fallback
+        }
+    }
+}
+
+/// Releases a client's place against `Budgets::max_clients` once nothing is
+/// left running on its behalf.
+///
+/// A seat is taken once, when a client attaches, but two threads act for it
+/// afterwards -- its reader and its writer -- and either can outlive the
+/// other: a writer can go on delivering to a client whose reader has
+/// already ended, so freeing the seat the moment either thread exits would
+/// let the other go on costing a slot nothing accounts for. Wrapped in an
+/// `Arc` and cloned once per thread, so `Drop` runs exactly once, whichever
+/// thread's clone happens to be the last to go -- which also covers a
+/// thread that panics rather than returning.
+struct Seat(Arc<AtomicUsize>);
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Tells the loop a client's reader thread has ended, however it ended.
+///
+/// Held by that thread and sent from its `Drop`, not written inline after
+/// its read loop: a frame a peer sent that fails to decode ends the thread
+/// through a panic, which unwinds past any code placed after the loop, so
+/// only a guard's `Drop` -- run during that unwind the same as at an
+/// ordinary return -- reaches the loop either way. Without it, a client
+/// whose reader crashed would stay in `self.clients` forever: nothing would
+/// ever close its connection or free its seat, because both wait on the
+/// `Event::Detached` this sends.
+struct DetachOnDrop {
+    id: ClientId,
+    events: SyncSender<Event>,
+}
+
+impl Drop for DetachOnDrop {
+    fn drop(&mut self) {
+        let _ = self.events.send(Event::Detached(self.id));
+    }
+}
 
 /// Failures starting or running the daemon.
 #[derive(Debug, thiserror::Error)]
@@ -79,10 +198,20 @@ impl Shutdown {
     }
 }
 
+/// What connects the loop to one client's threads.
+struct Wiring {
+    /// Its queue.
+    outbox: Outbox,
+    /// Ends its connection, both halves, whoever holds them.
+    closer: Closer,
+    /// When it is part-way through a frame, set by its reader thread.
+    frame: FrameClock,
+}
+
 /// Something the loop reacts to.
 enum Event {
     /// A client attached.
-    Attached(ClientId, Sender<ServerMessage>),
+    Attached(ClientId, Wiring),
     /// A client said something.
     Request(ClientId, ClientMessage),
     /// A client went away.
@@ -91,7 +220,9 @@ enum Event {
 
 /// An attached client.
 struct Client {
-    outbox: Sender<ServerMessage>,
+    outbox: Outbox,
+    /// Ends its connection, both halves, whoever holds them.
+    closer: Closer,
     /// Whether it has asked for pane events. A client that has not subscribed
     /// is still connected but silent, which is what a one-shot command wants.
     subscribed: bool,
@@ -99,6 +230,18 @@ struct Client {
     /// prompts are broadcast to interface clients only; a delegate caller
     /// wants the fate of its own request and nothing else.
     role: Role,
+    /// Whether its `Hello` has been accepted.
+    ///
+    /// Nothing but a `Hello` is acted on before then: a peer that has not
+    /// said which protocol it speaks may mean something else by every byte
+    /// that follows, and one that was refused must not get to act anyway.
+    ready: bool,
+    /// When it is part-way through a frame, so [`Daemon::enforce_deadlines`]
+    /// can tell a stalled client from an idle one.
+    frame: FrameClock,
+    /// When it attached, so [`Daemon::enforce_deadlines`] can tell a client
+    /// that is taking too long to say `Hello`.
+    attached: Instant,
 }
 
 /// The daemon.
@@ -108,15 +251,25 @@ pub struct Daemon {
     harnesses: HarnessRegistry,
     projects: HashMap<ProjectId, Project>,
     events: Receiver<Event>,
-    sender: Sender<Event>,
+    sender: SyncSender<Event>,
     device: String,
     stop: Arc<AtomicBool>,
     limits: DelegationLimits,
+    /// Limits on what one client may cost the daemon.
+    budgets: Budgets,
     /// Requests asked about and not yet answered.
     pending: HashMap<RequestId, Pending>,
     /// Panes the user has approved for every future request, for as long as
     /// this daemon runs.
     blanket: HashSet<PaneId>,
+    /// Where a task delivered in a file is written.
+    task_dir: PathBuf,
+    /// Task files whose removal failed, to be tried again.
+    leftovers: Leftovers,
+    /// When `leftovers` was last tried.
+    leftovers_tried: Instant,
+    /// The task directory's lock, while this daemon holds it.
+    task_dir_lock: Option<std::fs::File>,
 }
 
 impl Daemon {
@@ -134,7 +287,7 @@ impl Daemon {
         device: impl Into<String>,
         limits: DelegationLimits,
     ) -> Self {
-        let (sender, events) = channel();
+        let (sender, events) = sync_channel(EVENT_BACKLOG);
 
         Self {
             panes: HashMap::new(),
@@ -146,9 +299,28 @@ impl Daemon {
             device: device.into(),
             stop: Arc::new(AtomicBool::new(false)),
             limits,
+            budgets: Budgets::default(),
             pending: HashMap::new(),
             blanket: HashSet::new(),
+            task_dir: default_task_dir(),
+            leftovers: Leftovers::default(),
+            leftovers_tried: Instant::now(),
+            task_dir_lock: None,
         }
+    }
+
+    /// Replaces the limits on what one client may cost.
+    ///
+    /// Before `serve`, which consumes the daemon.
+    pub fn set_budgets(&mut self, budgets: Budgets) {
+        self.budgets = budgets;
+    }
+
+    /// Where task files are written: [`dispatch_os::paths::task_dir`] unless
+    /// told otherwise.
+    #[doc(hidden)]
+    pub fn set_task_dir(&mut self, dir: PathBuf) {
+        self.task_dir = dir;
     }
 
     /// Returns the handle that stops this daemon.
@@ -199,8 +371,16 @@ impl Daemon {
     }
 
     /// Accepts connections until the listener fails, serving them all.
+    ///
+    /// First takes the task directory, which sweeps up the task files a
+    /// daemon that did not stop cleanly left behind -- unless another
+    /// daemon holds the directory, whose files those may be.
     pub fn serve(mut self, listener: Listener) -> Result<(), DaemonError> {
+        self.task_dir_lock = crate::task_file::claim(&self.task_dir);
+
         let sender = self.sender.clone();
+        let max_clients = self.budgets.max_clients;
+        let live = Arc::new(AtomicUsize::new(0));
         let mut next_id = 0;
 
         // Accepting blocks, so it runs on its own thread and hands each
@@ -209,10 +389,19 @@ impl Daemon {
             loop {
                 match listener.accept() {
                     Ok(connection) => {
-                        next_id += 1;
-                        if spawn_client(next_id, connection, &sender).is_err() {
-                            break;
+                        // Counted by seats, held until both of a client's
+                        // threads have ended; closed at once rather than
+                        // served badly.
+                        if live.load(Ordering::Relaxed) >= max_clients {
+                            tracing::warn!(
+                                max_clients,
+                                "turning a client away: too many are connected"
+                            );
+                            connection.closer().close();
+                            continue;
                         }
+                        next_id += 1;
+                        spawn_client(next_id, connection, &sender, &live);
                     }
                     Err(error) => {
                         tracing::warn!(%error, "failed to accept a connection");
@@ -242,9 +431,25 @@ impl Daemon {
             }
 
             self.pump_panes();
+            self.enforce_deadlines();
         }
 
         self.close_all_panes();
+        self.clear_leftovers_on_the_way_out();
+    }
+
+    /// Tries once more to remove task files a pane's process still held,
+    /// for as long as the processes just ended may take to let go.
+    fn clear_leftovers_on_the_way_out(&mut self) {
+        let deadline = Instant::now() + LEFTOVERS_AT_SHUTDOWN;
+        loop {
+            self.leftovers.retry();
+            if self.leftovers.is_empty() || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        self.leftovers.report();
     }
 
     /// Terminates every pane, so nothing outlives the daemon.
@@ -261,24 +466,42 @@ impl Daemon {
             self.handle(event);
         }
         self.pump_panes();
+        self.enforce_deadlines();
     }
 
     fn handle(&mut self, event: Event) {
         match event {
-            Event::Attached(id, outbox) => {
+            Event::Attached(id, wiring) => {
                 self.clients.insert(
                     id,
                     Client {
-                        outbox,
+                        outbox: wiring.outbox,
+                        closer: wiring.closer,
                         subscribed: false,
                         role: Role::default(),
+                        ready: false,
+                        frame: wiring.frame,
+                        attached: Instant::now(),
                     },
                 );
                 tracing::info!(client = id, "client attached");
             }
             Event::Detached(id) => {
-                self.clients.remove(&id);
-                self.abandon(id);
+                // A client `refuse`d or already `hang_up`'d on is forgotten
+                // already: its writer thread is on its own from here,
+                // flushing a refusal or already being closed.
+                if self.clients.contains_key(&id) {
+                    // Its own sending half has ended, so the client itself
+                    // is gone -- not merely idle, which is between frames,
+                    // not the end of the stream -- and closing the
+                    // connection now is what stops its writer from
+                    // lingering, stuck delivering to a peer that stopped
+                    // reading or has already left, holding a thread, a
+                    // socket and its seat open for nothing.
+                    self.hang_up(id);
+                } else {
+                    self.abandon(id);
+                }
                 tracing::info!(client = id, "client detached");
             }
             Event::Request(id, message) => self.handle_request(id, message),
@@ -286,6 +509,27 @@ impl Daemon {
     }
 
     fn handle_request(&mut self, id: ClientId, message: ClientMessage) {
+        let Some(client) = self.clients.get(&id) else {
+            // Refused, hung up on, or detached. Its reader may still be
+            // forwarding frames it had already read -- a peer can send a
+            // request right behind a Hello it is about to be refused for --
+            // and none of them is anyone's to act on.
+            tracing::debug!(client = id, "ignoring a request from a client that is gone");
+            return;
+        };
+
+        if !client.ready && !matches!(message, ClientMessage::Hello { .. }) {
+            tracing::info!(client = id, "a client spoke before its Hello");
+            self.send(
+                id,
+                ServerMessage::Error {
+                    error: ProtocolError::Other("the connection must begin with a Hello".into()),
+                },
+            );
+            self.refuse(id);
+            return;
+        }
+
         match message {
             ClientMessage::Hello {
                 version,
@@ -304,12 +548,13 @@ impl Daemon {
                             },
                         },
                     );
-                    self.clients.remove(&id);
+                    self.refuse(id);
                     return;
                 }
 
                 if let Some(existing) = self.clients.get_mut(&id) {
                     existing.role = role;
+                    existing.ready = true;
                 }
 
                 tracing::info!(client = id, %version, name = %client, "handshake accepted");
@@ -395,9 +640,7 @@ impl Daemon {
                     existing.push(pending.announcement.clone());
                 }
 
-                for message in existing {
-                    self.send(id, message);
-                }
+                self.send_batch(id, existing);
             }
 
             ClientMessage::OpenProject { root } => self.open_project_for(id, root),
@@ -421,8 +664,24 @@ impl Daemon {
                     return;
                 };
 
-                if let Err(error) = target.session.write(&bytes) {
-                    tracing::warn!(%error, "failed to write to a pane");
+                match target.session.write(&bytes) {
+                    Ok(()) => {}
+                    // Said to the one client that sent it, which is the one
+                    // whose paste just went nowhere; the rest of the fleet
+                    // has no use for it.
+                    Err(dispatch_pty::PtyError::InputFull { waiting }) => {
+                        let dropped = bytes.len();
+                        self.send(
+                            id,
+                            ServerMessage::Error {
+                                error: ProtocolError::Other(format!(
+                                    "pane {pane} is not reading its input: {waiting} bytes are \
+                                     still waiting for it, so these {dropped} were dropped"
+                                )),
+                            },
+                        );
+                    }
+                    Err(error) => tracing::warn!(%error, "failed to write to a pane"),
                 }
             }
 
@@ -625,9 +884,7 @@ impl Daemon {
 
         let mut launch = def.launch_for_current_platform();
         let id = PaneId::new();
-        for (key, value) in self.pane_env(id) {
-            launch.env.entry(key).or_insert(value);
-        }
+        add_missing(&mut launch.env, self.pane_env(id));
 
         let session = match Pty::spawn(&launch, &root, size) {
             Ok(session) => session,
@@ -654,6 +911,7 @@ impl Daemon {
             request: None,
             caller: None,
             exited_at: None,
+            task_file: None,
         };
         // Announced from the pane's own field rather than repeated here: what a
         // client draws has to be what the daemon is holding.
@@ -709,6 +967,38 @@ impl Daemon {
         env
     }
 
+    /// The one-shot run of `task` under `harness`, with the environment pane
+    /// `pane` would start with, or `None` when the harness has no one-shot
+    /// form for this platform.
+    ///
+    /// One place builds it, so what is judged before a run starts is what
+    /// starts.
+    fn task_run(&self, harness: &str, task: &str, pane: PaneId) -> Option<TaskRun> {
+        let mut run = self.harnesses.get(harness)?.task_launch(task)?;
+        add_missing(&mut run.launch.env, self.pane_env(pane));
+        if run.input == TaskInput::Argument {
+            // Its task is in its arguments, so a task file named in its
+            // environment could only be stale -- inherited, or set in the
+            // harness file -- and a redirect against it would read another
+            // file than the task.
+            run.launch.env.retain(|name, _| {
+                !dispatch_os::pty::same_variable(name, dispatch_config::TASK_FILE_ENV)
+            });
+            run.launch
+                .unset
+                .insert(dispatch_config::TASK_FILE_ENV.to_string());
+        }
+        Some(run)
+    }
+
+    /// Why `run` must not start, if the form it came from puts the task where
+    /// a shell parses it.
+    fn unsafe_task_form(&self, harness: &str, run: &TaskRun) -> Option<String> {
+        self.harnesses
+            .get(harness)?
+            .task_refusal_as(std::env::consts::OS, &run.launch)
+    }
+
     /// Refuses, approves, or asks about a request to delegate.
     fn delegate_request(
         &mut self,
@@ -742,16 +1032,29 @@ impl Daemon {
             harness
         };
 
+        // Built as `approve` will build it, environment and all: which file a
+        // bare command names depends on `PATH`. The pane id is a stand-in,
+        // since nothing is judged by it.
+        let run = self.task_run(&harness, &task, PaneId::new());
+
+        // A form that would put the task on cmd.exe's command line is refused
+        // whatever the caps say: approving it would not make it safe.
+        if let Some(reason) = run
+            .as_ref()
+            .and_then(|run| self.unsafe_task_form(&harness, run))
+        {
+            tracing::info!(%parent, %harness, %reason, "refused an unsafe task form");
+            self.resolve(request, caller, DelegateOutcome::Refused { reason });
+            return;
+        }
+
         let depth = self.depth_of(parent);
         let live = self.live_children(parent);
         // The same predicate `approve` will use to actually launch it: a
         // harness with `[task]` but an empty argument list has no form either,
         // and asking the user about it only to refuse it after they approve is
         // worse than refusing up front.
-        let has_task_form = self
-            .harnesses
-            .get(&harness)
-            .is_some_and(|def| def.task_launch(&task).is_some());
+        let has_task_form = run.is_some();
 
         if let Some(reason) =
             crate::delegation::refusal(depth, live, self.limits, has_task_form, &harness)
@@ -850,6 +1153,21 @@ impl Daemon {
         };
         let project = asking.project;
 
+        // An exited pane keeps its row so its last output can be read, but
+        // the agent that asked is gone: a subagent started now would work for
+        // nobody. A blanket approval outlives the agent the same way, so this
+        // is asked on its path too.
+        if matches!(asking.session.state(), RunState::Exited(_)) {
+            self.resolve(
+                request,
+                caller,
+                DelegateOutcome::Refused {
+                    reason: "the pane that asked has exited".into(),
+                },
+            );
+            return;
+        }
+
         let Some(root) = self.projects.get(&project).map(|p| p.root.clone()) else {
             self.send(
                 caller,
@@ -863,11 +1181,38 @@ impl Daemon {
             return;
         };
 
-        let Some(launch) = self
-            .harnesses
-            .get(harness)
-            .and_then(|def| def.task_launch(task))
-        else {
+        let id = PaneId::new();
+        let run = self.task_run(harness, task, id);
+
+        // Judged again on the run that is about to start, as the request
+        // was when it arrived: which file a bare command names is decided
+        // by the filesystem now, not then.
+        if let Some(reason) = run
+            .as_ref()
+            .and_then(|run| self.unsafe_task_form(harness, run))
+        {
+            tracing::info!(%parent, %harness, %reason, "refused an unsafe task form on approval");
+            self.resolve(request, caller, DelegateOutcome::Refused { reason });
+            return;
+        }
+
+        // Asked again here, and not only when the request arrived: several
+        // requests can each see a free slot while they wait, and every one
+        // of them would start on approval. The cap is on what runs, so it is
+        // enforced where things start running -- with the same predicate the
+        // request was first judged by, so the two can never disagree.
+        let depth = self.depth_of(parent);
+        let live = self.live_children(parent);
+        if let Some(reason) =
+            crate::delegation::refusal(depth, live, self.limits, run.is_some(), harness)
+        {
+            tracing::info!(%parent, %harness, %reason, "refused an approved delegation");
+            self.resolve(request, caller, DelegateOutcome::Refused { reason });
+            return;
+        }
+        let Some(run) = run else {
+            // `refusal` refuses a missing form first, so this cannot be
+            // reached; kept as a refusal rather than a panic all the same.
             self.resolve(
                 request,
                 caller,
@@ -878,11 +1223,39 @@ impl Daemon {
             return;
         };
 
-        let id = PaneId::new();
-        let mut launch = launch;
-        for (key, value) in self.pane_env(id) {
-            launch.env.entry(key).or_insert(value);
-        }
+        let mut launch = run.launch;
+        let task_file = match run.input {
+            TaskInput::Argument => None,
+            TaskInput::File => {
+                match TaskFile::write(&self.task_dir, request, task, &self.leftovers) {
+                    Ok(file) => {
+                        // Last, and in place of any spelling of it the
+                        // harness set: the file Dispatch wrote is the one
+                        // the form reads.
+                        launch.env.retain(|name, _| {
+                            !dispatch_os::pty::same_variable(name, dispatch_config::TASK_FILE_ENV)
+                        });
+                        launch.env.insert(
+                            dispatch_config::TASK_FILE_ENV.to_string(),
+                            file.for_redirect(),
+                        );
+                        Some(file)
+                    }
+                    Err(error) => {
+                        self.resolve(
+                            request,
+                            caller,
+                            DelegateOutcome::Refused {
+                                reason: format!(
+                                    "could not write the task down for {harness}: {error}"
+                                ),
+                            },
+                        );
+                        return;
+                    }
+                }
+            }
+        };
 
         let session = match Pty::spawn(&launch, &root, Size::new(size.0, size.1)) {
             Ok(session) => session,
@@ -912,6 +1285,7 @@ impl Daemon {
                 request: Some(request),
                 caller: Some(caller),
                 exited_at: None,
+                task_file,
             },
         );
 
@@ -1153,6 +1527,8 @@ impl Daemon {
             {
                 pane.status = PaneStatus::Exited(code);
                 pane.exited_at = Some(Instant::now());
+                // Read by now, and nothing will read it again.
+                pane.task_file = None;
                 exited.push((*id, code));
             }
         }
@@ -1211,18 +1587,135 @@ impl Daemon {
         }
 
         self.expire_requests();
+
+        if !self.leftovers.is_empty() && self.leftovers_tried.elapsed() >= RETRY_LEFTOVERS {
+            self.leftovers_tried = Instant::now();
+            self.leftovers.retry();
+        }
+    }
+
+    /// Hangs up on clients that ran out of time: one that never said
+    /// `Hello`, and one that began a frame and never finished it.
+    fn enforce_deadlines(&mut self) {
+        let now = Instant::now();
+
+        let late: Vec<(ClientId, &'static str)> = self
+            .clients
+            .iter()
+            .filter_map(|(id, client)| {
+                if !client.ready && now.duration_since(client.attached) >= self.budgets.handshake {
+                    return Some((*id, "it never said hello"));
+                }
+                if client
+                    .frame
+                    .since()
+                    .is_some_and(|began| now.duration_since(began) >= self.budgets.frame)
+                {
+                    return Some((*id, "it stopped part-way through a message"));
+                }
+                None
+            })
+            .collect();
+
+        for (id, why) in late {
+            tracing::info!(
+                client = id,
+                why,
+                "hanging up on a client that ran out of time"
+            );
+            self.hang_up(id);
+        }
+    }
+
+    /// Forgets a client, ends its connection at once, and drops what it was
+    /// waiting on.
+    ///
+    /// For a client whose writer thread is stuck: past its budget, live or
+    /// asked-for, there is nothing more it can be told and nothing to wait
+    /// for, so the connection ends now rather than however long the write
+    /// the writer thread is blocked on would otherwise take to fail on its
+    /// own.
+    ///
+    /// `Closer::close` can block for up to about two seconds -- on Windows it
+    /// keeps cancelling until nothing is left in flight on either pipe -- and
+    /// the loop calls this from the same thread that ticks every pane and
+    /// drains every event; blocking here would stall the whole daemon behind
+    /// one client's connection. So the client is forgotten first, then closed
+    /// on a thread of its own that outlives this call, and only then is what
+    /// it was waiting on dropped.
+    ///
+    /// Not for a refusal or a protocol violation, which has just queued the
+    /// message explaining why: see [`Self::refuse`], which lets that reach
+    /// the peer first.
+    ///
+    /// Logs nothing itself: every caller already has, in its own words --
+    /// out of time, behind on what it asked for, or simply gone -- and
+    /// "hung up" would be the wrong word for the last of those, which is
+    /// the client leaving on its own rather than the daemon choosing to end
+    /// it.
+    fn hang_up(&mut self, id: ClientId) {
+        if let Some(client) = self.clients.remove(&id) {
+            let closer = client.closer;
+            std::thread::spawn(move || closer.close());
+        }
+        self.abandon(id);
+    }
+
+    /// Forgets a client and drops what it was waiting on, without touching
+    /// its connection.
+    ///
+    /// For a refusal or a protocol violation, sent as the `ServerMessage`
+    /// just queued ahead of this call: closing here -- immediately, as
+    /// [`Self::hang_up`] does for a client past its budget -- races that
+    /// write, and `Closer::close` can win it, so the peer would see a bare
+    /// disconnect instead of the reason. Forgetting the client only drops
+    /// this end's `Outbox`; the writer thread's own clone of the connection's
+    /// `Closer` is what ends it, once `Inbox::recv` returns `None` -- the
+    /// refusal delivered and nothing left queued -- or a write itself fails.
+    fn refuse(&mut self, id: ClientId) {
+        self.clients.remove(&id);
+        tracing::info!(client = id, "refused a client");
+        self.abandon(id);
     }
 
     /// Sends to one client.
+    ///
+    /// Not judged against the client's live-traffic budget: this is what it
+    /// asked for. See [`Self::send_batch`], of which this is the one-message
+    /// case.
     fn send(&mut self, id: ClientId, message: ServerMessage) {
+        self.send_batch(id, vec![message]);
+    }
+
+    /// Sends every message in `messages` to one client, as a single reply.
+    ///
+    /// `ClientMessage::Subscribe`'s whole catch-up goes through here in one
+    /// call: checked once, against the asked-for backlog already waiting,
+    /// rather than once per message, so a reply that clears the check is
+    /// delivered whole -- never split or refused partway through by its own
+    /// bulk. A client that keeps asking for things without ever reading the
+    /// answers is hung up all the same, just like one that falls behind on
+    /// live traffic.
+    fn send_batch(&mut self, id: ClientId, messages: Vec<ServerMessage>) {
         let Some(client) = self.clients.get(&id) else {
             return;
         };
 
-        // A failed send means the writer thread is gone, so the client has
-        // disconnected and should be forgotten rather than retried.
-        if client.outbox.send(message).is_err() {
-            self.clients.remove(&id);
+        match client.outbox.send_all(messages, self.budgets.outbox_bytes) {
+            Ok(()) => {}
+            // A failed send means the writer thread is gone, so the client
+            // has disconnected and should be forgotten rather than retried.
+            Err(Refused::Gone) => {
+                self.clients.remove(&id);
+            }
+            Err(Refused::Behind { queued }) => {
+                tracing::warn!(
+                    client = id,
+                    queued,
+                    "hanging up on a client that is behind on what it asked for"
+                );
+                self.hang_up(id);
+            }
         }
     }
 
@@ -1239,6 +1732,7 @@ impl Daemon {
     /// otherwise be told twice.
     fn broadcast_except(&mut self, exclude: Option<ClientId>, message: ServerMessage) {
         let mut gone = Vec::new();
+        let mut behind = Vec::new();
 
         for (id, client) in &self.clients {
             // A delegate caller wants the fate of its own request; the fleet's
@@ -1247,13 +1741,30 @@ impl Daemon {
             if Some(*id) == exclude || !client.subscribed || client.role != Role::Interface {
                 continue;
             }
-            if client.outbox.send(message.clone()).is_err() {
-                gone.push(*id);
+            match client
+                .outbox
+                .send_within(message.clone(), self.budgets.outbox_bytes)
+            {
+                Ok(()) => {}
+                Err(Refused::Gone) => gone.push(*id),
+                Err(Refused::Behind { queued }) => behind.push((*id, queued)),
             }
         }
 
         for id in gone {
             self.clients.remove(&id);
+        }
+
+        // Hung up on rather than skipped: a client that misses output it is
+        // never told it missed draws a screen that is quietly wrong. One that
+        // reconnects is replayed the lot.
+        for (id, queued) in behind {
+            tracing::warn!(
+                client = id,
+                queued,
+                "hanging up on a client that stopped reading"
+            );
+            self.hang_up(id);
         }
     }
 }
@@ -1283,20 +1794,50 @@ fn client_binary_dir() -> Option<PathBuf> {
 fn spawn_client(
     id: ClientId,
     connection: Connection,
-    events: &Sender<Event>,
-) -> Result<(), dispatch_os::ipc::IpcError> {
+    events: &SyncSender<Event>,
+    live: &Arc<AtomicUsize>,
+) {
+    let closer = connection.closer();
+    // The writer thread gets its own clone: `Daemon::hang_up` closes the one
+    // in `Wiring` at once, for a client stuck mid-write, while this one ends
+    // the connection only once the writer has nothing left to deliver (or a
+    // write itself fails) -- the ordinary way a refusal reaches its peer
+    // before the connection does.
+    let writer_closer = closer.clone();
     let (mut reader, mut writer) = connection.split();
-    let (outbox, outgoing) = channel::<ServerMessage>();
+    let (outbox, inbox) = crate::outbox::pair();
+    let frame = FrameClock::default();
 
-    if events.send(Event::Attached(id, outbox)).is_err() {
-        return Ok(());
+    if events
+        .send(Event::Attached(
+            id,
+            Wiring {
+                outbox,
+                closer,
+                frame: frame.clone(),
+            },
+        ))
+        .is_err()
+    {
+        return;
     }
+    live.fetch_add(1, Ordering::Relaxed);
+    // Held by both threads below; the seat is freed once whichever of them
+    // ends last drops its clone, not when the first of the two does.
+    let seat = Arc::new(Seat(Arc::clone(live)));
 
     let incoming = events.clone();
+    let reader_seat = Arc::clone(&seat);
     std::thread::spawn(move || {
+        let _detached = DetachOnDrop {
+            id,
+            events: incoming.clone(),
+        };
+
         loop {
-            match Frame::read::<_, ClientMessage>(&mut reader) {
+            match Frame::read_watched::<_, ClientMessage>(&mut reader, || frame.start()) {
                 Ok(message) => {
+                    frame.finish();
                     if incoming.send(Event::Request(id, message)).is_err() {
                         break;
                     }
@@ -1309,11 +1850,11 @@ fn spawn_client(
             }
         }
 
-        let _ = incoming.send(Event::Detached(id));
+        drop(reader_seat);
     });
 
     std::thread::spawn(move || {
-        while let Ok(message) = outgoing.recv() {
+        while let Some(message) = inbox.recv() {
             // Logged rather than swallowed: a write that fails here is how a
             // client ends up waiting for an answer the daemon believes it sent,
             // and a silent `break` leaves nothing to read afterwards. Debug
@@ -1324,18 +1865,35 @@ fn spawn_client(
                 break;
             }
         }
-    });
 
-    Ok(())
+        // Reached once there is nothing left to deliver -- `Daemon::refuse`
+        // dropped the `Outbox` after queueing the reason, and this is what
+        // was queued -- or once a write above failed. Either way the
+        // connection is done with; `Daemon::hang_up` closes the other clone
+        // itself, immediately, for a client this thread is instead stuck
+        // mid-write to.
+        writer_closer.close();
+        drop(seat);
+    });
 }
 
 /// Lets a test drive the loop without a socket.
 impl Daemon {
     /// Attaches a fake client and returns its inbox.
+    ///
+    /// Taking from the inbox is what reading is: a test that never takes is
+    /// a client that has stopped reading.
     #[doc(hidden)]
-    pub fn attach_for_test(&mut self, id: u64) -> Receiver<ServerMessage> {
-        let (outbox, inbox) = channel();
-        self.handle(Event::Attached(id, outbox));
+    pub fn attach_for_test(&mut self, id: u64) -> Inbox {
+        let (outbox, inbox) = crate::outbox::pair();
+        self.handle(Event::Attached(
+            id,
+            Wiring {
+                outbox,
+                closer: Closer::default(),
+                frame: FrameClock::default(),
+            },
+        ));
         inbox
     }
 
@@ -1349,6 +1907,16 @@ impl Daemon {
     #[doc(hidden)]
     pub fn detach_for_test(&mut self, id: u64) {
         self.handle(Event::Detached(id));
+    }
+
+    /// The pid of every pane's process, for tests that watch a tree end.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pane_pids_for_test(&self) -> Vec<u32> {
+        self.panes
+            .values()
+            .filter_map(|pane| pane.session.pid())
+            .collect()
     }
 }
 

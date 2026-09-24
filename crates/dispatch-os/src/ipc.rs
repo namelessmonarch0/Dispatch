@@ -1,12 +1,23 @@
 //! Local transport between a Dispatch client and `dispatchd`.
 //!
-//! A Unix domain socket on POSIX, a named pipe on Windows. Both are
-//! local-only and carry the operating system's own access control, which is
-//! what keeps another user off a daemon that can run arbitrary commands.
+//! A Unix domain socket on POSIX, readable and writable by its owner alone;
+//! a named pipe on Windows, whose DACL admits its owner alone and which
+//! refuses clients on other machines. That access control is what keeps
+//! another user off a daemon that can run arbitrary commands.
+//!
+//! It also has to run the other way on Windows. Pipe names are machine-wide
+//! and the daemon's is a hash of a path anyone can predict, so another user
+//! can create the pipe before the daemon does. A client that connected to
+//! it would hand that user its tasks and its keystrokes; so a client checks
+//! who owns the pipe it opened, and refuses one this user does not own
+//! before saying anything down it.
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 mod pairing;
 
@@ -24,6 +35,16 @@ pub enum IpcError {
     /// No daemon is listening.
     #[error("no daemon is listening on {0}")]
     NotRunning(String),
+
+    /// The endpoint answers but belongs to another account: a pipe someone
+    /// else created under the daemon's name before the daemon could.
+    #[error("{endpoint} is owned by {owner}, not by this user; refusing to connect")]
+    ForeignOwner {
+        /// The pipe that was opened.
+        endpoint: String,
+        /// Its owner's SID, for a message that says whose it is.
+        owner: String,
+    },
 
     /// The underlying transport failed.
     #[error("{context}: {source}")]
@@ -55,12 +76,164 @@ impl IpcError {
     }
 }
 
+/// Refuses `endpoint` unless `owner`, its owner's SID, is `me`, the SID of
+/// the user this process runs as.
+///
+/// A named pipe's name is machine-wide and the daemon's is predictable, so
+/// another account can create it first; a client that spoke to that pipe
+/// would hand a stranger everything it sends. Only this user's own pipe is
+/// trusted. Kept out of the platform code so that every platform's tests
+/// exercise the decision, not only Windows'.
+#[cfg(any(windows, test))]
+pub(crate) fn trust_owner(endpoint: &str, owner: &str, me: &str) -> Result<(), IpcError> {
+    if owner == me {
+        return Ok(());
+    }
+    Err(IpcError::ForeignOwner {
+        endpoint: endpoint.to_string(),
+        owner: owner.to_string(),
+    })
+}
+
+/// What binding reports when the endpoint is already held, from what
+/// opening it as a client found.
+///
+/// A pipe another account created under the daemon's name first is not a
+/// daemon already running, and saying it was sends the user looking for one
+/// that is not there. The owner check a client makes tells the two apart,
+/// as far as it can: an endpoint that would not open at all says nothing
+/// about whose it is, and is reported as a daemon, as it always was. Kept
+/// out of the platform code so every platform's tests exercise it.
+#[cfg(any(windows, test))]
+pub(crate) fn held(endpoint: &str, opened: Result<(), IpcError>) -> IpcError {
+    match opened {
+        Err(foreign @ IpcError::ForeignOwner { .. }) => foreign,
+        _ => IpcError::AlreadyRunning(endpoint.to_string()),
+    }
+}
+
 /// Where the daemon listens.
 ///
 /// Under the configuration directory, so `DISPATCH_CONFIG_DIR` gives a
 /// separate daemon its own endpoint and two configurations cannot collide.
 pub fn endpoint() -> Result<PathBuf, IpcError> {
     Ok(crate::paths::config_dir()?.join("dispatchd.sock"))
+}
+
+/// How long a connection may take to say which half it is.
+///
+/// A client writes its thirteen bytes the moment it connects. One that has
+/// not in two seconds is not a Dispatch client, or not a working one.
+const PREAMBLE_PATIENCE: Duration = Duration::from_secs(2);
+
+/// How many connections may be announcing themselves at once.
+///
+/// Each holds a thread until it has said which half it is or run out of
+/// patience. Past this a new connection is closed at once, so a flood of
+/// silent connections costs this many threads for two seconds rather than
+/// one thread each.
+const MAX_ANNOUNCING: usize = 32;
+
+/// Ends a connection from outside the threads using it.
+///
+/// A thread parked in a read or a write on a peer that has stopped answering
+/// holds its half until the peer lets go -- for a socket under a dead SSH
+/// session, the kernel's quarter of an hour. Nothing outside that thread can
+/// drop the half, so this is the way in: it fails what is in flight on both
+/// halves, the parked threads return with an error, and each lets its half
+/// go.
+///
+/// On Unix both sockets are shut down, which also fails everything after.
+/// On Windows the pipe operations in flight are cancelled and every one
+/// after fails before it starts; the pipes themselves end once the threads
+/// holding them drop their halves -- which they do when their operation
+/// fails. A command transport's process tree is killed, which ends its
+/// pipes from the far side.
+///
+/// Cheap to clone; every clone ends the same connection, and closing twice
+/// does nothing. `Closer::default()` closes nothing: it is what a
+/// connection built from halves the caller already owns hands out.
+///
+/// A closer holds a second handle onto each stream, so while any clone of
+/// it lives the connection stays open, even once both halves are dropped:
+/// the peer sees no end of file, and a named pipe stays connected. Whoever
+/// holds one closes it or drops it when the connection is done with;
+/// closing lets the handles go.
+#[derive(Clone, Default)]
+pub struct Closer(Arc<Mutex<Option<Ending>>>);
+
+/// What ending one connection takes.
+enum Ending {
+    /// A second handle onto each of the connection's two streams.
+    Streams(Vec<imp::Stream>),
+    /// The process behind a command transport, while it is still there to
+    /// be ended; see [`Spawned::pid`].
+    Process(Arc<Mutex<Option<u32>>>),
+}
+
+impl std::fmt::Debug for Closer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Closer")
+    }
+}
+
+impl Closer {
+    /// A closer for the connection paired from `reader` and `writer`.
+    fn streams(reader: &imp::Stream, writer: &imp::Stream) -> Result<Self, IpcError> {
+        let second = |stream: &imp::Stream| {
+            imp::try_clone(stream)
+                .map_err(|e| IpcError::io("preparing a connection to be closed", e))
+        };
+        Ok(Self::ending(Ending::Streams(vec![
+            second(reader)?,
+            second(writer)?,
+        ])))
+    }
+
+    /// A closer for the command transport that `spawned` runs.
+    fn process(spawned: &Spawned) -> Self {
+        Self::ending(Ending::Process(Arc::clone(&spawned.pid)))
+    }
+
+    fn ending(ending: Ending) -> Self {
+        Self(Arc::new(Mutex::new(Some(ending))))
+    }
+
+    /// Makes both halves of the connection fail, whoever holds them.
+    ///
+    /// Can block. On Windows it cancels until nothing is in flight on either
+    /// pipe, up to a second for each. For a command transport it gives the
+    /// tree its grace before killing it outright on Unix; on Windows the
+    /// transport's job is ended at once. Keep it off a thread that cannot
+    /// afford that.
+    pub fn close(&self) {
+        let ending = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+
+        match ending {
+            None => {}
+            Some(Ending::Streams(streams)) => {
+                for stream in &streams {
+                    imp::interrupt(stream);
+                }
+            }
+            Some(Ending::Process(pid)) => {
+                // Held across the signals, so the child cannot be reaped --
+                // and its pid freed for a stranger -- while it is being
+                // signalled. Only across the signals, though: the reader
+                // half's reap needs this lock to wait for the child, and on
+                // Linux a killed leader nobody has waited for keeps its group
+                // alive. Waiting here for the group to go would wait out the
+                // whole kill timeout for a zombie only that reap can clear,
+                // so the tree is signalled and the reap left to finish it.
+                let pid = pid.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(pid) = *pid
+                    && let Err(error) = crate::process::signal_tree(pid, TEARDOWN_GRACE)
+                {
+                    tracing::debug!(%error, pid, "failed to end a command transport");
+                }
+            }
+        }
+    }
 }
 
 /// A connected client or server end.
@@ -78,8 +251,10 @@ pub struct Connection {
     reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
     /// The process behind a command transport, kept so it can be reaped.
-    child: Option<std::process::Child>,
+    child: Option<Spawned>,
     hint: StderrHint,
+    /// Ends this connection from outside; see [`Closer`].
+    closer: Closer,
 }
 
 impl std::fmt::Debug for Connection {
@@ -99,13 +274,20 @@ impl Connection {
     /// A client that reconnects uses this with the endpoint it first reached, so
     /// a configuration change mid-session cannot silently move it to a different
     /// daemon than the one its panes are on.
-    pub fn connect_to(endpoint: &std::path::Path) -> Result<Self, IpcError> {
+    pub fn connect_to(endpoint: &Path) -> Result<Self, IpcError> {
         let (reader, writer) = pairing::dial(|| imp::connect(endpoint))?;
+        Self::over_streams(reader, writer)
+    }
+
+    /// A connection over the two streams a dial or a listener paired.
+    fn over_streams(reader: imp::Stream, writer: imp::Stream) -> Result<Self, IpcError> {
+        let closer = Closer::streams(&reader, &writer)?;
         Ok(Self {
             reader: Box::new(reader),
             writer: Box::new(writer),
             child: None,
             hint: StderrHint::default(),
+            closer,
         })
     }
 
@@ -122,6 +304,7 @@ impl Connection {
             writer,
             child: None,
             hint: StderrHint::default(),
+            closer: Closer::default(),
         }
     }
 
@@ -149,12 +332,13 @@ impl Connection {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        put_in_its_own_group(&mut command);
-
-        let mut child = command.spawn().map_err(|source| IpcError::Spawn {
-            command: described.clone(),
-            source,
-        })?;
+        // In a group or job of its own, so ending it ends everything it
+        // forks: `ssh` and `sh -c` both fork.
+        let mut child =
+            crate::process::spawn_contained(&mut command).map_err(|source| IpcError::Spawn {
+                command: described.clone(),
+                source,
+            })?;
 
         let reader = child.stdout.take().expect("stdout was piped");
         let writer = child.stdin.take().expect("stdin was piped");
@@ -175,11 +359,18 @@ impl Connection {
             });
         }
 
+        let spawned = Spawned {
+            pid: Arc::new(Mutex::new(Some(child.id()))),
+            child,
+        };
+        let closer = Closer::process(&spawned);
+
         Ok(Self {
             reader: Box::new(reader),
             writer: Box::new(writer),
-            child: Some(child),
+            child: Some(spawned),
             hint,
+            closer,
         })
     }
 
@@ -189,10 +380,19 @@ impl Connection {
         self.hint.clone()
     }
 
+    /// Ends this connection from outside, whoever ends up holding its halves.
+    ///
+    /// Taken before [`Connection::split`], which hands the halves to threads
+    /// that may park in them.
+    #[must_use]
+    pub fn closer(&self) -> Closer {
+        self.closer.clone()
+    }
+
     /// The child's process id, when the transport is a command.
     #[must_use]
     pub fn child_id(&self) -> Option<u32> {
-        self.child.as_ref().map(std::process::Child::id)
+        self.child.as_ref().map(|spawned| spawned.child.id())
     }
 
     /// Splits into a reader and a writer.
@@ -234,53 +434,39 @@ impl Drop for Connection {
 /// tearing down, which should not make a reconnect wait on it.
 const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Terminates a command transport's whole process tree, then reaps its
+/// A command transport's process, and the pid its closers may signal.
+struct Spawned {
+    child: std::process::Child,
+    /// The child's pid until it is reaped, shared with every [`Closer`] for
+    /// the connection.
+    ///
+    /// Reaping frees the pid for the system to hand to whatever starts next,
+    /// so a closer that outlived the reader half would signal a stranger.
+    /// [`reap`] clears this under its lock before it waits, and a closer
+    /// holds the lock for as long as it signals: until the wait, the pid is
+    /// still this child's, dead or alive.
+    pid: Arc<Mutex<Option<u32>>>,
+}
+
+/// Terminates a command transport's whole process tree, reaping its
 /// immediate child.
 ///
 /// `ssh` and `sh -c` both fork; killing only the process this crate spawned
 /// would leave those orphaned and holding the pipes this `Connection` reads
-/// and writes, which is what [`put_in_its_own_group`] and
-/// [`process::terminate_tree`](crate::process::terminate_tree) are for.
-fn reap(child: &mut std::process::Child) {
-    let _ = crate::process::terminate_tree(child.id(), TEARDOWN_GRACE);
-    let _ = child.wait();
-}
-
-/// Puts `command`'s child in a process group or job of its own, so
-/// [`process::terminate_tree`](crate::process::terminate_tree) can reach
-/// everything it forks rather than only the child itself.
+/// and writes, which is what [`process::spawn_contained`](crate::process::spawn_contained)
+/// and [`process::terminate_tree`](crate::process::terminate_tree) are for.
 ///
-/// The same treatment [`process::spawn_detached`](crate::process::spawn_detached)
-/// gives the daemon it starts, for the same reason: a command transport's
-/// child is not necessarily a leaf either.
-#[cfg(unix)]
-fn put_in_its_own_group(command: &mut std::process::Command) {
-    use std::os::unix::process::CommandExt;
-
-    // SAFETY: setsid is async-signal-safe and is the documented way to leave
-    // the parent's session and become a process group leader, which is what
-    // lets `killpg` reach every descendant later. The closure allocates
-    // nothing and touches no shared state.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(windows)]
-fn put_in_its_own_group(command: &mut std::process::Command) {
-    use std::os::windows::process::CommandExt;
-
-    /// Starts the child as the root of its own process group, so a signal
-    /// meant for it does not also reach this process, and so it can be
-    /// addressed as a group later.
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+/// The tree is signalled, then the child waited for, and only then the rest
+/// of the tree. On Linux a leader nobody has waited for is still a member of
+/// its group, so waiting for the group first sat out the whole kill timeout
+/// on this transport's own zombie: on every drop, and before a dial whose
+/// command had already failed could say so.
+fn reap(spawned: &mut Spawned) {
+    let pid = spawned.child.id();
+    spawned.pid.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let _ = crate::process::signal_tree(pid, TEARDOWN_GRACE);
+    let _ = spawned.child.wait();
+    crate::process::wait_for_tree(pid);
 }
 
 /// A reader that reaps its process when it is dropped.
@@ -290,7 +476,7 @@ fn put_in_its_own_group(command: &mut std::process::Command) {
 /// the moment the `Connection` went out of scope.
 struct ChildReader {
     reader: Box<dyn Read + Send>,
-    child: std::process::Child,
+    child: Spawned,
 }
 
 impl Read for ChildReader {
@@ -351,10 +537,20 @@ impl Write for Connection {
 }
 
 /// Accepts client connections.
+///
+/// Accepting runs on a thread of its own from the moment the endpoint is
+/// bound, and each connection's preamble is read on a thread of its own
+/// again, against [`PREAMBLE_PATIENCE`]. A client that connects and says
+/// nothing -- a wedged build, or on Windows a handle opened read-only --
+/// costs that one thread for two seconds and holds up nobody.
 pub struct Listener {
-    inner: imp::Listener,
-    /// Connections whose partner has not arrived yet.
-    halves: Mutex<pairing::Halves<imp::Stream>>,
+    /// Connections whose two halves have both arrived and announced themselves.
+    paired: Mutex<Receiver<Result<Connection, IpcError>>>,
+    /// Asks the accepting thread to stop, once something wakes it.
+    stopping: Arc<AtomicBool>,
+    /// Where it listens, so dropping it can wake the accepting thread.
+    endpoint: PathBuf,
+    accepting: Option<std::thread::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for Listener {
@@ -366,64 +562,149 @@ impl std::fmt::Debug for Listener {
 impl Listener {
     /// Starts listening, refusing to start beside a running daemon.
     pub fn bind() -> Result<Self, IpcError> {
-        let path = endpoint()?;
+        Self::bind_to(&endpoint()?)
+    }
 
+    /// Starts listening on `path`, refusing to start beside a running daemon.
+    ///
+    /// For a daemon whose endpoint is not this configuration's own: a test
+    /// that stands one up, without steering the process-wide configuration
+    /// directory to put it there.
+    pub fn bind_to(path: &Path) -> Result<Self, IpcError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| IpcError::io(format!("creating {}", parent.display()), e))?;
         }
 
+        let inner = imp::bind(path)?;
+        let (sender, paired) = channel();
+        let stopping = Arc::new(AtomicBool::new(false));
+
+        let accepting = {
+            let stopping = Arc::clone(&stopping);
+            std::thread::spawn(move || accept_all(&inner, &sender, &stopping))
+        };
+
         Ok(Self {
-            inner: imp::bind(&path)?,
-            halves: Mutex::new(pairing::Halves::new()),
+            paired: Mutex::new(paired),
+            stopping,
+            endpoint: path.to_path_buf(),
+            accepting: Some(accepting),
         })
     }
 
     /// Waits for the next client, meaning both halves of one.
-    ///
-    /// Connections arrive one at a time and a client sends two, so this
-    /// accepts until some client's pair is complete. The preamble is read here
-    /// rather than on a thread of its own: a client that connects and then
-    /// neither writes nor exits would hold up this loop, but it is a process of
-    /// the same user -- the transport admits no one else -- and the simplicity
-    /// is worth more than a defence against the user's own wedged build. A
-    /// client that dies mid-handshake closes its connection instead, which
-    /// fails the read at once. Unix bounds the wait as well; a synchronous
-    /// named pipe read cannot be given a timeout.
-    ///
-    /// A client that dies *between* its two connections leaves the half it did
-    /// announce waiting for a partner that will never come, and nothing reaps
-    /// it. The window is the microseconds between two connects, so this costs
-    /// one idle entry per client that died inside it -- not a budget worth a
-    /// reaper on a local, single-user daemon.
     pub fn accept(&self) -> Result<Connection, IpcError> {
-        loop {
-            let mut stream = imp::accept(&self.inner)?;
+        let paired = self.paired.lock().unwrap_or_else(|e| e.into_inner());
+        match paired.recv() {
+            Ok(result) => result,
+            // The accepting thread reports why before it stops, so an empty,
+            // closed queue means it stopped without a reason to give.
+            Err(_) => Err(IpcError::io(
+                "accepting a connection",
+                std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+            )),
+        }
+    }
+}
 
-            imp::bound_preamble_wait(&stream);
-            let half = pairing::listen_for(&mut stream);
-            imp::unbounded_reads(&stream);
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
+
+        // The accepting thread is parked in the platform's accept; one
+        // connection of our own wakes it to see the flag. Joined, so the
+        // endpoint is free once this returns: a daemon restarted in the same
+        // process, or a test binding the same path again, must not find the
+        // old listener still answering.
+        //
+        // Joined only when the wake got through. One that cannot reach the
+        // endpoint means no one else can either -- its socket file was
+        // removed under it, or the accepting thread has already stopped --
+        // and a join that nothing will wake would hang this drop for good.
+        //
+        // Held open until the join is done: Windows takes a connection that
+        // closed before the accept reached it for a probe and waits for the
+        // next one, which would never come.
+        let wake = imp::connect(&self.endpoint);
+        if let Some(accepting) = self.accepting.take()
+            && wake.is_ok()
+        {
+            let _ = accepting.join();
+        }
+        drop(wake);
+    }
+}
+
+/// Accepts until the listener fails or is dropped, reading each preamble on
+/// a thread of its own and handing on each connection once both of its
+/// halves are in.
+fn accept_all(
+    inner: &imp::Listener,
+    paired: &Sender<Result<Connection, IpcError>>,
+    stopping: &AtomicBool,
+) {
+    let halves = Arc::new(Mutex::new(pairing::Halves::new()));
+    let announcing = Arc::new(AtomicUsize::new(0));
+
+    loop {
+        let stream = match imp::accept(inner) {
+            Ok(stream) => stream,
+            Err(error) => {
+                let _ = paired.send(Err(error));
+                return;
+            }
+        };
+
+        if stopping.load(Ordering::Relaxed) {
+            return;
+        }
+
+        if announcing.load(Ordering::Relaxed) >= MAX_ANNOUNCING {
+            tracing::warn!(
+                "closing a connection: {MAX_ANNOUNCING} others have not yet said which half they are"
+            );
+            continue;
+        }
+
+        announcing.fetch_add(1, Ordering::Relaxed);
+        let halves = Arc::clone(&halves);
+        let announcing = Arc::clone(&announcing);
+        let paired = paired.clone();
+
+        std::thread::spawn(move || {
+            let mut stream = stream;
+            let half = imp::read_preamble(&mut stream, PREAMBLE_PATIENCE);
+            announcing.fetch_sub(1, Ordering::Relaxed);
 
             // A client that vanished, stalled, or was speaking to something
-            // else. Nothing is owed to it, and the next client is still owed a
-            // listener.
-            let Ok((token, role)) = half else { continue };
+            // else. Nothing is owed to it.
+            let Ok((token, role)) = half else { return };
 
-            let paired = self
-                .halves
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .offer(token, role, stream);
+            let offered = halves.lock().unwrap_or_else(|e| e.into_inner()).offer(
+                token,
+                role,
+                stream,
+                Instant::now(),
+            );
 
-            if let Some((reader, writer)) = paired {
-                return Ok(Connection {
-                    reader: Box::new(reader),
-                    writer: Box::new(writer),
-                    child: None,
-                    hint: StderrHint::default(),
-                });
+            let Some((reader, writer)) = offered else {
+                return;
+            };
+
+            // A failure here is this one connection's -- no handle left to
+            // duplicate, say -- and it is dropped like any other that could
+            // not be served. Sent on, it would read as the listener's own
+            // failure, which the daemon takes as the end of accepting.
+            match Connection::over_streams(reader, writer) {
+                Ok(connection) => {
+                    let _ = paired.send(Ok(connection));
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "dropping a connection that could not be prepared")
+                }
             }
-        }
+        });
     }
 }
 
@@ -487,18 +768,29 @@ mod imp {
             .map_err(|e| IpcError::io("accepting a connection", e))
     }
 
-    /// Bounds how long a client may take over its preamble.
-    ///
-    /// The accept loop reads the preamble itself, so an indefinite wait here
-    /// would be a wait every other client shares. A failure to set the timeout
-    /// only loses that bound, which is why it is ignored.
-    pub(super) fn bound_preamble_wait(stream: &Stream) {
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    /// A second handle onto the same socket, for a [`super::Closer`].
+    pub(super) fn try_clone(stream: &Stream) -> std::io::Result<Stream> {
+        stream.try_clone()
     }
 
-    /// Restores the blocking reads the frame loop expects.
-    pub(super) fn unbounded_reads(stream: &Stream) {
+    /// Shuts both directions down: what is parked on the socket fails now,
+    /// and everything after fails too.
+    pub(super) fn interrupt(stream: &Stream) {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// Reads a connection's preamble, giving up after `patience`.
+    ///
+    /// A failure to set the timeout only loses the bound, which is why it is
+    /// ignored; the frame loop that follows expects blocking reads again.
+    pub(super) fn read_preamble(
+        stream: &mut Stream,
+        patience: std::time::Duration,
+    ) -> Result<(super::pairing::Token, u8), IpcError> {
+        let _ = stream.set_read_timeout(Some(patience));
+        let half = super::pairing::listen_for(stream);
         let _ = stream.set_read_timeout(None);
+        half
     }
 }
 
@@ -507,26 +799,33 @@ mod imp {
     use std::io::{Read, Write};
     use std::os::windows::io::FromRawHandle;
     use std::path::Path;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{
         ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY,
-        ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+        ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
     };
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+    use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
+        FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION,
     };
+    use windows_sys::Win32::System::IO::CancelIoEx;
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, NAMED_PIPE_MODE,
+        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
+        PIPE_WAIT,
     };
 
     use super::IpcError;
+    use crate::owner_only::{OwnerOnly, current_user_sid, sid_string};
 
     /// Named pipes are addressed by name rather than by a filesystem path, so
     /// the endpoint is hashed into one. Two configurations therefore get two
     /// pipes, matching how the Unix socket lives under the config directory.
-    fn pipe_name(path: &Path) -> String {
+    pub(super) fn pipe_name(path: &Path) -> String {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for byte in path.display().to_string().bytes() {
             hash ^= u64::from(byte);
@@ -535,21 +834,67 @@ mod imp {
         format!(r"\\.\pipe\dispatchd-{hash:016x}")
     }
 
-    pub(super) struct Stream(std::fs::File);
+    /// One pipe handle, and what it shares with every other handle
+    /// [`try_clone`] made onto the same pipe.
+    pub(super) struct Stream {
+        file: std::fs::File,
+        shutdown: Arc<Shutdown>,
+    }
+
+    /// How a pipe is ended from a handle other than the one in use.
+    ///
+    /// A cancel reaches only an operation already in the kernel, and does
+    /// not stay: one that arrives a moment before a thread issues its read
+    /// is lost, and the read parks as if nothing had happened. So ending is
+    /// a flag every operation checks first, and a count of the operations
+    /// past that check, which [`interrupt`] cancels until there are none.
+    #[derive(Default)]
+    struct Shutdown {
+        requested: AtomicBool,
+        in_flight: AtomicUsize,
+    }
+
+    impl Stream {
+        fn new(file: std::fs::File) -> Self {
+            Self {
+                file,
+                shutdown: Arc::default(),
+            }
+        }
+
+        /// Runs one operation on the pipe unless it has been ended.
+        ///
+        /// Counted before the flag is read, and the flag set before the
+        /// count is read, both sequentially consistent: either the operation
+        /// sees the pipe ended, or [`interrupt`] sees the operation.
+        fn unless_ended<T>(
+            &mut self,
+            operation: impl FnOnce(&mut std::fs::File) -> std::io::Result<T>,
+        ) -> std::io::Result<T> {
+            self.shutdown.in_flight.fetch_add(1, Ordering::SeqCst);
+            let result = if self.shutdown.requested.load(Ordering::SeqCst) {
+                Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted))
+            } else {
+                operation(&mut self.file)
+            };
+            self.shutdown.in_flight.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+    }
 
     impl Read for Stream {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            self.0.read(buf)
+            self.unless_ended(|file| file.read(buf))
         }
     }
 
     impl Write for Stream {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.write(buf)
+            self.unless_ended(|file| file.write(buf))
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
-            self.0.flush()
+            self.unless_ended(std::io::Write::flush)
         }
     }
 
@@ -564,14 +909,9 @@ mod imp {
         /// Stored as a raw handle because `HANDLE` is a pointer and therefore
         /// not `Send`; the pipe is owned solely by this listener.
         pending: Mutex<isize>,
+        /// Who may open each instance: this user, and nobody else.
+        security: OwnerOnly,
     }
-
-    // SAFETY: the handle is owned exclusively by this listener and is only
-    // touched under the mutex.
-    unsafe impl Send for Listener {}
-    // SAFETY: as above — every access to the handle goes through the mutex, so
-    // sharing the listener between threads cannot race on it.
-    unsafe impl Sync for Listener {}
 
     impl Drop for Listener {
         fn drop(&mut self) {
@@ -586,11 +926,49 @@ mod imp {
         }
     }
 
-    /// Creates one pipe instance.
+    /// How every instance of the daemon's pipe reads and writes, and whom it
+    /// serves.
+    ///
+    /// Local clients only: a client on another machine reaches a named pipe
+    /// through SMB, and nothing Dispatch speaks is meant to cross it.
+    const PIPE_MODE: NAMED_PIPE_MODE =
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
+
+    /// Creates one pipe instance, open to `security`'s user alone.
     ///
     /// `first` asks the kernel to fail if an instance already exists, which is
     /// how a second daemon is detected without a lock file of its own.
-    fn create_instance(name: &str, first: bool) -> Result<isize, std::io::Error> {
+    pub(super) fn create_instance(
+        name: &str,
+        first: bool,
+        security: &OwnerOnly,
+    ) -> Result<isize, std::io::Error> {
+        create_instance_mode(name, first, security, PIPE_MODE)
+    }
+
+    /// A pipe like the daemon's in every way but that it lets remote clients
+    /// in: the control that shows whether a remote-style open can reach a
+    /// pipe here at all.
+    #[cfg(test)]
+    pub(super) fn create_instance_open_to_remote_clients(
+        name: &str,
+        security: &OwnerOnly,
+    ) -> Result<isize, std::io::Error> {
+        create_instance_mode(
+            name,
+            true,
+            security,
+            PIPE_MODE & !PIPE_REJECT_REMOTE_CLIENTS,
+        )
+    }
+
+    /// [`create_instance`], in `mode`.
+    fn create_instance_mode(
+        name: &str,
+        first: bool,
+        security: &OwnerOnly,
+        mode: NAMED_PIPE_MODE,
+    ) -> Result<isize, std::io::Error> {
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
 
         let mut flags = PIPE_ACCESS_DUPLEX;
@@ -598,20 +976,21 @@ mod imp {
             flags |= FILE_FLAG_FIRST_PIPE_INSTANCE;
         }
 
-        // SAFETY: `wide` is a NUL-terminated wide string that outlives the
-        // call. A null security descriptor gives the pipe the default, which
-        // grants access to the creating user only -- the same boundary the
-        // Unix socket's 0600 mode provides.
+        let attributes = security.attributes();
+
+        // SAFETY: `wide` is a NUL-terminated wide string and `attributes`
+        // points at a descriptor `security` keeps alive; both outlive the
+        // call.
         let handle = unsafe {
             CreateNamedPipeW(
                 wide.as_ptr(),
                 flags,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                mode,
                 PIPE_UNLIMITED_INSTANCES,
                 64 * 1024,
                 64 * 1024,
                 0,
-                std::ptr::null(),
+                &attributes,
             )
         };
 
@@ -628,7 +1007,11 @@ mod imp {
     /// stopped waiting anyway.
     const BUSY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
+    /// Opens the daemon's pipe for `path`, waiting out a busy one, and
+    /// refuses it unless this user owns it.
     pub(super) fn connect(path: &Path) -> Result<Stream, IpcError> {
+        use std::os::windows::fs::OpenOptionsExt;
+
         let name = pipe_name(path);
         let deadline = std::time::Instant::now() + BUSY_PATIENCE;
 
@@ -636,11 +1019,18 @@ mod imp {
             let opened = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
+                // Identification only: whoever serves the pipe may learn
+                // which user this is, but not act as that user. The client's
+                // identity is handed over as the pipe opens, before the owner
+                // check below can refuse a pipe someone else created, and a
+                // squatter holding SeImpersonatePrivilege could otherwise act
+                // with it. The daemon never impersonates, so nothing is lost.
+                .security_qos_flags(SECURITY_IDENTIFICATION)
                 .open(&name)
-                .map(Stream);
+                .map(Stream::new);
 
             let error = match opened {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => return owned_by_this_user(stream, &name),
                 Err(error) => error,
             };
 
@@ -664,22 +1054,79 @@ mod imp {
         }
     }
 
+    /// Hands `stream` back if this user owns the pipe it opened on `name`,
+    /// before anything is said down it; see [`super::trust_owner`].
+    fn owned_by_this_user(stream: Stream, name: &str) -> Result<Stream, IpcError> {
+        let owner =
+            owner_of(&stream).map_err(|e| IpcError::io(format!("checking who owns {name}"), e))?;
+        let me = current_user_sid()
+            .map_err(|e| IpcError::io("finding which user this process runs as", e))?;
+        super::trust_owner(name, &owner, &me)?;
+        Ok(stream)
+    }
+
+    /// The SID of whoever owns the pipe `stream` is open on.
+    pub(super) fn owner_of(stream: &Stream) -> std::io::Result<String> {
+        use std::os::windows::io::AsRawHandle;
+
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: the handle is live for the call and every out-pointer is
+        // valid; on success `descriptor` is LocalAlloc'd and `owner` points
+        // into it.
+        let status = unsafe {
+            GetSecurityInfo(
+                stream.file.as_raw_handle() as HANDLE,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(std::io::Error::from_raw_os_error(status as i32));
+        }
+
+        let sid = if owner.is_null() {
+            Err(std::io::Error::other("the pipe has no owner"))
+        } else {
+            // SAFETY: `owner` is a SID inside `descriptor`, which is freed
+            // only below.
+            unsafe { sid_string(owner) }
+        };
+        // SAFETY: allocated by GetSecurityInfo, freed exactly once, and
+        // `owner` is not read after this.
+        unsafe { LocalFree(descriptor as HLOCAL) };
+        sid
+    }
+
     pub(super) fn bind(path: &Path) -> Result<Listener, IpcError> {
         let name = pipe_name(path);
+        let security =
+            OwnerOnly::new().map_err(|e| IpcError::io("building the pipe's access list", e))?;
 
         // Unlike a Unix socket there is no file to go stale: a pipe exists
-        // only while its server holds it, so a refusal here means a daemon is
-        // genuinely running.
-        let pending = create_instance(&name, true).map_err(|e| match e.raw_os_error() {
-            Some(code) if code == ERROR_ACCESS_DENIED as i32 => {
-                IpcError::AlreadyRunning(name.clone())
-            }
-            _ => IpcError::io(format!("listening on {name}"), e),
-        })?;
+        // only while its server holds it, so a refusal here means someone
+        // holds it -- this user's daemon, or another account that took the
+        // name first. Opening it as a client runs the owner check that tells
+        // the two apart.
+        let pending =
+            create_instance(&name, true, &security).map_err(|e| match e.raw_os_error() {
+                Some(code)
+                    if code == ERROR_ACCESS_DENIED as i32 || code == ERROR_PIPE_BUSY as i32 =>
+                {
+                    super::held(&name, connect(path).map(drop))
+                }
+                _ => IpcError::io(format!("listening on {name}"), e),
+            })?;
 
         Ok(Listener {
             name,
             pending: Mutex::new(pending),
+            security,
         })
     }
 
@@ -725,22 +1172,120 @@ mod imp {
 
         // Open the next instance before handing this one over, so the pipe is
         // never absent between clients.
-        *pending = create_instance(&listener.name, false)
+        *pending = create_instance(&listener.name, false, &listener.security)
             .map_err(|e| IpcError::io(format!("reopening {}", listener.name), e))?;
 
         // SAFETY: the handle is a connected instance and ownership moves into
         // the File, which closes it exactly once.
-        Ok(Stream(unsafe {
+        Ok(Stream::new(unsafe {
             std::fs::File::from_raw_handle(handle as _)
         }))
     }
 
-    /// A synchronous named pipe read cannot be given a timeout, so there is no
-    /// bound to set. The accept loop's comment says what that costs.
-    pub(super) fn bound_preamble_wait(_stream: &Stream) {}
+    /// A second handle onto the same pipe, for a [`super::Closer`].
+    pub(super) fn try_clone(stream: &Stream) -> std::io::Result<Stream> {
+        Ok(Stream {
+            file: stream.file.try_clone()?,
+            shutdown: Arc::clone(&stream.shutdown),
+        })
+    }
 
-    /// Nothing was bounded, so nothing is restored.
-    pub(super) fn unbounded_reads(_stream: &Stream) {}
+    /// How long ending a pipe keeps cancelling an operation that will not
+    /// finish.
+    ///
+    /// An operation past the flag reaches the kernel within microseconds,
+    /// and the next cancel ends it; this bounds the wait for one that some
+    /// fault keeps from being cancelled, so a close cannot hang on it.
+    const CANCEL_PATIENCE: Duration = Duration::from_secs(1);
+
+    /// Ends the pipe for every handle onto it: what is in flight is
+    /// cancelled, and everything after fails before it starts.
+    pub(super) fn interrupt(stream: &Stream) {
+        stream.shutdown.requested.store(true, Ordering::SeqCst);
+
+        // An operation that read the flag just before it was set may not
+        // have reached the kernel yet, where a cancel would find it; cancel
+        // again until nothing is in flight.
+        let deadline = Instant::now() + CANCEL_PATIENCE;
+        loop {
+            cancel(stream);
+            if stream.shutdown.in_flight.load(Ordering::SeqCst) == 0 || Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Cancels what is in flight on the pipe now, from whichever thread
+    /// issued it, and nothing after.
+    fn cancel(stream: &Stream) {
+        use std::os::windows::io::AsRawHandle;
+
+        // SAFETY: the handle is a live duplicate the caller holds for the
+        // length of the call, and cancelling reads or writes no memory of
+        // ours.
+        unsafe { CancelIoEx(stream.file.as_raw_handle() as HANDLE, std::ptr::null()) };
+    }
+
+    /// How often an overdue preamble's read is cancelled again.
+    const RECANCEL: Duration = Duration::from_millis(5);
+
+    /// Reads a connection's preamble, giving up after `patience`.
+    ///
+    /// A synchronous pipe read has no timeout of its own, so a watchdog
+    /// cancels it. The watchdog holds its own handle, so the one it cancels
+    /// cannot have been closed and reused under it; it is joined before this
+    /// returns, so it cannot cancel anything the paired connection does
+    /// later; and it cancels rather than [`interrupt`]s, so one that lands
+    /// just after the read finished finds nothing in flight and leaves the
+    /// pipe usable.
+    ///
+    /// The preamble takes as many reads as the client took writes to send
+    /// it, and a cancel that lands between two of them finds nothing and is
+    /// lost -- the next read would park for good, and hold one of the
+    /// listener's announcing places with it. So once the preamble is overdue
+    /// the watchdog cancels every [`RECANCEL`] until the read gives up.
+    pub(super) fn read_preamble(
+        stream: &mut Stream,
+        patience: std::time::Duration,
+    ) -> Result<(super::pairing::Token, u8), IpcError> {
+        let watched =
+            try_clone(stream).map_err(|e| IpcError::io("watching a connection's preamble", e))?;
+        let (finished, wait) = std::sync::mpsc::channel::<()>();
+
+        let watchdog = std::thread::spawn(move || {
+            let overdue =
+                |waited| matches!(waited, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+
+            if overdue(wait.recv_timeout(patience)) {
+                loop {
+                    cancel(&watched);
+                    if !overdue(wait.recv_timeout(RECANCEL)) {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let half = super::pairing::listen_for(stream);
+        drop(finished);
+        let _ = watchdog.join();
+        half
+    }
+
+    /// Closes a pipe instance a test created directly.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be a live handle from [`create_instance`] that is closed
+    /// nowhere else and used by nothing after this.
+    #[cfg(test)]
+    pub(super) unsafe fn close_for_test(handle: isize) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        // SAFETY: the caller vouches that `handle` is live and that this is
+        // its one close.
+        unsafe { CloseHandle(handle as HANDLE) };
+    }
 }
 
 #[cfg(test)]
@@ -1171,6 +1716,15 @@ mod tests {
         drop(connection);
 
         // A reaped process's pid answers no signal; an unreaped one does.
+        // Polled: the tree has been killed by the time `drop` returns, but
+        // the grandchild answers `kill(pid, 0)` until whoever inherited it
+        // reaps it, and on macOS that is launchd, on its own schedule.
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while (pid_is_alive(pid) || pid_is_alive(grandchild))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(!pid_is_alive(pid), "the shell is gone");
         assert!(
             !pid_is_alive(grandchild),
@@ -1178,6 +1732,51 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn dropping_a_command_connection_ends_its_whole_tree() {
+        // `ssh.exe` forks too. The transport used to kill only the process it
+        // started, leaving its children holding the pipes.
+        let connection = Connection::over_command(
+            std::ffi::OsStr::new("cmd.exe"),
+            &[
+                std::ffi::OsString::from("/d"),
+                std::ffi::OsString::from("/c"),
+                std::ffi::OsString::from("ping -n 30 127.0.0.1 >nul"),
+            ],
+        )
+        .expect("cmd.exe exists");
+        let pid = connection
+            .child_id()
+            .expect("a command transport has a child");
+
+        let deadline = std::time::Instant::now() + PATIENCE;
+        let everyone = loop {
+            let below = crate::process::descendants(pid);
+            if !below.is_empty() {
+                break std::iter::once(pid).chain(below).collect::<Vec<_>>();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cmd.exe never started ping"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        drop(connection);
+
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while everyone.iter().any(|p| crate::process::is_running(*p))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            everyone.iter().all(|p| !crate::process::is_running(*p)),
+            "a process behind the transport outlived it: {everyone:?}"
+        );
     }
 
     #[test]
@@ -1216,6 +1815,760 @@ mod tests {
             "{} should be under {}",
             path.display(),
             endpoint_guard.dir.display()
+        );
+    }
+
+    #[test]
+    fn a_client_that_never_announces_itself_does_not_hold_up_the_next() {
+        // One connection says nothing at all. The listener used to read its
+        // preamble itself, so every client behind it waited out the whole
+        // two seconds -- and on Windows, where the read has no timeout,
+        // waited forever.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("silent-first");
+
+        let listener = Listener::bind().expect("binding succeeds");
+        let path = endpoint().expect("resolves");
+
+        let (served, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (reader, _writer) = listener.accept().expect("accepting succeeds").split();
+            let _ = served.send(reading(reader).recv_timeout(PATIENCE));
+        });
+
+        let _silent = imp::connect(&path).expect("connecting succeeds");
+        // Let the listener take the silent one first, as it would in life.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        let (_reader, mut writer) = Connection::connect().expect("connecting succeeds").split();
+        writer.write_all(b"next").expect("writing succeeds");
+        writer.flush().expect("flushing succeeds");
+
+        assert_eq!(done.recv_timeout(PATIENCE), Ok(Ok(*b"next")));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the next client waited {:?} behind a silent one",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_client_that_never_announces_itself_is_let_go() {
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("silent-closed");
+
+        let _listener = Listener::bind().expect("binding succeeds");
+        let path = endpoint().expect("resolves");
+
+        let mut silent = imp::connect(&path).expect("connecting succeeds");
+        let (ended, end) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            // End of file on Unix, a broken pipe on Windows: either way the
+            // listener has let the connection go.
+            let _ = silent.read(&mut byte);
+            let _ = ended.send(());
+        });
+
+        assert!(
+            end.recv_timeout(PATIENCE).is_ok(),
+            "a connection that never said which half it was is still open"
+        );
+    }
+
+    #[test]
+    fn dropping_a_listener_frees_its_endpoint() {
+        // Accepting now runs on a thread of its own. A drop that did not wait
+        // for it would leave the endpoint answering for a moment, and the
+        // next bind would take the old listener for a running daemon.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("rebind");
+
+        let first = Listener::bind().expect("binding succeeds");
+        drop(first);
+
+        let _second = Listener::bind().expect("the endpoint is free once the first is dropped");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dropping_a_listener_whose_socket_was_removed_returns() {
+        // Nothing can wake an accept parked on a socket file that is gone, so
+        // a drop that waited for one regardless would never return.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("removed");
+
+        let listener = Listener::bind().expect("binding succeeds");
+        std::fs::remove_file(endpoint().expect("resolves")).expect("the socket exists");
+
+        let (dropped, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(listener);
+            let _ = dropped.send(());
+        });
+
+        assert!(
+            done.recv_timeout(PATIENCE).is_ok(),
+            "dropping the listener hung on an endpoint nothing can reach"
+        );
+    }
+
+    #[test]
+    fn a_listener_can_be_bound_to_a_path_it_is_given() {
+        let _guard = crate::env_lock();
+        let endpoint_guard = Endpoint::new("bind-to");
+        let path = endpoint_guard.dir.join("elsewhere.sock");
+
+        let listener = Listener::bind_to(&path).expect("binding succeeds");
+        std::thread::spawn(move || {
+            let (reader, mut writer) = listener.accept().expect("accepting succeeds").split();
+            let heard = reading(reader).recv_timeout(PATIENCE);
+            if let Ok(heard) = heard {
+                let _ = writer.write_all(&heard);
+                let _ = writer.flush();
+            }
+        });
+
+        let (reader, mut writer) = Connection::connect_to(&path)
+            .expect("connecting succeeds")
+            .split();
+        writer.write_all(b"echo").expect("writing succeeds");
+        writer.flush().expect("flushing succeeds");
+        assert_eq!(reading(reader).recv_timeout(PATIENCE), Ok(*b"echo"));
+    }
+
+    #[test]
+    fn a_closer_ends_a_connection_whose_reader_is_parked() {
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("closer");
+
+        let listener = Listener::bind().expect("binding succeeds");
+        let server = std::thread::spawn(move || listener.accept().expect("accepting succeeds"));
+
+        let client = Connection::connect().expect("connecting succeeds");
+        let closer = client.closer();
+        let _server_side = server.join().expect("the server thread finishes");
+
+        let (reader, mut writer) = client.split();
+        // `reading` sends only on a full read; when the read fails instead,
+        // its sender is dropped and the receiver sees a disconnect.
+        let parked = reading(reader);
+
+        // Given time to park, so the close meets a read already in flight
+        // -- on Windows, one it has to cancel -- rather than one it stops
+        // before it starts.
+        std::thread::sleep(Duration::from_millis(100));
+        closer.close();
+
+        assert_eq!(
+            parked.recv_timeout(PATIENCE),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "the parked read is still parked"
+        );
+
+        // Everything after the close fails too, on both platforms: a
+        // connection a closer has ended is not half-alive.
+        assert!(
+            writer
+                .write_all(&[0u8; 64 * 1024])
+                .and_then(|()| writer.flush())
+                .is_err(),
+            "a write after closing still went through"
+        );
+    }
+
+    #[test]
+    fn a_closer_ends_a_connection_whose_writer_is_parked() {
+        // A peer that stops reading parks the writer once the transport's
+        // buffer is full, and a writer parked for good holds its half for
+        // good. Hanging up on such a peer is what the closer is for.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("closer-writer");
+
+        let listener = Listener::bind().expect("binding succeeds");
+        let server = std::thread::spawn(move || listener.accept().expect("accepting succeeds"));
+
+        let client = Connection::connect().expect("connecting succeeds");
+        let closer = client.closer();
+        // Held and never read from.
+        let _server_side = server.join().expect("the server thread finishes");
+
+        let (_reader, mut writer) = client.split();
+        let (wrote, written) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Far more than any socket or pipe buffers.
+            let sent = writer
+                .write_all(&vec![0u8; 1024 * 1024])
+                .and_then(|()| writer.flush());
+            let _ = wrote.send(sent.is_ok());
+        });
+
+        // Given time to fill the buffer and park.
+        std::thread::sleep(Duration::from_millis(100));
+        closer.close();
+
+        assert_eq!(
+            written.recv_timeout(PATIENCE),
+            Ok(false),
+            "the parked write is still parked, or went through"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_closer_ends_a_command_transport() {
+        let connection = Connection::over_command(
+            std::ffi::OsStr::new("sh"),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("sleep 30"),
+            ],
+        )
+        .expect("sh exists");
+        let closer = connection.closer();
+        let (reader, _writer) = connection.split();
+        let parked = reading(reader);
+
+        closer.close();
+
+        assert_eq!(
+            parked.recv_timeout(PATIENCE),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "the read on a killed command's stdout is still parked"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_closer_ends_a_command_transport_and_everything_it_started() {
+        // The test above, where the transport's tree is a job: closing ends
+        // the job, so the read parked on the command's stdout returns, and
+        // nothing the command started is left running -- or holding the
+        // pipe that read waits on.
+        let connection = Connection::over_command(
+            std::ffi::OsStr::new("cmd.exe"),
+            &[
+                std::ffi::OsString::from("/d"),
+                std::ffi::OsString::from("/c"),
+                std::ffi::OsString::from("ping -n 30 127.0.0.1 >nul"),
+            ],
+        )
+        .expect("cmd.exe exists");
+        let pid = connection
+            .child_id()
+            .expect("a command transport has a child");
+        let closer = connection.closer();
+        let (reader, _writer) = connection.split();
+        let parked = reading(reader);
+
+        let deadline = std::time::Instant::now() + PATIENCE;
+        let everyone = loop {
+            let below = crate::process::descendants(pid);
+            if !below.is_empty() {
+                break std::iter::once(pid).chain(below).collect::<Vec<_>>();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cmd.exe never started ping"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        closer.close();
+
+        assert_eq!(
+            parked.recv_timeout(PATIENCE),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "the read on a closed command's stdout is still parked"
+        );
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while everyone.iter().any(|p| crate::process::is_running(*p))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            everyone.iter().all(|p| !crate::process::is_running(*p)),
+            "a process behind the closed transport outlived it: {everyone:?}"
+        );
+    }
+
+    /// Whether anything is left of the process group `leader` leads, an
+    /// unreaped leader included.
+    #[cfg(unix)]
+    fn group_exists(leader: u32) -> bool {
+        let leader = libc::pid_t::try_from(leader).expect("a pid fits in pid_t");
+        // SAFETY: signal 0 is delivered to nobody; killpg only reports
+        // whether the group has members, and touches no memory of ours.
+        if unsafe { libc::killpg(leader, 0) } == 0 {
+            return true;
+        }
+        // macOS answers EPERM for a group whose only member is a zombie:
+        // still there until its parent waits for it.
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn closing_a_command_transport_does_not_wait_out_its_tree() {
+        // Closing holds the lock the reader half's reap needs, and on Linux a
+        // killed leader nobody has waited for is still a member of its group.
+        // A close that waited for the group to vanish waited for a zombie only
+        // the reap it was blocking could clear: the whole kill timeout, on
+        // every client dropped and every connection given up on.
+        let connection = Connection::over_command(
+            std::ffi::OsStr::new("sh"),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("sleep 30 & sleep 30"),
+            ],
+        )
+        .expect("sh exists");
+        let leader = connection.child_id().expect("a command has a pid");
+        let closer = connection.closer();
+        let (reader, _writer) = connection.split();
+        // Parked in a read, as a client's reader is: the tree dying wakes it,
+        // and its reap is what needs the lock `close` holds.
+        let parked = reading(reader);
+
+        let started = std::time::Instant::now();
+        closer.close();
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(500),
+            "closing a command transport took {took:?}"
+        );
+
+        // Not waiting is not leaving it running: the tree is signalled, and
+        // the reap the lock was holding up waits its leader.
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while group_exists(leader) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !group_exists(leader),
+            "the command's tree outlived its closing"
+        );
+        assert_eq!(
+            parked.recv_timeout(PATIENCE),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "the read on a closed command's stdout is still parked"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dropping_a_connection_whose_command_has_exited_is_quick() {
+        // A dial whose command fails at once is dropped, and its error
+        // reported, only once the reap is done. The reap used to wait for the
+        // group to vanish before it waited for the leader -- and on Linux a
+        // leader nobody has waited for is still a member of its group, so it
+        // sat out the whole kill timeout on its own zombie.
+        let mut connection = Connection::over_command(
+            std::ffi::OsStr::new("sh"),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("exit 0"),
+            ],
+        )
+        .expect("sh exists");
+        // End of file: the command has exited, and nobody has waited for it.
+        let mut rest = Vec::new();
+        connection
+            .read_to_end(&mut rest)
+            .expect("reading to the end succeeds");
+
+        let started = std::time::Instant::now();
+        drop(connection);
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(500),
+            "dropping an exited command's connection took {took:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dropping_a_live_command_connection_is_quick_and_ends_its_tree() {
+        // Every client dropped and every connection given up on reaps its
+        // transport, which is still running: its leader dies of the signal
+        // and is a zombie, like the exited one above, until it is waited for.
+        let mut connection = Connection::over_command(
+            std::ffi::OsStr::new("sh"),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("sleep 30 & echo forked; wait"),
+            ],
+        )
+        .expect("sh exists");
+        let leader = connection.child_id().expect("a command has a pid");
+        // Said once the background `sleep` exists, so there is a tree to end.
+        let mut said = [0u8; 7];
+        connection
+            .read_exact(&mut said)
+            .expect("the command says it has forked");
+        assert_eq!(&said, b"forked\n");
+
+        let started = std::time::Instant::now();
+        drop(connection);
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(500),
+            "dropping a live command's connection took {took:?}"
+        );
+
+        // Quick is not leaving it running: the leader is reaped, and what it
+        // started is gone once its new parent has reaped that too.
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while group_exists(leader) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !group_exists(leader),
+            "the command's tree outlived its connection"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dropping_a_command_connection_ends_a_tree_that_ignores_being_asked() {
+        // What the reap's order leans on: a tree that ignores SIGTERM is
+        // killed once its grace runs out, even though its leader is not
+        // waited for until afterwards -- on Linux, a leader that keeps its
+        // group looking alive the whole time.
+        let mut connection = Connection::over_command(
+            std::ffi::OsStr::new("sh"),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("trap '' TERM; sleep 30 & echo forked; wait"),
+            ],
+        )
+        .expect("sh exists");
+        let leader = connection.child_id().expect("a command has a pid");
+        let mut said = [0u8; 7];
+        connection
+            .read_exact(&mut said)
+            .expect("the command says it has forked");
+        assert_eq!(&said, b"forked\n");
+
+        // On a thread, so a reap that never escalated fails here rather than
+        // hanging the suite for as long as the tree cares to run.
+        let (dropped, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(connection);
+            let _ = dropped.send(());
+        });
+        assert!(
+            done.recv_timeout(PATIENCE).is_ok(),
+            "dropping the connection waited on a tree that ignores SIGTERM"
+        );
+
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while group_exists(leader) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !group_exists(leader),
+            "a tree that ignores SIGTERM outlived its connection"
+        );
+    }
+
+    /// The pid `closer` would signal if it were closed now.
+    #[cfg(unix)]
+    fn aimed_at(closer: &Closer) -> Option<u32> {
+        match &*closer.0.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(Ending::Process(pid)) => *pid.lock().unwrap_or_else(|e| e.into_inner()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_closer_signals_nothing_once_its_command_is_reaped() {
+        // Reaping frees the pid, and the system hands a free pid to whatever
+        // starts next. A closer that outlives the reader half -- the reader
+        // saw end of file and let go, and only then is the connection
+        // abandoned -- would otherwise kill a stranger's process tree.
+        let connection = Connection::over_command(
+            std::ffi::OsStr::new("sh"),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("sleep 30"),
+            ],
+        )
+        .expect("sh exists");
+        let closer = connection.closer();
+        let (reader, _writer) = connection.split();
+        assert!(
+            aimed_at(&closer).is_some(),
+            "a running command is the closer's to end"
+        );
+
+        drop(reader);
+
+        assert_eq!(
+            aimed_at(&closer),
+            None,
+            "the closer still aims at a pid its command no longer holds"
+        );
+        closer.close();
+    }
+
+    #[test]
+    fn a_pipe_is_trusted_only_when_this_user_owns_it() {
+        // Pipe names are machine-wide and the daemon's is predictable, so
+        // another account can create it first. A client that spoke to that
+        // pipe would hand a stranger its tasks and its keystrokes.
+        let me = "S-1-5-21-1004336348-1177238915-682003330-1001";
+        let pipe = r"\\.\pipe\dispatchd-0123456789abcdef";
+
+        assert!(
+            trust_owner(pipe, me, me).is_ok(),
+            "a pipe this user owns is refused"
+        );
+
+        let error =
+            trust_owner(pipe, "S-1-5-18", me).expect_err("a pipe LocalSystem owns is not ours");
+        assert!(
+            matches!(&error, IpcError::ForeignOwner { owner, .. } if owner == "S-1-5-18"),
+            "expected ForeignOwner, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("S-1-5-18"),
+            "the refusal does not name the owner: {error}"
+        );
+    }
+
+    #[test]
+    fn a_held_endpoint_is_reported_as_whoever_holds_it() {
+        // A daemon that cannot bind because the pipe is someone else's must
+        // say so, not send the user looking for a daemon of their own.
+        let pipe = r"\\.\pipe\dispatchd-0123456789abcdef";
+
+        let foreign = held(
+            pipe,
+            Err(IpcError::ForeignOwner {
+                endpoint: pipe.to_string(),
+                owner: "S-1-5-18".to_string(),
+            }),
+        );
+        assert!(
+            matches!(&foreign, IpcError::ForeignOwner { owner, .. } if owner == "S-1-5-18"),
+            "another owner's pipe is reported as theirs, got {foreign:?}"
+        );
+
+        let ours = held(pipe, Ok(()));
+        assert!(
+            matches!(&ours, IpcError::AlreadyRunning(endpoint) if endpoint == pipe),
+            "this user's own pipe is a daemon already running, got {ours:?}"
+        );
+
+        // Could not be opened, so could not be asked: as before.
+        let unopened = held(pipe, Err(IpcError::NotRunning(pipe.to_string())));
+        assert!(
+            matches!(&unopened, IpcError::AlreadyRunning(_)),
+            "a pipe that would not open is reported as it always was, got {unopened:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn the_pipe_admits_its_owner_and_nobody_else() {
+        // The null descriptor this replaces took the default DACL, which
+        // also let Everyone and anonymous logons open the pipe to read.
+        let name = format!(r"\\.\pipe\dispatchd-test-owner-{}", std::process::id());
+        let security = crate::owner_only::OwnerOnly::new().expect("the descriptor builds");
+        let pipe = imp::create_instance(&name, true, &security).expect("the pipe is created");
+
+        let entries = crate::owner_only::dacl_of(pipe);
+        // SAFETY: `pipe` was created just above, is closed nowhere else, and
+        // nothing uses it after this.
+        unsafe { imp::close_for_test(pipe) };
+
+        let me = crate::owner_only::current_user_sid().expect("this process has a user");
+        // `GA` is not stored as written: the pipe's descriptor is assigned
+        // through the file generic mapping, so GENERIC_ALL lands as the
+        // FILE_ALL_ACCESS it maps to.
+        assert_eq!(
+            entries.expect("the DACL reads back"),
+            vec![crate::owner_only::Ace {
+                kind: crate::owner_only::ACCESS_ALLOWED,
+                mask: windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS,
+                sid: me,
+            }],
+            "exactly one entry, allowing this user everything"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_read_only_handle_that_says_nothing_holds_up_nobody() {
+        // The shape the audit described: open for reading only, which can
+        // never write a preamble, and hold it. It used to park the accept
+        // loop for good.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("read-only");
+
+        let listener = Listener::bind().expect("binding succeeds");
+        let name = imp::pipe_name(&endpoint().expect("resolves"));
+
+        let (served, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (reader, _writer) = listener.accept().expect("accepting succeeds").split();
+            let _ = served.send(reading(reader).recv_timeout(PATIENCE));
+        });
+
+        let mut silent = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&name)
+            .expect("the owner may open it");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        let (_reader, mut writer) = Connection::connect().expect("connecting succeeds").split();
+        writer.write_all(b"next").expect("writing succeeds");
+        writer.flush().expect("flushing succeeds");
+        assert_eq!(done.recv_timeout(PATIENCE), Ok(Ok(*b"next")));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let (ended, end) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            let _ = silent.read(&mut byte);
+            let _ = ended.send(());
+        });
+        assert!(
+            end.recv_timeout(PATIENCE).is_ok(),
+            "the silent read-only handle was never let go"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_client_addressing_the_pipe_as_another_machine_would_is_refused() {
+        // `\\localhost\pipe\…` goes through the SMB redirector, which is what
+        // a client on another machine does. Without the Server service that
+        // path reaches no pipe at all, and a refusal would prove nothing
+        // about PIPE_REJECT_REMOTE_CLIENTS. So a control pipe, identical but
+        // for the flag, is opened the same way first: only if it opens does
+        // the real pipe's refusal show the flag at work.
+        use std::io::Write as _;
+
+        let security = crate::owner_only::OwnerOnly::new().expect("the descriptor builds");
+        let local =
+            |label: &str| format!(r"\\.\pipe\dispatchd-test-{label}-{}", std::process::id());
+        let (control_name, real_name) = (local("remote-control"), local("remote"));
+        let control = imp::create_instance_open_to_remote_clients(&control_name, &security)
+            .expect("the control pipe is created");
+        let real = imp::create_instance(&real_name, true, &security).expect("the pipe is created");
+
+        let remotely = |name: &str| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(name.replacen(r"\\.\", r"\\localhost\", 1))
+        };
+        let control_opened = remotely(&control_name);
+        let real_opened = remotely(&real_name);
+
+        // SAFETY: both were created just above, are closed nowhere else, and
+        // nothing uses either after this.
+        unsafe {
+            imp::close_for_test(control);
+            imp::close_for_test(real);
+        }
+
+        // Straight to stderr: the harness captures `eprintln!` from a test
+        // that passes, and which error refused the open is the evidence that
+        // belongs in the CI log.
+        let mut log = std::io::stderr();
+
+        if let Err(error) = &control_opened {
+            if std::env::var_os("CI").is_some() {
+                panic!(
+                    "SMB loopback unavailable on CI; the flag went untested: \
+                     the control pipe's remote-style open failed with {error}"
+                );
+            }
+            let _ = writeln!(
+                log,
+                "skipped the remote-client check: nothing reaches a pipe over SMB loopback here ({error})"
+            );
+            return;
+        }
+
+        let refused = real_opened.expect_err("a remote-style open reached the pipe");
+        let _ = writeln!(
+            log,
+            "{real_name} refused a remote-style open that its control accepted: OS error {:?} ({refused})",
+            refused.raw_os_error()
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_client_trusts_the_pipe_its_own_user_created() {
+        // The owner check must pass the daemon's own pipe -- also when the
+        // daemon runs elevated, whose objects the Administrators group owns
+        // unless the descriptor names an owner.
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("owner");
+
+        let _listener = Listener::bind().expect("binding succeeds");
+        let stream =
+            imp::connect(&endpoint().expect("resolves")).expect("our own pipe passes the check");
+
+        assert_eq!(
+            imp::owner_of(&stream).expect("the owner reads back"),
+            crate::owner_only::current_user_sid().expect("this process has a user"),
+            "the pipe is owned by someone other than the user who created it"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_daemon_finding_its_pipe_held_by_another_owner_says_whose_it_is() {
+        // Pipe names are machine-wide, so another account can create the
+        // daemon's before it starts. That is not a daemon already running,
+        // and saying it was sends the user looking for one that is not
+        // there.
+        use windows_sys::Win32::Foundation::ERROR_INVALID_OWNER;
+
+        let _guard = crate::env_lock();
+        let _endpoint = Endpoint::new("squatted");
+        let name = imp::pipe_name(&endpoint().expect("resolves"));
+
+        // A second account is not to be had on CI. The Administrators group
+        // stands in for one: an elevated process, as CI's is, may name it as
+        // an object's owner, and it is not this user. The access list still
+        // admits this user, as a squatter's would, or there would be nothing
+        // to connect to and ask.
+        let me = crate::owner_only::current_user_sid().expect("this process has a user");
+        let squatter = crate::owner_only::OwnerOnly::from_sddl(&format!("O:BAD:P(A;;GA;;;{me})"))
+            .expect("the descriptor builds");
+        let held = match imp::create_instance(&name, true, &squatter) {
+            Ok(held) => held,
+            Err(error) if error.raw_os_error() == Some(ERROR_INVALID_OWNER as i32) => {
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "CI runs elevated, so the Administrators group can own a pipe: {error}"
+                );
+                eprintln!("skipped: not elevated, so no pipe here can be owned by anyone else");
+                return;
+            }
+            Err(error) => panic!("the squatter's pipe could not be created: {error}"),
+        };
+
+        let bound = Listener::bind();
+        // SAFETY: created just above, closed nowhere else, and nothing uses
+        // it after this.
+        unsafe { imp::close_for_test(held) };
+
+        let error = bound.expect_err("a pipe someone else holds is not this daemon's to serve");
+        assert!(
+            matches!(&error, IpcError::ForeignOwner { owner, .. } if owner == "S-1-5-32-544"),
+            "expected ForeignOwner naming the Administrators group, got {error:?}"
         );
     }
 }

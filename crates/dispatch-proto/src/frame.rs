@@ -12,6 +12,13 @@ use serde::de::DeserializeOwned;
 /// to four gigabytes.
 pub const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
 
+/// The most of a payload read at once.
+///
+/// A payload is read into a buffer grown as bytes arrive rather than one
+/// sized from its length prefix: a peer that announces 64 MiB and sends ten
+/// bytes has then cost about this much, not the whole announcement.
+const READ_CHUNK: usize = 64 * 1024;
+
 /// Failures reading or writing a frame.
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
@@ -77,6 +84,19 @@ impl Frame {
 
     /// Reads one frame and decodes it.
     pub fn read<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<T, FrameError> {
+        Self::read_watched(reader, || {})
+    }
+
+    /// Reads one frame, calling `started` once its length has arrived.
+    ///
+    /// The daemon uses the hook to notice a peer that begins a frame and
+    /// never finishes it: between frames a quiet peer is an idle one, but
+    /// part-way through one it is a stalled one. Not called when the stream
+    /// ends between frames.
+    pub fn read_watched<R: Read, T: DeserializeOwned>(
+        reader: &mut R,
+        started: impl FnOnce(),
+    ) -> Result<T, FrameError> {
         let mut length = [0u8; 4];
 
         match reader.read_exact(&mut length) {
@@ -94,19 +114,36 @@ impl Frame {
             return Err(FrameError::TooLarge { size });
         }
 
-        let mut payload = vec![0u8; size as usize];
-        match reader.read_exact(&mut payload) {
-            Ok(()) => {}
+        started();
+
+        let payload = read_payload(reader, size as usize)?;
+        rmp_serde::from_slice(&payload).map_err(|e| FrameError::Decode(e.to_string()))
+    }
+}
+
+/// Reads exactly `size` bytes, growing the buffer as they arrive.
+fn read_payload<R: Read>(reader: &mut R, size: usize) -> Result<Vec<u8>, FrameError> {
+    let mut payload = Vec::new();
+
+    while payload.len() < size {
+        let start = payload.len();
+        let want = (size - start).min(READ_CHUNK);
+        payload.resize(start + want, 0);
+
+        match reader.read(&mut payload[start..]) {
             // Stopping part-way through is a broken connection, not a clean
-            // close, and the caller should treat the two differently.
+            // close, and the caller treats the two differently.
+            Ok(0) => return Err(FrameError::Truncated),
+            Ok(n) => payload.truncate(start + n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => payload.truncate(start),
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 return Err(FrameError::Truncated);
             }
             Err(e) => return Err(e.into()),
         }
-
-        rmp_serde::from_slice(&payload).map_err(|e| FrameError::Decode(e.to_string()))
     }
+
+    Ok(payload)
 }
 
 #[cfg(test)]

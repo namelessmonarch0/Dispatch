@@ -1,5 +1,4 @@
 id = "claude"
-icon = ""
 display_name = "Claude Code"
 command = "claude"
 args = []
@@ -12,16 +11,6 @@ args = ["/c", "claude"]
 
 [task]
 args = ["-p", "{task}"]
-
-# cmd.exe reads its whole command line as shell syntax, so a task placed
-# there could run its & and %VAR% as commands, and could not hold a newline.
-# Dispatch writes the task to a file instead, names it in DISPATCH_TASK_FILE
-# (already quoted for cmd.exe), and cmd.exe redirects it into `claude -p`,
-# which reads its prompt from standard input. /d skips AutoRun commands;
-# /v:off keeps ! literal.
-[task.platform.windows]
-args = ["/d", "/v:off", "/c", "claude", "-p", "<%DISPATCH_TASK_FILE%"]
-input = "file"
 
 [[settings]]
 key = "model"

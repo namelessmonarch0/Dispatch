@@ -253,7 +253,11 @@ fn completing_a_typed_path_fills_in_the_rest_of_it() {
     let tree = Tree::new("complete", &["outer"]);
     let mut browser = Browser::new(tree.path());
 
-    let typed = format!("{}/out", tree.path().display());
+    // Joined rather than formatted with a literal `/`: `complete` fills in
+    // the rest through `Path::display`, which uses the platform's own
+    // separator, so the expectation has to be built the same way or the two
+    // strings only agree on Unix.
+    let typed = tree.path().join("out").display().to_string();
     for c in typed.chars() {
         browser.push(c);
     }
@@ -261,7 +265,7 @@ fn completing_a_typed_path_fills_in_the_rest_of_it() {
 
     assert_eq!(
         browser.input(),
-        format!("{}/outer", tree.path().display()),
+        tree.path().join("outer").display().to_string(),
         "one candidate completes"
     );
 }

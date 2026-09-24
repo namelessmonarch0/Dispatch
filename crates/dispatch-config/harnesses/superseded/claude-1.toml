@@ -1,0 +1,24 @@
+id = "claude"
+display_name = "Claude Code"
+command = "claude"
+args = []
+
+# `claude` installs on Windows as a claude.cmd shim, which CreateProcess
+# cannot execute directly.
+[platform.windows]
+command = "cmd.exe"
+args = ["/c", "claude"]
+
+[[settings]]
+key = "model"
+label = "Model"
+kind = "choice"
+options = ["default", "opus", "sonnet", "haiku"]
+default = "default"
+
+[[settings]]
+key = "permission_mode"
+label = "Permission mode"
+kind = "choice"
+options = ["default", "acceptEdits", "plan"]
+default = "default"

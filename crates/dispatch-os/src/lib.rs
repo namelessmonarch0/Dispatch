@@ -6,8 +6,11 @@
 pub mod dll;
 pub mod host;
 pub mod ipc;
+#[cfg(windows)]
+mod owner_only;
 pub mod paths;
 pub mod process;
+pub mod pty;
 pub mod signal;
 
 /// Serialises the tests that move the process-wide configuration directory.

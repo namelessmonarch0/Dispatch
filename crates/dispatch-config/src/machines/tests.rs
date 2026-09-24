@@ -184,3 +184,30 @@ fn removing_answers_whether_it_was_there() {
     assert!(!remove(dir.path(), "tower").expect("nothing to write"));
     assert!(load(dir.path()).expect("it reads back").is_empty());
 }
+
+#[test]
+fn two_adds_of_one_name_at_once_keep_one() {
+    // `check` and the save were two separate reads of the file, so two adds
+    // could each find the name free and both be saved.
+    let dir = TempDir::new("machines-race");
+
+    let adds: Vec<_> = (0..8)
+        .map(|i| {
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                add(&dir, Machine::new("tower", format!("host{i}")), "laptop")
+            })
+        })
+        .collect();
+    let results: Vec<_> = adds
+        .into_iter()
+        .map(|add| add.join().expect("the add finishes"))
+        .collect();
+
+    assert_eq!(
+        results.iter().filter(|r| r.is_ok()).count(),
+        1,
+        "{results:?}"
+    );
+    assert_eq!(load(dir.path()).expect("it reads back").len(), 1);
+}

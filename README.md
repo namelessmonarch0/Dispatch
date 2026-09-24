@@ -12,7 +12,8 @@ them instead so they outlive the interface.
 
 Requires:
 
-- Rust 1.85 or newer (edition 2024)
+- Rust 1.89 or newer (edition 2024). CI builds with exactly 1.89, so a
+  change that needs a newer compiler fails there first.
 - **Zig 0.16.0** — builds the vendored `libghostty-vt` terminal engine
 
 ```sh
@@ -36,6 +37,13 @@ Visual Studio install is needed:
 rustup target add x86_64-pc-windows-gnu
 cargo build --workspace --target x86_64-pc-windows-gnu
 ```
+
+## Security model
+
+One daemon serves one operating-system user, and anything that can reach
+its socket can do anything a client can. Delegation approval keeps
+well-meaning agents in check; it is not a sandbox for untrusted ones. See
+[docs/security-model.md](docs/security-model.md).
 
 ## Layout
 
@@ -95,6 +103,12 @@ The sidebar is the list of projects you keep, not the one directory Dispatch
 was started in. Opening Dispatch in a directory adds it to that list, and it is
 there on every later start, whichever directory you started in. The list lives
 in `projects.toml` beside the rest of the configuration.
+
+Beside it, and beside `machines.toml`, a change leaves an empty
+`projects.toml.lock` or `machines.toml.lock`: the lock two Dispatches take in
+turn to change the list. It is safe to ignore; delete one only while no
+Dispatch is running, or two of them can each take a lock of their own and
+write over each other.
 
 `^a o` opens a directory browser: arrows walk it, `→` steps into a directory
 and `←` back out, typing filters the listing, and a typed path with a `/` in it
@@ -205,12 +219,16 @@ form, since an interactive agent never exits:
 [task]
 args = ["-p", "{task}"]
 
+# cmd.exe would run the task's & and % as commands, so on Windows the task
+# is written to a file and redirected into the agent's standard input.
 [task.platform.windows]
-args = ["/c", "claude", "-p", "{task}"]
+args = ["/d", "/v:off", "/c", "claude", "-p", "<%DISPATCH_TASK_FILE%"]
+input = "file"
 ```
 
-`claude` and `codex` ship with one. Caps live in `config.toml`, and refuse rather
-than prompt:
+`claude` and `codex` ship with one. On Windows the daemon refuses a form that
+would put the task on `cmd.exe`'s command line, and says which file to fix.
+Caps live in `config.toml`, and refuse rather than prompt:
 
 ```toml
 [delegation]

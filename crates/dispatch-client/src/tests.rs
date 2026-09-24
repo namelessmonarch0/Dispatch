@@ -155,10 +155,16 @@ impl Heard {
 /// Before this existed the second bind only worked where the platform happened
 /// to refuse a connection to the first listener, which macOS does and Linux does
 /// not.
+///
+/// Dropping one also waits for its accepting thread, which closes the listener
+/// on its way out. Waking the thread is not enough on its own: the next bind
+/// can run before that thread gets round to letting go, find the old listener
+/// still answering, and report a daemon already running.
 struct Server {
     heard: Heard,
     stopped: Arc<AtomicBool>,
     endpoint: PathBuf,
+    serving: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Server {
@@ -176,7 +182,26 @@ impl Drop for Server {
         self.stopped.store(true, Ordering::Relaxed);
         // The loop is parked in `accept`; one connection wakes it, and it
         // checks the flag before serving anyone.
-        let _ = dispatch_os::ipc::Connection::connect_to(&self.endpoint);
+        let wake = dispatch_os::ipc::Connection::connect_to(&self.endpoint);
+
+        // Joined only when the wake got through, as `Listener`'s own drop
+        // does. One that could not connect found nothing listening -- a
+        // hung-up server has already dropped its listener -- so the endpoint
+        // is free, and a join nothing will wake could hang. One that got
+        // through always ends: an answering or silent loop breaks on it and
+        // drops the listener, and a hung-up server's thread only ever waits
+        // for its own listener's drop and its one handler, which runs no
+        // scripted output that blocks.
+        //
+        // The wake is held open until then: Windows takes a connection that
+        // closed before the accept reached it for a probe, and would not
+        // deliver it.
+        if let Some(serving) = self.serving.take()
+            && wake.is_ok()
+        {
+            let _ = serving.join();
+        }
+        drop(wake);
     }
 }
 
@@ -204,7 +229,7 @@ fn serve_one(
     type Once = Arc<Mutex<Option<Box<dyn FnOnce(&mut Writer) + Send>>>>;
     let serve: Once = Arc::new(Mutex::new(Some(Box::new(serve))));
 
-    std::thread::spawn(move || {
+    let serving = std::thread::spawn(move || {
         loop {
             let Ok(connection) = listener.accept() else {
                 break;
@@ -276,6 +301,7 @@ fn serve_one(
         heard,
         stopped,
         endpoint,
+        serving: Some(serving),
     }
 }
 
@@ -357,6 +383,17 @@ fn welcome() -> ServerMessage {
         version: dispatch_proto::VERSION,
         device: "desktop".into(),
     }
+}
+
+/// `bytes` as a `printf` format string.
+///
+/// Three-digit octal escapes rather than `\xHH`: `printf` must understand
+/// them under POSIX, and Ubuntu's `/bin/sh` is dash, whose `printf` has no
+/// `\x` at all -- it printed the escapes as text and the handshake never
+/// completed.
+#[cfg(unix)]
+fn octal(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("\\{b:03o}")).collect()
 }
 
 #[test]
@@ -592,6 +629,27 @@ fn a_handle_taken_before_a_reconnection_still_works_after_one() {
 }
 
 #[test]
+fn a_dropped_fake_daemon_has_let_go_of_its_endpoint() {
+    // The two tests above stand a second daemon up the moment the first is
+    // dropped. A first one still closing its listener when `drop` returned
+    // answered the second one's bind, which then reported AlreadyRunning.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _endpoint = Endpoint::new("let-go");
+
+    for after in [After::HangUp, After::Answer, After::Silence] {
+        for _ in 0..20 {
+            drop(serve_one(welcome(), |_| {}, after));
+            let rebound = Listener::bind();
+            assert!(
+                rebound.is_ok(),
+                "a dropped {after:?} server still held the endpoint: {:?}",
+                rebound.err()
+            );
+        }
+    }
+}
+
+#[test]
 fn a_daemon_that_stops_answering_is_treated_as_gone() {
     // The socket is up as far as this end can tell, and nothing will ever cross
     // it again. Without asking, the client would wait for output forever.
@@ -739,7 +797,7 @@ fn a_command_that_dies_is_respawned() {
     // lost, and the supervisor has to dial again.
     let mut encoded = Vec::new();
     Frame::write(&mut encoded, &welcome()).expect("writing succeeds");
-    let escaped: String = encoded.iter().map(|b| format!("\\x{b:02x}")).collect();
+    let escaped = octal(&encoded);
 
     let program = std::ffi::OsString::from("sh");
     let args = vec![
@@ -870,12 +928,101 @@ fn a_dial_that_never_answers_leaves_no_process_behind() {
     );
 
     let grandchild = first_recorded_pid(&pid_file);
+
+    // Polled, as every sibling test polls: the tree has been signalled, but a
+    // killed process answers `kill(pid, 0)` until whoever inherited it reaps
+    // it, and on macOS that is launchd, on its own schedule.
+    let deadline = Instant::now() + PATIENCE;
+    while pid_is_alive(grandchild) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(
         !pid_is_alive(grandchild),
         "the dial's process tree outlived the handshake that walked away from it"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A process this one has started since `before` that has started one of
+/// its own, followed by everything below it.
+///
+/// Found while it runs: once a tree has been ended there is nothing left to
+/// name it by, and a test that never saw it would prove nothing.
+fn tree_started_since(before: &[u32]) -> Vec<u32> {
+    let me = std::process::id();
+    let deadline = Instant::now() + PATIENCE;
+
+    loop {
+        for pid in dispatch_os::process::descendants(me) {
+            if before.contains(&pid) {
+                continue;
+            }
+            let below = dispatch_os::process::descendants(pid);
+            if !below.is_empty() {
+                return std::iter::once(pid).chain(below).collect();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the dialled command never started anything"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(windows),
+    ignore = "Unix has its own: a_dial_that_never_answers_leaves_no_process_behind"
+)]
+fn a_command_dial_given_up_on_leaves_no_process_behind_on_windows() {
+    // The test above, where a dial's tree is a job rather than a process
+    // group. Walking away from the handshake has to end the job -- the
+    // command and what it started -- or the supervisor, dialling again every
+    // couple of seconds, leaves one tree behind per attempt.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Spelled for both platforms so it can be run on Unix by hand, with
+    // `--ignored`; there the tree is a process group instead.
+    let (program, args): (OsString, Vec<OsString>) = if cfg!(windows) {
+        (
+            "cmd.exe".into(),
+            vec!["/d".into(), "/c".into(), "ping -n 30 127.0.0.1 >nul".into()],
+        )
+    } else {
+        ("sh".into(), vec!["-c".into(), "sleep 30 & sleep 30".into()])
+    };
+
+    let before = dispatch_os::process::descendants(std::process::id());
+    // Long enough for a cold `cmd.exe` to have started `ping` by the time
+    // the handshake is given up on: the tree has to be seen alive first.
+    let dial = Dial::Command { program, args };
+    let dialling = std::thread::spawn(move || {
+        connect_within("test", Role::Interface, &dial, Duration::from_secs(5)).map(|_| ())
+    });
+
+    let tree = tree_started_since(&before);
+
+    let dialled = dialling.join().expect("the dial does not panic");
+    assert!(
+        matches!(dialled, Err(ClientError::Handshake(_))),
+        "expected the handshake to time out, got {dialled:?}"
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while tree
+        .iter()
+        .any(|&pid| dispatch_os::process::is_running(pid))
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        tree.iter()
+            .all(|&pid| !dispatch_os::process::is_running(pid)),
+        "the dial's process tree outlived the handshake that walked away from it: {tree:?}"
+    );
 }
 
 #[test]
@@ -895,7 +1042,7 @@ fn a_connection_given_up_on_leaves_no_process_behind() {
     // handshake completes and the connection is up before it goes quiet.
     let mut encoded = Vec::new();
     Frame::write(&mut encoded, &welcome()).expect("writing succeeds");
-    let escaped: String = encoded.iter().map(|b| format!("\\x{b:02x}")).collect();
+    let escaped = octal(&encoded);
 
     let (program, args) = mute_command(&pid_file, &format!("printf '{escaped}'; "));
 
@@ -1182,7 +1329,7 @@ fn a_client_dropped_mid_dial_leaves_nothing_behind() {
 
     let mut encoded = Vec::new();
     Frame::write(&mut encoded, &welcome()).expect("writing succeeds");
-    let escaped: String = encoded.iter().map(|b| format!("\\x{b:02x}")).collect();
+    let escaped = octal(&encoded);
 
     let client = Client::dial(
         Role::Interface,
@@ -1375,4 +1522,368 @@ fn a_replaced_connection_cannot_speak_for_its_successor() {
 
     drop(client);
     drop(server.join());
+}
+
+#[test]
+fn a_daemon_speaking_another_major_version_is_refused_by_the_client() {
+    // The daemon checks the client's version; until now the client never
+    // checked the daemon's, and would read every frame of a protocol it
+    // does not speak.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _endpoint = Endpoint::new("future-daemon");
+
+    let _server = serve_one(
+        ServerMessage::Welcome {
+            version: Version {
+                major: 99,
+                minor: 0,
+            },
+            device: "future".into(),
+        },
+        |_| {},
+        After::Silence,
+    );
+
+    let error = Client::attach_with("test", Liveness::default())
+        .expect_err("a daemon from another major version is refused");
+
+    assert!(
+        matches!(
+            error,
+            ClientError::Refused(ProtocolError::IncompatibleVersion { .. })
+        ),
+        "expected an incompatible version, got {error:?}"
+    );
+}
+
+/// A message far bigger than any pipe or socket buffer, so writing it
+/// blocks until the peer reads.
+fn huge() -> ClientMessage {
+    ClientMessage::OpenProject {
+        root: PathBuf::from("x".repeat(4 * 1024 * 1024)),
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_peer_that_never_reads_is_given_up_on_despite_a_stuck_write() {
+    // The audit's probe: welcomed, then the peer neither reads nor speaks.
+    // The big write blocked holding the lock the supervisor needed, and the
+    // client went on reporting itself connected long past its silence limit.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut encoded = Vec::new();
+    Frame::write(&mut encoded, &welcome()).expect("writing succeeds");
+
+    let client = Client::attach_over(
+        Role::Interface,
+        "test",
+        Liveness {
+            interval: Duration::from_millis(50),
+            silence: Duration::from_millis(300),
+        },
+        OsString::from("sh"),
+        vec![
+            OsString::from("-c"),
+            OsString::from(format!("printf '{}'; sleep 30", octal(&encoded))),
+        ],
+    )
+    .expect("the command answers the handshake");
+
+    client.send(huge());
+
+    // Given up on and redialled -- the command answers again -- well inside
+    // the thirty seconds the first peer would otherwise have held it.
+    assert!(
+        wait_until(Duration::from_secs(5), || client.generation() >= 2),
+        "the client never gave up on a peer it could not write to"
+    );
+
+    let started = Instant::now();
+    drop(client);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "dropping the client took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_peer_that_talks_but_never_reads_is_given_up_on() {
+    // Never silent -- it answers on its own every twenty milliseconds -- so
+    // only a deadline on the write itself can notice that nothing sent
+    // reaches it. The replacement then answers like a live daemon, and the
+    // old connection's stuck write, failing once it is closed, must not take
+    // the replacement down.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _endpoint = Endpoint::new("talks-only");
+
+    let listener = Listener::bind().expect("binding succeeds");
+    let endpoint = dispatch_os::ipc::endpoint().expect("the endpoint resolves");
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+
+    let server = std::thread::spawn(move || {
+        let (mut first_reader, mut first_writer) =
+            listener.accept().expect("the first dial arrives").split();
+        let _ = Frame::read::<_, ClientMessage>(&mut first_reader);
+        Frame::write(&mut first_writer, &welcome()).expect("the welcome goes out");
+        std::thread::spawn(move || {
+            while Frame::write(&mut first_writer, &ServerMessage::Pong { token: 0 }).is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let (mut second_reader, mut second_writer) =
+            listener.accept().expect("the redial arrives").split();
+        let _ = Frame::read::<_, ClientMessage>(&mut second_reader);
+        Frame::write(&mut second_writer, &welcome()).expect("the welcome goes out");
+        std::thread::spawn(move || {
+            while let Ok(message) = Frame::read::<_, ClientMessage>(&mut second_reader) {
+                if let ClientMessage::Ping { token } = message
+                    && Frame::write(&mut second_writer, &ServerMessage::Pong { token }).is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        let _ = stopped.recv();
+        (listener, first_reader)
+    });
+
+    let client = Client::attach_at(
+        Role::Interface,
+        "test",
+        Liveness {
+            interval: Duration::from_millis(50),
+            silence: Duration::from_millis(300),
+        },
+        endpoint,
+    )
+    .expect("the first connection is welcomed");
+
+    client.send(huge());
+
+    assert!(
+        wait_until(PATIENCE, || client.generation() == 2
+            && client.is_connected()),
+        "a peer that never read was not given up on"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        assert!(
+            client.is_connected() && client.generation() == 2,
+            "the old connection's stuck write took down its replacement"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    drop(client);
+    let _ = stop.send(());
+    drop(server.join());
+}
+
+#[test]
+fn a_socket_dial_that_is_given_up_on_lets_its_thread_go() {
+    // A peer that accepts and never answers the handshake. The dial gives
+    // up at its patience; the thread it left parked in the read used to stay
+    // parked until the peer closed -- one per retry, forever.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _endpoint = Endpoint::new("mute-socket");
+
+    let listener = Listener::bind().expect("binding succeeds");
+    let endpoint = dispatch_os::ipc::endpoint().expect("the endpoint resolves");
+    let (closed, ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut reader, _writer) = listener.accept().expect("the dial arrives").split();
+        let _ = Frame::read::<_, ClientMessage>(&mut reader);
+        // Now say nothing, and report when the client has let go.
+        let mut byte = [0u8; 1];
+        while reader.read(&mut byte).is_ok_and(|n| n > 0) {}
+        let _ = closed.send(());
+        drop(listener);
+    });
+
+    let dialled = connect_within(
+        "test",
+        Role::Interface,
+        &Dial::Endpoint(endpoint),
+        Duration::from_millis(300),
+    );
+    assert!(matches!(dialled, Err(ClientError::Handshake(_))));
+
+    assert!(
+        ended.recv_timeout(PATIENCE).is_ok(),
+        "the abandoned handshake still holds its connection open"
+    );
+}
+
+/// A writer whose every write blocks until the test lets it go, and then
+/// fails: a write to a peer that never reads, until the connection is closed.
+struct Stuck {
+    /// Told each time a write begins.
+    began: Sender<()>,
+    /// Dropped to let the write go.
+    release: Receiver<()>,
+}
+
+impl Write for Stuck {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        let _ = self.began.send(());
+        let _ = self.release.recv();
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A stuck writer, word of each write it begins, and what lets it go.
+fn stuck() -> (Stuck, Receiver<()>, Sender<()>) {
+    let (began, beginning) = channel();
+    let (release, released) = channel();
+    (
+        Stuck {
+            began,
+            release: released,
+        },
+        beginning,
+        release,
+    )
+}
+
+/// A wire up on connection 1, writing to `writer`, with nothing to close.
+fn wired(liveness: Liveness, writer: impl Write + Send + 'static) -> Arc<Wire> {
+    let wire = Wire::new(
+        Role::Interface,
+        "test",
+        liveness,
+        Dial::Endpoint(PathBuf::new()),
+    );
+    *wire.line.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(Arc::new(Line::new(1, Box::new(writer), Closer::default())));
+    wire.generation.store(1, Ordering::Relaxed);
+    wire.connected.store(true, Ordering::Relaxed);
+    Arc::new(wire)
+}
+
+#[test]
+fn checking_liveness_never_waits_on_the_connection() {
+    // Both deadlines -- the stuck write and the silence -- are enforced by
+    // the thread that checks liveness, so that thread must never be the one
+    // a write holds. A ping written by it, even one that only started when
+    // nothing else was writing, blocked it in a write a peer that never
+    // reads would hold for good, and then nothing enforced either.
+    let (writer, _began, release) = stuck();
+    let wire = wired(
+        Liveness {
+            interval: Duration::from_millis(10),
+            silence: Duration::from_secs(60),
+        },
+        writer,
+    );
+
+    // Quiet for longer than the interval, so a question is due.
+    std::thread::sleep(Duration::from_millis(50));
+
+    let (outbox, queued) = channel();
+    let (done, checked) = channel();
+    let checking = Arc::clone(&wire);
+    std::thread::spawn(move || {
+        check_liveness(&checking, &outbox);
+        let _ = done.send(());
+    });
+
+    assert!(
+        checked.recv_timeout(Duration::from_secs(2)).is_ok(),
+        "the liveness check is stuck in a write the peer never takes"
+    );
+    assert!(
+        matches!(queued.try_recv(), Ok(ClientMessage::Ping { .. })),
+        "the question is still asked, through the queue"
+    );
+
+    drop(release);
+}
+
+#[test]
+fn a_stale_write_that_fails_cannot_take_its_successor_down() {
+    // A write stuck on a connection that has been given up on fails only
+    // once that connection is closed -- by which time its replacement may be
+    // up. The failure has to end the connection it was written to, not
+    // whichever one is current.
+    let (writer, began, release) = stuck();
+    let wire = wired(Liveness::default(), writer);
+
+    let (done, wrote) = channel();
+    let writing = Arc::clone(&wire);
+    std::thread::spawn(move || {
+        let _ = done.send(writing.write(&ClientMessage::Subscribe));
+    });
+    began
+        .recv_timeout(PATIENCE)
+        .expect("the write to connection 1 is under way");
+
+    // Replaced while that write is still stuck, as the supervisor does.
+    {
+        let mut slot = wire.line.lock().unwrap_or_else(|e| e.into_inner());
+        wire.generation.store(2, Ordering::Relaxed);
+        *slot = Some(Arc::new(Line::new(
+            2,
+            Box::new(std::io::sink()),
+            Closer::default(),
+        )));
+        wire.connected.store(true, Ordering::Relaxed);
+    }
+
+    // The old write fails, as closing its connection makes it.
+    drop(release);
+    assert_eq!(
+        wrote.recv_timeout(PATIENCE),
+        Ok(false),
+        "the stuck write reports that its connection is gone"
+    );
+
+    assert_eq!(
+        wire.current().map(|line| line.generation),
+        Some(2),
+        "the old connection's failed write took its replacement out"
+    );
+    assert!(
+        wire.connected.load(Ordering::Relaxed),
+        "the old connection's failed write marked its replacement down"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_dial_given_up_on_before_it_opened_anything_is_closed_once_it_does() {
+    // The caller can stop waiting before the dialling thread has recorded
+    // what it opened -- the opening is what took too long. What it opens
+    // after that is nobody's to close unless recording it closes it.
+    let dialling = Dialling::default();
+    dialling.abandon();
+
+    let connection = Connection::over_command(
+        std::ffi::OsStr::new("sh"),
+        &[OsString::from("-c"), OsString::from("sleep 30")],
+    )
+    .expect("sh exists");
+    let closer = connection.closer();
+    let (mut reader, _writer) = connection.split();
+    let (ended, read_ended) = channel();
+    std::thread::spawn(move || {
+        let mut byte = [0u8; 1];
+        while reader.read(&mut byte).is_ok_and(|n| n > 0) {}
+        let _ = ended.send(());
+    });
+
+    dialling.record(closer);
+
+    assert!(
+        read_ended.recv_timeout(PATIENCE).is_ok(),
+        "a dial recorded after it was abandoned is still open"
+    );
 }
