@@ -284,4 +284,35 @@ mod tests {
         assert!(top.contains(" Claude Code wants to delegate "), "{top}");
         assert!(!top.contains('…'), "{top}");
     }
+
+    #[test]
+    fn a_name_is_cut_only_once_it_no_longer_fits() {
+        // A box 64 wide has 62 columns inside its corners. " wants to
+        // delegate " and the space before the name take 20, leaving 42.
+        let fits = "n".repeat(42);
+        assert_eq!(
+            title_row(
+                Approval {
+                    asking: &fits,
+                    ..approval("echo delegated")
+                },
+                64
+            ),
+            format!("┌ {fits} wants to delegate ┐"),
+            "a name exactly as wide as the room is shown whole"
+        );
+
+        let over = "m".repeat(43);
+        assert_eq!(
+            title_row(
+                Approval {
+                    asking: &over,
+                    ..approval("echo delegated")
+                },
+                64
+            ),
+            format!("┌ {}… wants to delegate ┐", "m".repeat(41)),
+            "one column more is cut, and the title still fills the box exactly"
+        );
+    }
 }
