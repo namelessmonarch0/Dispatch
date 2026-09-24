@@ -155,10 +155,16 @@ impl Heard {
 /// Before this existed the second bind only worked where the platform happened
 /// to refuse a connection to the first listener, which macOS does and Linux does
 /// not.
+///
+/// Dropping one also waits for its accepting thread, which closes the listener
+/// on its way out. Waking the thread is not enough on its own: the next bind
+/// can run before that thread gets round to letting go, find the old listener
+/// still answering, and report a daemon already running.
 struct Server {
     heard: Heard,
     stopped: Arc<AtomicBool>,
     endpoint: PathBuf,
+    serving: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Server {
@@ -176,7 +182,26 @@ impl Drop for Server {
         self.stopped.store(true, Ordering::Relaxed);
         // The loop is parked in `accept`; one connection wakes it, and it
         // checks the flag before serving anyone.
-        let _ = dispatch_os::ipc::Connection::connect_to(&self.endpoint);
+        let wake = dispatch_os::ipc::Connection::connect_to(&self.endpoint);
+
+        // Joined only when the wake got through, as `Listener`'s own drop
+        // does. One that could not connect found nothing listening -- a
+        // hung-up server has already dropped its listener -- so the endpoint
+        // is free, and a join nothing will wake could hang. One that got
+        // through always ends: an answering or silent loop breaks on it and
+        // drops the listener, and a hung-up server's thread only ever waits
+        // for its own listener's drop and its one handler, which runs no
+        // scripted output that blocks.
+        //
+        // The wake is held open until then: Windows takes a connection that
+        // closed before the accept reached it for a probe, and would not
+        // deliver it.
+        if let Some(serving) = self.serving.take()
+            && wake.is_ok()
+        {
+            let _ = serving.join();
+        }
+        drop(wake);
     }
 }
 
@@ -204,7 +229,7 @@ fn serve_one(
     type Once = Arc<Mutex<Option<Box<dyn FnOnce(&mut Writer) + Send>>>>;
     let serve: Once = Arc::new(Mutex::new(Some(Box::new(serve))));
 
-    std::thread::spawn(move || {
+    let serving = std::thread::spawn(move || {
         loop {
             let Ok(connection) = listener.accept() else {
                 break;
@@ -276,6 +301,7 @@ fn serve_one(
         heard,
         stopped,
         endpoint,
+        serving: Some(serving),
     }
 }
 
@@ -600,6 +626,27 @@ fn a_handle_taken_before_a_reconnection_still_works_after_one() {
         "the message reached the new connection, sent {:#?}",
         heard.snapshot()
     );
+}
+
+#[test]
+fn a_dropped_fake_daemon_has_let_go_of_its_endpoint() {
+    // The two tests above stand a second daemon up the moment the first is
+    // dropped. A first one still closing its listener when `drop` returned
+    // answered the second one's bind, which then reported AlreadyRunning.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _endpoint = Endpoint::new("let-go");
+
+    for after in [After::HangUp, After::Answer, After::Silence] {
+        for _ in 0..20 {
+            drop(serve_one(welcome(), |_| {}, after));
+            let rebound = Listener::bind();
+            assert!(
+                rebound.is_ok(),
+                "a dropped {after:?} server still held the endpoint: {:?}",
+                rebound.err()
+            );
+        }
+    }
 }
 
 #[test]
