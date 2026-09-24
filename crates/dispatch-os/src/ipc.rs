@@ -2435,6 +2435,50 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn dropping_a_command_connection_ends_a_tree_that_ignores_being_asked() {
+        // What the reap's order leans on: a tree that ignores SIGTERM is
+        // killed once its grace runs out, even though its leader is not
+        // waited for until afterwards -- on Linux, a leader that keeps its
+        // group looking alive the whole time.
+        let mut connection = Connection::over_command(
+            std::ffi::OsStr::new("sh"),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("trap '' TERM; sleep 30 & echo forked; wait"),
+            ],
+        )
+        .expect("sh exists");
+        let leader = connection.child_id().expect("a command has a pid");
+        let mut said = [0u8; 7];
+        connection
+            .read_exact(&mut said)
+            .expect("the command says it has forked");
+        assert_eq!(&said, b"forked\n");
+
+        // On a thread, so a reap that never escalated fails here rather than
+        // hanging the suite for as long as the tree cares to run.
+        let (dropped, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(connection);
+            let _ = dropped.send(());
+        });
+        assert!(
+            done.recv_timeout(PATIENCE).is_ok(),
+            "dropping the connection waited on a tree that ignores SIGTERM"
+        );
+
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while group_exists(leader) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !group_exists(leader),
+            "a tree that ignores SIGTERM outlived its connection"
+        );
+    }
+
     /// The pid `closer` would signal if it were closed now.
     #[cfg(unix)]
     fn aimed_at(closer: &Closer) -> Option<u32> {

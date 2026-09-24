@@ -1076,7 +1076,226 @@ mod windows_tests {
             .expect("cmd.exe starts");
         let pid = child.id();
         child.wait().expect("it exits");
+        // Its last handle closed, the pid names nothing: the answer is the
+        // one for no such process, not one about an exited process.
+        drop(child);
 
         terminate_tree(pid, DEFAULT_GRACE).expect("a process that has gone is what was asked for");
+    }
+
+    /// Whether `pid` still names a process object, running or exited.
+    ///
+    /// An exited process keeps its pid while anyone holds a handle to it;
+    /// only once the last handle is closed can the system hand the pid out
+    /// again.
+    fn names_a_process(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+
+        // SAFETY: OpenProcess takes access flags and a pid by value.
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        // SAFETY: a handle this call just opened, closed exactly once.
+        unsafe { CloseHandle(handle) };
+        true
+    }
+
+    #[test]
+    fn a_contained_process_keeps_its_pid_until_it_is_ended() {
+        // A contained process that exits on its own -- every pane does -- is
+        // still recorded until it is ended. Were its pid free meanwhile, the
+        // system could give it to a stranger, and ending that stranger by pid
+        // would end the stale job instead, and report success.
+        let mut command = std::process::Command::new("cmd.exe");
+        command
+            .args(["/d", "/c", "exit 0"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = spawn_contained(&mut command).expect("cmd.exe starts");
+        let pid = child.id();
+        child.wait().expect("it exits");
+        drop(child);
+
+        // Watched for a while rather than asked once: something else briefly
+        // holding the exited process open would answer for it.
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            assert!(
+                names_a_process(pid),
+                "the pid of a process still recorded as contained was let go"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        terminate_tree(pid, DEFAULT_GRACE).expect("an exited contained process is ended");
+    }
+
+    /// Where the helper below writes its answer.
+    const HELPER_ANSWER: &str = "DISPATCH_TEST_HELPER_ANSWER";
+    /// Set when the helper is to put itself in a job that forbids breakaway.
+    const HELPER_FORBIDS_BREAKAWAY: &str = "DISPATCH_TEST_HELPER_FORBIDS_BREAKAWAY";
+
+    /// Not a test of its own: the body of the contained helper the two tests
+    /// below start. Run without its variables, it does nothing.
+    ///
+    /// Starts a detached `ping` and answers `started <pid>` or
+    /// `failed <error>`. Asked to, it first puts itself in a job that forbids
+    /// breakaway, as a CI runner's or an OpenSSH session's may.
+    #[test]
+    fn detach_as_a_contained_helper() {
+        let Some(answer) = std::env::var_os(HELPER_ANSWER) else {
+            return;
+        };
+        let answer = std::path::PathBuf::from(answer);
+
+        if std::env::var_os(HELPER_FORBIDS_BREAKAWAY).is_some() {
+            forbid_breakaway();
+        }
+
+        let said = match spawn_detached(
+            std::path::Path::new("ping.exe"),
+            &["-n".into(), "30".into(), "127.0.0.1".into()],
+        ) {
+            Ok(pid) => format!("started {pid}"),
+            Err(error) => format!("failed {error}"),
+        };
+
+        // Renamed into place, so the test never reads half of it.
+        let partial = answer.with_extension("partial");
+        std::fs::write(&partial, said).expect("the answer is writable");
+        std::fs::rename(&partial, &answer).expect("the answer can be put in place");
+    }
+
+    /// Puts this process in a job of its own, one with no limits at all --
+    /// breakaway included -- nested inside whatever job it is already in.
+    fn forbid_breakaway() {
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        // SAFETY: both arguments may be null: default security, no name.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        assert!(!job.is_null(), "{}", std::io::Error::last_os_error());
+        // SAFETY: a live job handle, and the pseudo-handle for this process.
+        // The job handle is left open: this helper exits in a moment.
+        let assigned = unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) };
+        assert_ne!(assigned, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    /// Runs the helper contained, reads its answer, and ends its job.
+    fn run_contained_helper(label: &str, forbid_breakaway: bool) -> String {
+        let dir = std::env::temp_dir().join(format!("dispatch-os-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir is writable");
+        let answer = dir.join("answer");
+
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("the test binary"));
+        command
+            .args([
+                "--exact",
+                "process::windows_tests::detach_as_a_contained_helper",
+                "--test-threads=1",
+            ])
+            .env(HELPER_ANSWER, &answer)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if forbid_breakaway {
+            command.env(HELPER_FORBIDS_BREAKAWAY, "1");
+        }
+        let mut helper = spawn_contained(&mut command).expect("the test binary runs");
+
+        let answered = eventually(Duration::from_secs(10), || answer.exists());
+        let said = std::fs::read_to_string(&answer).unwrap_or_default();
+
+        terminate_tree(helper.id(), DEFAULT_GRACE).expect("the helper's job is ended");
+        let _ = helper.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(answered, "the helper never answered");
+        said
+    }
+
+    /// The pid the helper started, or a failure saying what it said instead.
+    fn started(said: &str) -> u32 {
+        said.strip_prefix("started ")
+            .and_then(|pid| pid.parse().ok())
+            .unwrap_or_else(|| panic!("the helper did not start a detached process: {said}"))
+    }
+
+    /// The job this test process runs in, if any, for a failure that may be
+    /// the runner's doing rather than this crate's.
+    fn own_job() -> String {
+        use windows_sys::Win32::System::JobObjects::{
+            IsProcessInJob, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let mut inside = 0;
+        // SAFETY: the pseudo-handle for this process; a null job asks about
+        // any job; `inside` is a valid place for the answer.
+        if unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut inside) } == 0 {
+            return format!("unknown ({})", std::io::Error::last_os_error());
+        }
+        if inside == 0 {
+            return "none".into();
+        }
+
+        // SAFETY: an all-zero structure is valid to fill.
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a null job names this process's own; `limits` is the
+        // structure this class names.
+        let read = unsafe {
+            QueryInformationJobObject(
+                std::ptr::null_mut(),
+                JobObjectExtendedLimitInformation,
+                (&raw mut limits).cast(),
+                u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                    .expect("a small struct"),
+                std::ptr::null_mut(),
+            )
+        };
+        if read == 0 {
+            return format!(
+                "one whose limits cannot be read ({})",
+                std::io::Error::last_os_error()
+            );
+        }
+        format!(
+            "one with limit flags {:#x}",
+            limits.BasicLimitInformation.LimitFlags
+        )
+    }
+
+    #[test]
+    fn a_daemon_started_from_a_contained_process_outlives_its_job() {
+        // A local `dispatchd --stdio` bridge runs contained, as every command
+        // transport does, and starts the daemon it bridges to. That daemon
+        // owns agents: ending the transport must not end them.
+        let detached = started(&run_contained_helper("breakaway", false));
+
+        let outlived = is_running(detached);
+        let _ = terminate_tree(detached, DEFAULT_GRACE);
+        assert!(
+            outlived,
+            "the detached process died with the job of the process that started it; \
+             this test process's own job: {}",
+            own_job()
+        );
+    }
+
+    #[test]
+    fn a_detached_process_still_starts_inside_a_job_that_forbids_breakaway() {
+        // An OpenSSH session on Windows, or a CI runner, may run everything in
+        // a job that refuses to let anything leave. The daemon must still
+        // start there -- inside that job, since it cannot be anywhere else.
+        started(&run_contained_helper("no-breakaway", true));
+
+        // Nothing to clean up: ending the helper's job ended the one nested
+        // in it, and what the helper started with it. Ending its pid again
+        // could end a stranger the system has since given that pid to.
     }
 }
