@@ -887,7 +887,15 @@ fn connect(
 /// Bounded because a hint is worth a moment and never a hang: the caller is
 /// already holding a failure to report, and a command that says nothing more
 /// must not turn that failure into a wait.
-const HINT_PATIENCE: Duration = Duration::from_millis(50);
+///
+/// A quarter of a second rather than the fifty milliseconds it once was. A
+/// dying command's last words cross a pipe and a drain thread of their own,
+/// and on a loaded machine that took longer than fifty often enough to lose
+/// them -- `Permission denied (publickey)` reported as bare silence. A
+/// failing attach now reports a quarter second later, and loses its
+/// explanation far less often: of the two, the explanation is what the user
+/// cannot get back.
+const HINT_PATIENCE: Duration = Duration::from_millis(250);
 
 /// How often to look while waiting for one.
 const HINT_POLL: Duration = Duration::from_millis(5);
