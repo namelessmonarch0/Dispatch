@@ -97,8 +97,9 @@ pub fn terminate_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
 }
 
 /// Asks `pid`'s group or job to stop, and kills what is left after `grace`,
-/// without waiting afterwards for it to be gone. On Windows a contained tree
-/// is not asked first: its job is ended at once.
+/// without waiting afterwards for it to be gone. On Windows nothing is asked
+/// first: a contained tree's job is ended at once, and so is a process that
+/// was never contained.
 ///
 /// On Linux a killed leader nobody has waited for is still a member of its
 /// group, so waiting for the group to vanish before the leader is reaped
@@ -737,10 +738,13 @@ mod imp {
     /// for it to empty; the record stays, so a later `terminate_tree` or
     /// [`wait_for_tree`] can do that waiting.
     ///
-    /// Nothing here needs a reaper -- a terminated process signals its
-    /// handle whether or not anyone has waited for it -- so a process that
-    /// was never contained is ended as `terminate_tree` ends it.
-    pub(super) fn signal_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
+    /// A process that was never contained -- `contain` could not record it --
+    /// is ended the same way `terminate_tree` ends it, and not waited for
+    /// either. A command transport's closer calls this under the lock its
+    /// reap needs, so waiting out [`KILL_TIMEOUT`] here would hold the reap
+    /// up too; and the reap waits for the process itself. There is no grace
+    /// to give it, as there is none on this platform for a contained tree.
+    pub(super) fn signal_tree(pid: u32, _grace: Duration) -> Result<(), ProcessError> {
         let map = |source| ProcessError::Terminate { pid, source };
 
         let records = contained().lock().unwrap_or_else(|e| e.into_inner());
@@ -749,7 +753,7 @@ mod imp {
         }
         drop(records);
 
-        terminate_one(pid, grace)
+        end_one(pid).map(drop)
     }
 
     pub(super) fn wait_for_tree(pid: u32) {
@@ -766,19 +770,41 @@ mod imp {
     }
 
     /// Ends one process that was never contained -- a daemon started
-    /// detached, say.
+    /// detached, say -- and waits for it to be gone.
     fn terminate_one(pid: u32, grace: Duration) -> Result<(), ProcessError> {
+        let map = |source| ProcessError::Terminate { pid, source };
+
+        let Some(process) = end_one(pid)? else {
+            return Ok(());
+        };
+
+        let millis = u32::try_from(grace.max(KILL_TIMEOUT).as_millis()).unwrap_or(u32::MAX);
+        // SAFETY: a live handle opened with SYNCHRONIZE -- without it, as
+        // before, this wait failed every time.
+        match unsafe { WaitForSingleObject(process.0, millis) } {
+            WAIT_OBJECT_0 => Ok(()),
+            WAIT_TIMEOUT => Err(map(std::io::Error::from(std::io::ErrorKind::TimedOut))),
+            _ => Err(map(std::io::Error::last_os_error())),
+        }
+    }
+
+    /// Ends one process that was never contained, without waiting for it to
+    /// be gone.
+    ///
+    /// Hands back its handle, for a caller that does wait; `None` when it had
+    /// already gone, which is what the caller wanted.
+    fn end_one(pid: u32) -> Result<Option<Owned>, ProcessError> {
         let map = |source| ProcessError::Terminate { pid, source };
 
         // SAFETY: OpenProcess takes access flags and a pid by value.
         let raw = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
         if raw.is_null() {
             let error = std::io::Error::last_os_error();
-            // No such process: it has exited and been waited for, which is
-            // what the caller wanted. Anything else -- access denied above
-            // all -- says nothing about whether it is gone.
+            // No such process: it has exited and been waited for. Anything
+            // else -- access denied above all -- says nothing about whether
+            // it is gone.
             if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
-                return Ok(());
+                return Ok(None);
             }
             return Err(map(error));
         }
@@ -790,19 +816,12 @@ mod imp {
             // Ending a process that has already exited fails; it is gone all
             // the same.
             if has_exited(&process) {
-                return Ok(());
+                return Ok(None);
             }
             return Err(map(error));
         }
 
-        let millis = u32::try_from(grace.max(KILL_TIMEOUT).as_millis()).unwrap_or(u32::MAX);
-        // SAFETY: a live handle opened with SYNCHRONIZE -- without it, as
-        // before, this wait failed every time.
-        match unsafe { WaitForSingleObject(process.0, millis) } {
-            WAIT_OBJECT_0 => Ok(()),
-            WAIT_TIMEOUT => Err(map(std::io::Error::from(std::io::ErrorKind::TimedOut))),
-            _ => Err(map(std::io::Error::last_os_error())),
-        }
+        Ok(Some(process))
     }
 
     /// Whether the process behind `process` has exited.
