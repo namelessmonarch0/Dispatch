@@ -2336,6 +2336,79 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn dropping_a_connection_whose_command_has_exited_is_quick() {
+        // A dial whose command fails at once is dropped, and its error
+        // reported, only once the reap is done. The reap used to wait for the
+        // group to vanish before it waited for the leader -- and on Linux a
+        // leader nobody has waited for is still a member of its group, so it
+        // sat out the whole kill timeout on its own zombie.
+        let mut connection = Connection::over_command(
+            std::ffi::OsStr::new("sh"),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("exit 0"),
+            ],
+        )
+        .expect("sh exists");
+        // End of file: the command has exited, and nobody has waited for it.
+        let mut rest = Vec::new();
+        connection
+            .read_to_end(&mut rest)
+            .expect("reading to the end succeeds");
+
+        let started = std::time::Instant::now();
+        drop(connection);
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(500),
+            "dropping an exited command's connection took {took:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dropping_a_live_command_connection_is_quick_and_ends_its_tree() {
+        // Every client dropped and every connection given up on reaps its
+        // transport, which is still running: its leader dies of the signal
+        // and is a zombie, like the exited one above, until it is waited for.
+        let mut connection = Connection::over_command(
+            std::ffi::OsStr::new("sh"),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("sleep 30 & echo forked; wait"),
+            ],
+        )
+        .expect("sh exists");
+        let leader = connection.child_id().expect("a command has a pid");
+        // Said once the background `sleep` exists, so there is a tree to end.
+        let mut said = [0u8; 7];
+        connection
+            .read_exact(&mut said)
+            .expect("the command says it has forked");
+        assert_eq!(&said, b"forked\n");
+
+        let started = std::time::Instant::now();
+        drop(connection);
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(500),
+            "dropping a live command's connection took {took:?}"
+        );
+
+        // Quick is not leaving it running: the leader is reaped, and what it
+        // started is gone once its new parent has reaped that too.
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while group_exists(leader) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !group_exists(leader),
+            "the command's tree outlived its connection"
+        );
+    }
+
     /// The pid `closer` would signal if it were closed now.
     #[cfg(unix)]
     fn aimed_at(closer: &Closer) -> Option<u32> {
