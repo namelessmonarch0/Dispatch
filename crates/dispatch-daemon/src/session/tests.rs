@@ -45,6 +45,14 @@ fn harnesses(dir: &std::path::Path) -> HarnessRegistry {
     };
     std::fs::write(dir.join("stall.toml"), stall).expect("temp dir is writable");
 
+    // Prints as fast as it can, forever.
+    let flood = if cfg!(windows) {
+        "id = \"flood\"\ndisplay_name = \"Flood\"\ncommand = \"cmd.exe\"\nargs = [\"/c\", \"for /l %i in (0,0,1) do @echo flood\"]\n"
+    } else {
+        "id = \"flood\"\ndisplay_name = \"Flood\"\ncommand = \"yes\"\nargs = [\"flood\"]\n"
+    };
+    std::fs::write(dir.join("flood.toml"), flood).expect("temp dir is writable");
+
     HarnessRegistry::load_from_dir(dir).expect("loading succeeds")
 }
 
@@ -107,7 +115,7 @@ fn output_of(messages: &[ServerMessage], pane: PaneId) -> String {
 }
 
 /// Drains whatever a client has been sent.
-fn drain(inbox: &Receiver<ServerMessage>) -> Vec<ServerMessage> {
+fn drain(inbox: &Inbox) -> Vec<ServerMessage> {
     let mut messages = Vec::new();
     while let Ok(message) = inbox.try_recv() {
         messages.push(message);
@@ -118,7 +126,7 @@ fn drain(inbox: &Receiver<ServerMessage>) -> Vec<ServerMessage> {
 /// Ticks the daemon until `predicate` holds, or gives up.
 fn wait_for(
     daemon: &mut Daemon,
-    inbox: &Receiver<ServerMessage>,
+    inbox: &Inbox,
     predicate: impl Fn(&[ServerMessage]) -> bool,
 ) -> Vec<ServerMessage> {
     let mut seen = Vec::new();
@@ -303,7 +311,7 @@ fn every_subscribed_client_sees_the_same_panes() {
     );
     daemon.tick();
 
-    let saw_spawn = |inbox: &Receiver<ServerMessage>| {
+    let saw_spawn = |inbox: &Inbox| {
         drain(inbox)
             .iter()
             .any(|m| matches!(m, ServerMessage::PaneSpawned { .. }))
@@ -1024,11 +1032,7 @@ fn daemon_with_limits(label: &str, limits: DelegationLimits) -> (Daemon, Project
 }
 
 /// Spawns a pane the ordinary way and returns its id.
-fn spawn_pane_for_test(
-    daemon: &mut Daemon,
-    inbox: &Receiver<ServerMessage>,
-    project: ProjectId,
-) -> PaneId {
+fn spawn_pane_for_test(daemon: &mut Daemon, inbox: &Inbox, project: ProjectId) -> PaneId {
     daemon.request_for_test(
         1,
         ClientMessage::SpawnPane {
@@ -1063,14 +1067,14 @@ fn m_is_child(message: &ServerMessage) -> bool {
 }
 
 /// Attaches a delegate caller and asks for a subagent.
-fn ask(daemon: &mut Daemon, parent: PaneId, task: &str) -> Receiver<ServerMessage> {
+fn ask(daemon: &mut Daemon, parent: PaneId, task: &str) -> Inbox {
     ask_as(daemon, 9, parent, task)
 }
 
 /// Attaches a delegate caller under a specific client id and asks for a
 /// subagent. Needed over `ask` when a test drives two delegate callers at
 /// once, since `ask` always reuses id 9.
-fn ask_as(daemon: &mut Daemon, id: u64, parent: PaneId, task: &str) -> Receiver<ServerMessage> {
+fn ask_as(daemon: &mut Daemon, id: u64, parent: PaneId, task: &str) -> Inbox {
     let caller = daemon.attach_for_test(id);
     daemon.request_for_test(
         id,
@@ -2364,4 +2368,213 @@ fn a_stalled_pane_does_not_stall_the_daemon() {
     let started = Instant::now();
     daemon.run();
     assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+use std::io::{Read, Write};
+
+/// A daemon serving a real endpoint on a thread of its own, stopped when
+/// dropped.
+///
+/// Most tests here drive the loop directly; these are the ones about what
+/// happens to the connection itself, which only a socket can show.
+struct Served {
+    endpoint: PathBuf,
+    project: ProjectId,
+    shutdown: Shutdown,
+    thread: Option<std::thread::JoinHandle<()>>,
+    _dir: TempDir,
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        self.shutdown.request();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Serves a fresh daemon under `budgets`. Keep `label` short: a Unix
+/// socket's whole path must fit in about a hundred bytes.
+fn served(label: &str, budgets: Budgets) -> Served {
+    let (mut daemon, project, dir) = daemon(label);
+    daemon.set_budgets(budgets);
+
+    let endpoint = dir.0.join("d.sock");
+    let listener = Listener::bind_to(&endpoint).expect("binding succeeds");
+    let shutdown = daemon.shutdown_handle();
+    let thread = std::thread::spawn(move || {
+        let _ = daemon.serve(listener);
+    });
+
+    Served {
+        endpoint,
+        project,
+        shutdown,
+        thread: Some(thread),
+        _dir: dir,
+    }
+}
+
+type RawReader = Box<dyn Read + Send>;
+type RawWriter = Box<dyn Write + Send>;
+
+fn raw_client(endpoint: &Path) -> (RawReader, RawWriter) {
+    Connection::connect_to(endpoint)
+        .expect("the daemon is listening")
+        .split()
+}
+
+/// Whether writes to the daemon start failing within `patience` -- that is,
+/// whether the daemon has let go of the half it reads from.
+fn stops_listening(mut writer: RawWriter, patience: Duration) -> bool {
+    let deadline = Instant::now() + patience;
+    while Instant::now() < deadline {
+        if Frame::write(&mut writer, &ClientMessage::Ping { token: 0 }).is_err() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// Connects as a well-behaved interface client and collects what arrives in
+/// `window`.
+fn subscribe_and_collect(endpoint: &Path, window: Duration) -> Vec<ServerMessage> {
+    let (mut reader, mut writer) = raw_client(endpoint);
+    Frame::write(&mut writer, &hello()).expect("writing succeeds");
+    Frame::write(&mut writer, &ClientMessage::Subscribe).expect("writing succeeds");
+
+    let (heard, hearing) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        while let Ok(message) = Frame::read::<_, ServerMessage>(&mut reader) {
+            if heard.send(message).is_err() {
+                return;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + window;
+    let mut seen = Vec::new();
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        match hearing.recv_timeout(left) {
+            Ok(message) => seen.push(message),
+            Err(_) => break,
+        }
+    }
+    drop(writer);
+    seen
+}
+
+/// The output bytes among `messages`, however many panes they came from.
+fn output_bytes(messages: &[ServerMessage]) -> usize {
+    messages
+        .iter()
+        .map(|m| match m {
+            ServerMessage::PaneOutput { bytes, .. } => bytes.len(),
+            _ => 0,
+        })
+        .sum()
+}
+
+#[test]
+#[cfg(unix)]
+fn a_client_that_never_reads_costs_no_more_than_its_budget() {
+    const BUDGET: usize = 256 * 1024;
+    let (mut daemon, project, _dir) = daemon("unread");
+    daemon.set_budgets(Budgets {
+        outbox_bytes: BUDGET,
+        ..Budgets::default()
+    });
+
+    let reading = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let never_reads = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::SpawnPane {
+            project,
+            harness: "flood".into(),
+            size: (80, 24),
+        },
+    );
+
+    // Two megabytes reach the client that reads. The other one's queue
+    // stops growing at the budget, instead of holding all two.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut delivered = 0;
+    while delivered < 2 * 1024 * 1024 {
+        assert!(
+            Instant::now() < deadline,
+            "the flood stopped reaching the client that reads ({delivered} bytes)"
+        );
+        daemon.tick();
+        delivered += output_bytes(&drain(&reading));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let backlog = output_bytes(&drain(&never_reads));
+    assert!(
+        backlog <= BUDGET + dispatch_pty::DRAIN_BUDGET + 8192,
+        "{backlog} bytes were queued for a client that never read"
+    );
+    assert!(
+        matches!(
+            never_reads.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ),
+        "the daemon let go of it"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_client_that_stops_reading_is_hung_up_and_can_come_back() {
+    // Bigger than the in-process test's budget: this client is read over a
+    // real socket by a thread the daemon does not step in lock with, unlike
+    // `daemon.tick()` there, and `flood` can outrun a fresh reader's first
+    // few ticks before its writer thread gets scheduled at all. Still far
+    // below the crate's own default, and the never-reading client below
+    // still overruns it in well under a second.
+    let served = served(
+        "stop-read",
+        Budgets {
+            outbox_bytes: 4 * 1024 * 1024,
+            ..Budgets::default()
+        },
+    );
+
+    let (_reader, mut writer) = raw_client(&served.endpoint);
+    Frame::write(&mut writer, &hello()).expect("writing succeeds");
+    Frame::write(&mut writer, &ClientMessage::Subscribe).expect("writing succeeds");
+    Frame::write(
+        &mut writer,
+        &ClientMessage::SpawnPane {
+            project: served.project,
+            harness: "flood".into(),
+            size: (80, 24),
+        },
+    )
+    .expect("writing succeeds");
+
+    // Never read: the socket fills, the outbox passes its budget, and the
+    // daemon hangs up -- both halves, so this side's writes start failing.
+    assert!(
+        stops_listening(writer, Duration::from_secs(20)),
+        "a client that stopped reading is still connected"
+    );
+
+    // Coming back is an ordinary late subscription: the pane is described
+    // and what it printed recently is replayed.
+    let seen = subscribe_and_collect(&served.endpoint, Duration::from_millis(500));
+    assert!(
+        seen.iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { harness, .. } if harness == "flood")),
+        "the reconnected client is told about the pane"
+    );
+    assert!(output_bytes(&seen) > 0, "and replayed what it printed");
 }

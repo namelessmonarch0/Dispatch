@@ -9,14 +9,16 @@ use std::time::{Duration, Instant};
 
 use dispatch_config::{DelegationLimits, HarnessRegistry};
 use dispatch_core::{PaneId, PaneStatus, Project, ProjectId, ProjectSource, RequestId};
-use dispatch_os::ipc::{Connection, Listener};
+use dispatch_os::ipc::{Closer, Connection, Listener};
 use dispatch_proto::{
     ClientMessage, DelegateOutcome, Frame, FrameError, PaneUpdate, ProtocolError, Role,
     ServerMessage,
 };
 use dispatch_pty::{Pty, RunState, Size};
 
+use crate::budgets::Budgets;
 use crate::delegation::Pending;
+use crate::outbox::{Inbox, Outbox, Refused};
 use crate::pane::DaemonPane;
 
 /// How much of a subagent's output its caller is given.
@@ -79,10 +81,18 @@ impl Shutdown {
     }
 }
 
+/// What connects the loop to one client's threads.
+struct Wiring {
+    /// Its queue.
+    outbox: Outbox,
+    /// Ends its connection, both halves, whoever holds them.
+    closer: Closer,
+}
+
 /// Something the loop reacts to.
 enum Event {
     /// A client attached.
-    Attached(ClientId, Sender<ServerMessage>),
+    Attached(ClientId, Wiring),
     /// A client said something.
     Request(ClientId, ClientMessage),
     /// A client went away.
@@ -91,7 +101,9 @@ enum Event {
 
 /// An attached client.
 struct Client {
-    outbox: Sender<ServerMessage>,
+    outbox: Outbox,
+    /// Ends its connection, both halves, whoever holds them.
+    closer: Closer,
     /// Whether it has asked for pane events. A client that has not subscribed
     /// is still connected but silent, which is what a one-shot command wants.
     subscribed: bool,
@@ -118,6 +130,8 @@ pub struct Daemon {
     device: String,
     stop: Arc<AtomicBool>,
     limits: DelegationLimits,
+    /// Limits on what one client may cost the daemon.
+    budgets: Budgets,
     /// Requests asked about and not yet answered.
     pending: HashMap<RequestId, Pending>,
     /// Panes the user has approved for every future request, for as long as
@@ -152,9 +166,17 @@ impl Daemon {
             device: device.into(),
             stop: Arc::new(AtomicBool::new(false)),
             limits,
+            budgets: Budgets::default(),
             pending: HashMap::new(),
             blanket: HashSet::new(),
         }
+    }
+
+    /// Replaces the limits on what one client may cost.
+    ///
+    /// Before `serve`, which consumes the daemon.
+    pub fn set_budgets(&mut self, budgets: Budgets) {
+        self.budgets = budgets;
     }
 
     /// Returns the handle that stops this daemon.
@@ -271,11 +293,12 @@ impl Daemon {
 
     fn handle(&mut self, event: Event) {
         match event {
-            Event::Attached(id, outbox) => {
+            Event::Attached(id, wiring) => {
                 self.clients.insert(
                     id,
                     Client {
-                        outbox,
+                        outbox: wiring.outbox,
+                        closer: wiring.closer,
                         subscribed: false,
                         role: Role::default(),
                         ready: false,
@@ -1275,20 +1298,31 @@ impl Daemon {
         self.expire_requests();
     }
 
-    /// Forgets a client, and whatever it was waiting on.
+    /// Forgets a client, ends its connection, and drops what it was waiting
+    /// on.
     ///
-    /// What the daemon does to a client it will not serve any longer: a
-    /// refused handshake, a protocol violation. Its outbox goes with it, so
-    /// the writer thread sends what was already queued -- the refusal among
-    /// it -- and stops.
+    /// Closing is what lets its threads go: a writer parked on a client that
+    /// stopped reading, a reader forwarding frames nobody will act on.
+    ///
+    /// `Closer::close` can block for up to about two seconds -- on Windows it
+    /// keeps cancelling until nothing is left in flight on either pipe -- and
+    /// the loop calls this from the same thread that ticks every pane and
+    /// drains every event; blocking here would stall the whole daemon behind
+    /// one client's connection. So the client is forgotten first, then closed
+    /// on a thread of its own that outlives this call, and only then is what
+    /// it was waiting on dropped.
     fn hang_up(&mut self, id: ClientId) {
-        if self.clients.remove(&id).is_some() {
+        if let Some(client) = self.clients.remove(&id) {
+            let closer = client.closer;
+            std::thread::spawn(move || closer.close());
             tracing::info!(client = id, "hung up on a client");
         }
         self.abandon(id);
     }
 
     /// Sends to one client.
+    ///
+    /// Not counted against the client's budget: this is what it asked for.
     fn send(&mut self, id: ClientId, message: ServerMessage) {
         let Some(client) = self.clients.get(&id) else {
             return;
@@ -1314,6 +1348,7 @@ impl Daemon {
     /// otherwise be told twice.
     fn broadcast_except(&mut self, exclude: Option<ClientId>, message: ServerMessage) {
         let mut gone = Vec::new();
+        let mut behind = Vec::new();
 
         for (id, client) in &self.clients {
             // A delegate caller wants the fate of its own request; the fleet's
@@ -1322,13 +1357,30 @@ impl Daemon {
             if Some(*id) == exclude || !client.subscribed || client.role != Role::Interface {
                 continue;
             }
-            if client.outbox.send(message.clone()).is_err() {
-                gone.push(*id);
+            match client
+                .outbox
+                .send_within(message.clone(), self.budgets.outbox_bytes)
+            {
+                Ok(()) => {}
+                Err(Refused::Gone) => gone.push(*id),
+                Err(Refused::Behind { queued }) => behind.push((*id, queued)),
             }
         }
 
         for id in gone {
             self.clients.remove(&id);
+        }
+
+        // Hung up on rather than skipped: a client that misses output it is
+        // never told it missed draws a screen that is quietly wrong. One that
+        // reconnects is replayed the lot.
+        for (id, queued) in behind {
+            tracing::warn!(
+                client = id,
+                queued,
+                "hanging up on a client that stopped reading"
+            );
+            self.hang_up(id);
         }
     }
 }
@@ -1360,10 +1412,14 @@ fn spawn_client(
     connection: Connection,
     events: &Sender<Event>,
 ) -> Result<(), dispatch_os::ipc::IpcError> {
+    let closer = connection.closer();
     let (mut reader, mut writer) = connection.split();
-    let (outbox, outgoing) = channel::<ServerMessage>();
+    let (outbox, inbox) = crate::outbox::pair();
 
-    if events.send(Event::Attached(id, outbox)).is_err() {
+    if events
+        .send(Event::Attached(id, Wiring { outbox, closer }))
+        .is_err()
+    {
         return Ok(());
     }
 
@@ -1388,7 +1444,7 @@ fn spawn_client(
     });
 
     std::thread::spawn(move || {
-        while let Ok(message) = outgoing.recv() {
+        while let Some(message) = inbox.recv() {
             // Logged rather than swallowed: a write that fails here is how a
             // client ends up waiting for an answer the daemon believes it sent,
             // and a silent `break` leaves nothing to read afterwards. Debug
@@ -1407,10 +1463,19 @@ fn spawn_client(
 /// Lets a test drive the loop without a socket.
 impl Daemon {
     /// Attaches a fake client and returns its inbox.
+    ///
+    /// Taking from the inbox is what reading is: a test that never takes is
+    /// a client that has stopped reading.
     #[doc(hidden)]
-    pub fn attach_for_test(&mut self, id: u64) -> Receiver<ServerMessage> {
-        let (outbox, inbox) = channel();
-        self.handle(Event::Attached(id, outbox));
+    pub fn attach_for_test(&mut self, id: u64) -> Inbox {
+        let (outbox, inbox) = crate::outbox::pair();
+        self.handle(Event::Attached(
+            id,
+            Wiring {
+                outbox,
+                closer: Closer::default(),
+            },
+        ));
         inbox
     }
 
