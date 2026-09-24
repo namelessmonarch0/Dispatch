@@ -445,3 +445,37 @@ fn a_finished_pty_is_one_whose_output_is_complete() {
         String::from_utf8_lossy(&output)
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn a_flood_is_handed_over_a_budget_at_a_time() {
+    // Three megabytes as fast as the shell can print them, drained slowly.
+    // Before, the first drain took whatever had piled up in an unbounded
+    // channel; now each takes a bounded slice, and nothing is lost.
+    const TOTAL: usize = 3_000_000;
+    let mut pty = Pty::spawn(
+        &shell(&format!("head -c {TOTAL} /dev/zero | tr '\\0' x")),
+        &cwd(),
+        Size::new(80, 24),
+    )
+    .expect("the shell starts");
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut received = 0;
+    while received < TOTAL {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {received} of {TOTAL} bytes arrived"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        let chunk = pty.drain();
+        assert!(
+            chunk.len() <= DRAIN_BUDGET + 8192,
+            "one drain handed over {} bytes",
+            chunk.len()
+        );
+        received += chunk.iter().filter(|&&b| b == b'x').count();
+    }
+
+    assert_eq!(received, TOTAL, "every byte arrived, none twice");
+}

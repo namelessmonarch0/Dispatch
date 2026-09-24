@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, channel, sync_channel};
 use std::time::Duration;
 
 use dispatch_config::Launch;
@@ -31,6 +31,21 @@ use crate::vt::{Size, VtError, VtTerminal};
 /// more. A write into an empty queue is always taken, whatever its size: a
 /// paste bigger than the budget still reaches a pane that reads it.
 pub const INPUT_BUDGET: usize = 8 * 1024 * 1024;
+
+/// How many reads of output may wait between the reader thread and `drain`.
+///
+/// Full, the reader stops reading, the pseudoterminal's own buffer fills,
+/// and the child blocks on its next write: a pane that prints faster than it
+/// is drawn is slowed down, not held in memory.
+const OUTPUT_CHUNKS: usize = 32;
+
+/// The most output one [`Pty::drain`] hands over, give or take the read that
+/// crosses it.
+///
+/// Without a limit, draining a pane that prints without pause never
+/// finishes: the reader refills the channel as fast as it is emptied, and
+/// the daemon's loop never reaches its other panes.
+pub const DRAIN_BUDGET: usize = 128 * 1024;
 
 /// Failures while running a pseudoterminal.
 #[derive(Debug, thiserror::Error)]
@@ -100,6 +115,8 @@ pub struct Pty {
     input: Sender<Vec<u8>>,
     /// How many bytes are queued and not yet written.
     waiting: Arc<AtomicUsize>,
+    /// Bounded so a pane printing faster than it is drained is slowed rather
+    /// than stored: see [`OUTPUT_CHUNKS`].
     events: Receiver<PtyEvent>,
     size: Size,
     /// Process id of the child, used to terminate its whole tree.
@@ -179,7 +196,7 @@ impl Pty {
         let waiting = Arc::new(AtomicUsize::new(0));
         spawn_writer(writer, queued, Arc::clone(&waiting));
 
-        let (tx, events) = channel();
+        let (tx, events) = sync_channel(OUTPUT_CHUNKS);
         spawn_reader(reader, tx.clone());
         spawn_waiter(child, tx);
 
@@ -196,13 +213,14 @@ impl Pty {
         })
     }
 
-    /// Takes everything the child has produced.
+    /// Takes what the child has produced, up to about [`DRAIN_BUDGET`].
     ///
     /// Never blocks: a pane with nothing to say costs one failed receive.
+    /// What is left waits for the next call.
     pub fn drain(&mut self) -> Vec<u8> {
         let mut output = Vec::new();
 
-        loop {
+        while output.len() < DRAIN_BUDGET {
             match self.events.try_recv() {
                 Ok(PtyEvent::Output(bytes)) => output.extend_from_slice(&bytes),
                 Ok(PtyEvent::Exited(code)) => self.state = RunState::Exited(code),
@@ -472,7 +490,7 @@ fn answer_inherit_cursor_handshake(writer: &mut Box<dyn Write + Send>) {
 }
 
 /// Reads the pseudoterminal until end-of-file, forwarding bytes.
-fn spawn_reader(mut reader: Box<dyn Read + Send>, tx: Sender<PtyEvent>) {
+fn spawn_reader(mut reader: Box<dyn Read + Send>, tx: SyncSender<PtyEvent>) {
     std::thread::spawn(move || {
         // Large enough that a burst of output is a few reads rather than
         // hundreds, small enough not to sit idle holding memory per pane.
@@ -518,7 +536,7 @@ fn spawn_writer(
 }
 
 /// Waits for the child and reports its exit status.
-fn spawn_waiter(mut child: Box<dyn portable_pty::Child + Send + Sync>, tx: Sender<PtyEvent>) {
+fn spawn_waiter(mut child: Box<dyn portable_pty::Child + Send + Sync>, tx: SyncSender<PtyEvent>) {
     std::thread::spawn(move || {
         let code = match child.wait() {
             Ok(status) => {
