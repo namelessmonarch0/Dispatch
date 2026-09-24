@@ -90,10 +90,11 @@ const MAX_ANNOUNCING: usize = 32;
 /// go.
 ///
 /// On Unix both sockets are shut down, which also fails everything after.
-/// On Windows the pipe operations in flight are cancelled, and the pipe ends
-/// once the threads parked in them drop their halves -- which they do when
-/// their operation fails. A command transport's process tree is killed,
-/// which ends its pipes from the far side.
+/// On Windows the pipe operations in flight are cancelled and every one
+/// after fails before it starts; the pipes themselves end once the threads
+/// holding them drop their halves -- which they do when their operation
+/// fails. A command transport's process tree is killed, which ends its
+/// pipes from the far side.
 ///
 /// Cheap to clone; every clone ends the same connection, and closing twice
 /// does nothing. `Closer::default()` closes nothing: it is what a
@@ -552,12 +553,17 @@ impl Drop for Listener {
         // endpoint means no one else can either -- its socket file was
         // removed under it, or the accepting thread has already stopped --
         // and a join that nothing will wake would hang this drop for good.
-        let woken = imp::connect(&self.endpoint).is_ok();
+        //
+        // Held open until the join is done: Windows takes a connection that
+        // closed before the accept reached it for a probe and waits for the
+        // next one, which would never come.
+        let wake = imp::connect(&self.endpoint);
         if let Some(accepting) = self.accepting.take()
-            && woken
+            && wake.is_ok()
         {
             let _ = accepting.join();
         }
+        drop(wake);
     }
 }
 
@@ -711,7 +717,9 @@ mod imp {
     use std::io::{Read, Write};
     use std::os::windows::io::FromRawHandle;
     use std::path::Path;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{
         ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY,
@@ -740,21 +748,67 @@ mod imp {
         format!(r"\\.\pipe\dispatchd-{hash:016x}")
     }
 
-    pub(super) struct Stream(std::fs::File);
+    /// One pipe handle, and what it shares with every other handle
+    /// [`try_clone`] made onto the same pipe.
+    pub(super) struct Stream {
+        file: std::fs::File,
+        shutdown: Arc<Shutdown>,
+    }
+
+    /// How a pipe is ended from a handle other than the one in use.
+    ///
+    /// A cancel reaches only an operation already in the kernel, and does
+    /// not stay: one that arrives a moment before a thread issues its read
+    /// is lost, and the read parks as if nothing had happened. So ending is
+    /// a flag every operation checks first, and a count of the operations
+    /// past that check, which [`interrupt`] cancels until there are none.
+    #[derive(Default)]
+    struct Shutdown {
+        requested: AtomicBool,
+        in_flight: AtomicUsize,
+    }
+
+    impl Stream {
+        fn new(file: std::fs::File) -> Self {
+            Self {
+                file,
+                shutdown: Arc::default(),
+            }
+        }
+
+        /// Runs one operation on the pipe unless it has been ended.
+        ///
+        /// Counted before the flag is read, and the flag set before the
+        /// count is read, both sequentially consistent: either the operation
+        /// sees the pipe ended, or [`interrupt`] sees the operation.
+        fn unless_ended<T>(
+            &mut self,
+            operation: impl FnOnce(&mut std::fs::File) -> std::io::Result<T>,
+        ) -> std::io::Result<T> {
+            self.shutdown.in_flight.fetch_add(1, Ordering::SeqCst);
+            let result = if self.shutdown.requested.load(Ordering::SeqCst) {
+                Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted))
+            } else {
+                operation(&mut self.file)
+            };
+            self.shutdown.in_flight.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+    }
 
     impl Read for Stream {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            self.0.read(buf)
+            self.unless_ended(|file| file.read(buf))
         }
     }
 
     impl Write for Stream {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.write(buf)
+            self.unless_ended(|file| file.write(buf))
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
-            self.0.flush()
+            self.unless_ended(std::io::Write::flush)
         }
     }
 
@@ -842,7 +896,7 @@ mod imp {
                 .read(true)
                 .write(true)
                 .open(&name)
-                .map(Stream);
+                .map(Stream::new);
 
             let error = match opened {
                 Ok(stream) => return Ok(stream),
@@ -935,24 +989,54 @@ mod imp {
 
         // SAFETY: the handle is a connected instance and ownership moves into
         // the File, which closes it exactly once.
-        Ok(Stream(unsafe {
+        Ok(Stream::new(unsafe {
             std::fs::File::from_raw_handle(handle as _)
         }))
     }
 
     /// A second handle onto the same pipe, for a [`super::Closer`].
     pub(super) fn try_clone(stream: &Stream) -> std::io::Result<Stream> {
-        stream.0.try_clone().map(Stream)
+        Ok(Stream {
+            file: stream.file.try_clone()?,
+            shutdown: Arc::clone(&stream.shutdown),
+        })
     }
 
-    /// Cancels what is in flight on the pipe, from whichever thread issued it.
+    /// How long ending a pipe keeps cancelling an operation that will not
+    /// finish.
+    ///
+    /// An operation past the flag reaches the kernel within microseconds,
+    /// and the next cancel ends it; this bounds the wait for one that some
+    /// fault keeps from being cancelled, so a close cannot hang on it.
+    const CANCEL_PATIENCE: Duration = Duration::from_secs(1);
+
+    /// Ends the pipe for every handle onto it: what is in flight is
+    /// cancelled, and everything after fails before it starts.
     pub(super) fn interrupt(stream: &Stream) {
+        stream.shutdown.requested.store(true, Ordering::SeqCst);
+
+        // An operation that read the flag just before it was set may not
+        // have reached the kernel yet, where a cancel would find it; cancel
+        // again until nothing is in flight.
+        let deadline = Instant::now() + CANCEL_PATIENCE;
+        loop {
+            cancel(stream);
+            if stream.shutdown.in_flight.load(Ordering::SeqCst) == 0 || Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Cancels what is in flight on the pipe now, from whichever thread
+    /// issued it, and nothing after.
+    fn cancel(stream: &Stream) {
         use std::os::windows::io::AsRawHandle;
 
         // SAFETY: the handle is a live duplicate the caller holds for the
         // length of the call, and cancelling reads or writes no memory of
         // ours.
-        unsafe { CancelIoEx(stream.0.as_raw_handle() as HANDLE, std::ptr::null()) };
+        unsafe { CancelIoEx(stream.file.as_raw_handle() as HANDLE, std::ptr::null()) };
     }
 
     /// Reads a connection's preamble, giving up after `patience`.
@@ -961,8 +1045,9 @@ mod imp {
     /// cancels it. The watchdog holds its own handle, so the one it cancels
     /// cannot have been closed and reused under it; it is joined before this
     /// returns, so it cannot cancel anything the paired connection does
-    /// later; and a cancel that lands just after the read finished finds
-    /// nothing in flight.
+    /// later; and it cancels rather than [`interrupt`]s, so one that lands
+    /// just after the read finished finds nothing in flight and leaves the
+    /// pipe usable.
     pub(super) fn read_preamble(
         stream: &mut Stream,
         patience: std::time::Duration,
@@ -973,7 +1058,7 @@ mod imp {
 
         let watchdog = std::thread::spawn(move || {
             if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = wait.recv_timeout(patience) {
-                interrupt(&watched);
+                cancel(&watched);
             }
         });
 
@@ -1614,17 +1699,15 @@ mod tests {
             "the parked read is still parked"
         );
 
-        // Unix shuts the sockets down for good. Windows cancels what was in
-        // flight; the pipe itself ends when the threads holding it let go.
-        if cfg!(unix) {
-            assert!(
-                writer
-                    .write_all(&[0u8; 64 * 1024])
-                    .and_then(|()| writer.flush())
-                    .is_err(),
-                "a write after closing still went through"
-            );
-        }
+        // Everything after the close fails too, on both platforms: a
+        // connection a closer has ended is not half-alive.
+        assert!(
+            writer
+                .write_all(&[0u8; 64 * 1024])
+                .and_then(|()| writer.flush())
+                .is_err(),
+            "a write after closing still went through"
+        );
     }
 
     #[test]
