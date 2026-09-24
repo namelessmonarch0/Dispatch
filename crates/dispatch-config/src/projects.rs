@@ -50,27 +50,7 @@ impl Saved {
 
 /// Reads the whole file. No file is an empty one.
 fn read(dir: &Path) -> Result<Saved, ConfigError> {
-    let path = dir.join(FILE);
-
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Saved::default()),
-        Err(source) => return Err(ConfigError::Io { path, source }),
-    };
-
-    toml::from_str(&text).map_err(|source| ConfigError::Toml { path, source })
-}
-
-/// Writes the whole file.
-fn write(dir: &Path, saved: &Saved) -> Result<(), ConfigError> {
-    std::fs::create_dir_all(dir).map_err(|source| ConfigError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
-
-    let path = dir.join(FILE);
-    let text = toml::to_string_pretty(saved).expect("lists of paths serialise");
-    std::fs::write(&path, text).map_err(|source| ConfigError::Io { path, source })
+    crate::store::read(dir, FILE)
 }
 
 /// This machine's remembered project roots, oldest first.
@@ -97,9 +77,10 @@ pub fn load_on(dir: &Path, machine: &str) -> Result<Vec<PathBuf>, ConfigError> {
 /// Writes this machine's list, replacing whatever was there — and leaving
 /// every remote machine's alone.
 pub fn save(dir: &Path, roots: &[PathBuf]) -> Result<(), ConfigError> {
-    let mut saved = read(dir)?;
-    saved.roots = roots.to_vec();
-    write(dir, &saved)
+    crate::store::update(dir, FILE, |saved: &mut Saved| {
+        saved.roots = roots.to_vec();
+        Ok(((), true))
+    })
 }
 
 /// Adds `root` to this machine's list, if it is not already on it.
@@ -131,12 +112,10 @@ pub fn forget_on(dir: &Path, machine: &str, root: &Path) -> Result<bool, ConfigE
 ///
 /// Answers whether it had one.
 pub fn forget_machine(dir: &Path, machine: &str) -> Result<bool, ConfigError> {
-    let mut saved = read(dir)?;
-    if saved.machines.remove(machine).is_none() {
-        return Ok(false);
-    }
-    write(dir, &saved)?;
-    Ok(true)
+    crate::store::update(dir, FILE, |saved: &mut Saved| {
+        let had = saved.machines.remove(machine).is_some();
+        Ok((had, had))
+    })
 }
 
 /// Shared implementation for adding `root` to either this machine's or a remote machine's list.
@@ -144,16 +123,15 @@ pub fn forget_machine(dir: &Path, machine: &str) -> Result<bool, ConfigError> {
 /// `machine: None` means this machine's top-level list; `machine: Some(name)` means that remote
 /// machine's table in the machines map. This one body serves both `remember` and `remember_on`.
 fn remember_in(dir: &Path, machine: Option<&str>, root: &Path) -> Result<bool, ConfigError> {
-    let mut saved = read(dir)?;
-    let list = saved.list_mut(machine);
+    crate::store::update(dir, FILE, |saved: &mut Saved| {
+        let list = saved.list_mut(machine);
+        if list.iter().any(|kept| kept == root) {
+            return Ok((false, false));
+        }
 
-    if list.iter().any(|kept| kept == root) {
-        return Ok(false);
-    }
-
-    list.push(root.to_path_buf());
-    write(dir, &saved)?;
-    Ok(true)
+        list.push(root.to_path_buf());
+        Ok((true, true))
+    })
 }
 
 /// Shared implementation for removing `root` from either this machine's or a remote machine's list.
@@ -161,17 +139,14 @@ fn remember_in(dir: &Path, machine: Option<&str>, root: &Path) -> Result<bool, C
 /// `machine: None` means this machine's top-level list; `machine: Some(name)` means that remote
 /// machine's table in the machines map. This one body serves both `forget` and `forget_on`.
 fn forget_in(dir: &Path, machine: Option<&str>, root: &Path) -> Result<bool, ConfigError> {
-    let mut saved = read(dir)?;
-    let list = saved.list_mut(machine);
-    let before = list.len();
+    crate::store::update(dir, FILE, |saved: &mut Saved| {
+        let list = saved.list_mut(machine);
+        let before = list.len();
+        list.retain(|kept| kept != root);
 
-    list.retain(|kept| kept != root);
-    if list.len() == before {
-        return Ok(false);
-    }
-
-    write(dir, &saved)?;
-    Ok(true)
+        let forgot = list.len() != before;
+        Ok((forgot, forgot))
+    })
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ pub mod defaults;
 pub mod harness;
 pub mod machines;
 pub mod projects;
+mod store;
 
 /// Shared by this crate's test modules, so there is one temporary-directory
 /// counter rather than one per module.
