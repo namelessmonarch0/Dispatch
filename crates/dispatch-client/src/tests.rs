@@ -944,6 +944,87 @@ fn a_dial_that_never_answers_leaves_no_process_behind() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A process this one has started since `before` that has started one of
+/// its own, followed by everything below it.
+///
+/// Found while it runs: once a tree has been ended there is nothing left to
+/// name it by, and a test that never saw it would prove nothing.
+fn tree_started_since(before: &[u32]) -> Vec<u32> {
+    let me = std::process::id();
+    let deadline = Instant::now() + PATIENCE;
+
+    loop {
+        for pid in dispatch_os::process::descendants(me) {
+            if before.contains(&pid) {
+                continue;
+            }
+            let below = dispatch_os::process::descendants(pid);
+            if !below.is_empty() {
+                return std::iter::once(pid).chain(below).collect();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the dialled command never started anything"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(windows),
+    ignore = "Unix has its own: a_dial_that_never_answers_leaves_no_process_behind"
+)]
+fn a_command_dial_given_up_on_leaves_no_process_behind_on_windows() {
+    // The test above, where a dial's tree is a job rather than a process
+    // group. Walking away from the handshake has to end the job -- the
+    // command and what it started -- or the supervisor, dialling again every
+    // couple of seconds, leaves one tree behind per attempt.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Spelled for both platforms so it can be run on Unix by hand, with
+    // `--ignored`; there the tree is a process group instead.
+    let (program, args): (OsString, Vec<OsString>) = if cfg!(windows) {
+        (
+            "cmd.exe".into(),
+            vec!["/d".into(), "/c".into(), "ping -n 30 127.0.0.1 >nul".into()],
+        )
+    } else {
+        ("sh".into(), vec!["-c".into(), "sleep 30 & sleep 30".into()])
+    };
+
+    let before = dispatch_os::process::descendants(std::process::id());
+    // Long enough for a cold `cmd.exe` to have started `ping` by the time
+    // the handshake is given up on: the tree has to be seen alive first.
+    let dial = Dial::Command { program, args };
+    let dialling = std::thread::spawn(move || {
+        connect_within("test", Role::Interface, &dial, Duration::from_secs(5)).map(|_| ())
+    });
+
+    let tree = tree_started_since(&before);
+
+    let dialled = dialling.join().expect("the dial does not panic");
+    assert!(
+        matches!(dialled, Err(ClientError::Handshake(_))),
+        "expected the handshake to time out, got {dialled:?}"
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while tree
+        .iter()
+        .any(|&pid| dispatch_os::process::is_running(pid))
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        tree.iter()
+            .all(|&pid| !dispatch_os::process::is_running(pid)),
+        "the dial's process tree outlived the handshake that walked away from it: {tree:?}"
+    );
+}
+
 #[test]
 #[cfg(unix)]
 fn a_connection_given_up_on_leaves_no_process_behind() {

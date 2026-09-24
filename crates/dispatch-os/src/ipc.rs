@@ -2018,6 +2018,61 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(windows)]
+    fn a_closer_ends_a_command_transport_and_everything_it_started() {
+        // The test above, where the transport's tree is a job: closing ends
+        // the job, so the read parked on the command's stdout returns, and
+        // nothing the command started is left running -- or holding the
+        // pipe that read waits on.
+        let connection = Connection::over_command(
+            std::ffi::OsStr::new("cmd.exe"),
+            &[
+                std::ffi::OsString::from("/d"),
+                std::ffi::OsString::from("/c"),
+                std::ffi::OsString::from("ping -n 30 127.0.0.1 >nul"),
+            ],
+        )
+        .expect("cmd.exe exists");
+        let pid = connection
+            .child_id()
+            .expect("a command transport has a child");
+        let closer = connection.closer();
+        let (reader, _writer) = connection.split();
+        let parked = reading(reader);
+
+        let deadline = std::time::Instant::now() + PATIENCE;
+        let everyone = loop {
+            let below = crate::process::descendants(pid);
+            if !below.is_empty() {
+                break std::iter::once(pid).chain(below).collect::<Vec<_>>();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cmd.exe never started ping"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        closer.close();
+
+        assert_eq!(
+            parked.recv_timeout(PATIENCE),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "the read on a closed command's stdout is still parked"
+        );
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while everyone.iter().any(|p| crate::process::is_running(*p))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            everyone.iter().all(|p| !crate::process::is_running(*p)),
+            "a process behind the closed transport outlived it: {everyone:?}"
+        );
+    }
+
     /// Whether anything is left of the process group `leader` leads, an
     /// unreaped leader included.
     #[cfg(unix)]
