@@ -2391,6 +2391,99 @@ fn a_stalled_pane_does_not_stall_the_daemon() {
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 
+/// A client that says `Ping` for ever, counting the frames it has begun.
+struct EndlessPings {
+    frame: Vec<u8>,
+    at: usize,
+    begun: Arc<AtomicUsize>,
+}
+
+impl Read for EndlessPings {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.at == 0 {
+            self.begun.fetch_add(1, Ordering::Relaxed);
+        }
+        let n = buf.len().min(self.frame.len() - self.at);
+        buf[..n].copy_from_slice(&self.frame[self.at..self.at + n]);
+        self.at = (self.at + n) % self.frame.len();
+        Ok(n)
+    }
+}
+
+/// Waits for `count` to reach `floor` and then stop moving, and says where
+/// it stopped.
+///
+/// Stillness alone could be a thread the scheduler set aside for a moment
+/// on a loaded machine; the floor rules that out. Gives up after ten
+/// seconds with wherever it has got to: a count that never reaches the
+/// floor, or never stops past it, is what the caller asserts against, not
+/// a hang.
+fn settled(count: &AtomicUsize, floor: usize) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = count.load(Ordering::Relaxed);
+    let mut still_since = Instant::now();
+
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+        let now = count.load(Ordering::Relaxed);
+        if now != last {
+            last = now;
+            still_since = Instant::now();
+        } else if last >= floor && still_since.elapsed() >= Duration::from_millis(300) {
+            break;
+        }
+    }
+
+    last
+}
+
+#[test]
+fn a_client_outrunning_a_busy_loop_waits_at_the_event_backlog() {
+    // The loop is never run here, which is how a loop busy with something
+    // else looks to a client's reader thread. With nothing taking events,
+    // the reader may queue EVENT_BACKLOG of them -- its attach and then its
+    // requests -- and must then wait to hand over the one it has just read,
+    // reading nothing further. Unbounded, a client sending faster than the
+    // daemon acts would be queued for without limit.
+    let (daemon, _, _dir) = daemon("backlog");
+
+    let mut frame = Vec::new();
+    Frame::write(&mut frame, &ClientMessage::Ping { token: 1 }).expect("a ping encodes");
+    let begun = Arc::new(AtomicUsize::new(0));
+    let reader = EndlessPings {
+        frame,
+        at: 0,
+        begun: Arc::clone(&begun),
+    };
+    let connection = Connection::from_halves(Box::new(reader), Box::new(std::io::sink()));
+    spawn_client(
+        1,
+        connection,
+        &daemon.sender,
+        &Arc::new(AtomicUsize::new(0)),
+    );
+
+    // The attach takes a place, so EVENT_BACKLOG - 1 requests are queued and
+    // one more has been read and is waiting to join them.
+    assert_eq!(
+        settled(&begun, EVENT_BACKLOG),
+        EVENT_BACKLOG,
+        "the reader should stop once the backlog is full"
+    );
+
+    // One place freed lets exactly one more through: the reader was waiting
+    // on the backlog, not finished or stuck on anything else.
+    assert!(
+        matches!(daemon.events.try_recv(), Ok(Event::Attached(1, _))),
+        "the attach is first in the queue"
+    );
+    assert_eq!(
+        settled(&begun, EVENT_BACKLOG + 1),
+        EVENT_BACKLOG + 1,
+        "one place freed should let one more request in"
+    );
+}
+
 use std::io::{Read, Write};
 
 /// A daemon serving a real endpoint on a thread of its own, stopped when
