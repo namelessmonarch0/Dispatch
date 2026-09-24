@@ -3563,6 +3563,97 @@ fn a_command_that_becomes_a_batch_file_while_asking_is_refused_at_approval() {
     );
 }
 
+/// A daemon whose delegated pane was closed while its task's file could not
+/// be removed, as on Windows while a killed agent still holds it open: here
+/// the directory is made read-only for the close.
+///
+/// Returns the daemon, the task directory (read-only again only if the
+/// caller makes it so), the file left behind, and the test's directory. `None`
+/// when permissions stop nobody, as for root.
+#[cfg(unix)]
+fn with_a_task_file_the_close_left(label: &str) -> Option<(Daemon, PathBuf, PathBuf, TempDir)> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let hold = "id = \"hold\"\ndisplay_name = \"Hold\"\ncommand = \"sh\"\n\n\
+                [task]\nargs = [\"-c\", 'exec sleep 30 < \"$DISPATCH_TASK_FILE\"']\n\
+                input = \"file\"\n";
+    let (mut daemon, ui, caller, dir) =
+        delegating_to(label, &[("hold", hold.to_string())], "hold", "a task");
+    let request = pending(&drain(&ui)).expect("the interface is asked");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+    let pane = outcomes(&drain(&caller))
+        .into_iter()
+        .find_map(|o| match o {
+            DelegateOutcome::Approved { pane } => Some(pane),
+            _ => None,
+        })
+        .expect("the subagent started");
+
+    let tasks = dir.0.join("tasks");
+    let file = std::fs::read_dir(&tasks)
+        .expect("the task directory exists")
+        .flatten()
+        .map(|entry| entry.path())
+        .next()
+        .expect("the task was written down");
+
+    let set = |mode| {
+        std::fs::set_permissions(&tasks, std::fs::Permissions::from_mode(mode))
+            .expect("permissions change");
+    };
+    set(0o500);
+    if std::fs::write(tasks.join("probe"), "").is_ok() {
+        set(0o700);
+        eprintln!("skipped: permissions do not stop this user writing");
+        return None;
+    }
+
+    daemon.request_for_test(1, ClientMessage::ClosePane { pane });
+    assert!(file.exists(), "the close could remove it after all");
+    set(0o700);
+
+    Some((daemon, tasks, file, dir))
+}
+
+#[test]
+#[cfg(unix)]
+fn a_task_file_a_closed_pane_left_is_removed_on_a_later_pass() {
+    let Some((mut daemon, _tasks, file, _dir)) = with_a_task_file_the_close_left("retry-pass")
+    else {
+        return;
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while file.exists() && Instant::now() < deadline {
+        daemon.tick();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!file.exists(), "the task's file is still there");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_task_file_a_closed_pane_left_is_removed_at_shutdown() {
+    let Some((mut daemon, _tasks, file, _dir)) = with_a_task_file_the_close_left("retry-shutdown")
+    else {
+        return;
+    };
+
+    // Asked to stop before the loop takes a single pass: only the way out
+    // is left to try again.
+    daemon.shutdown_handle().request();
+    daemon.run();
+
+    assert!(!file.exists(), "the task's file outlived the daemon");
+}
+
 #[test]
 fn a_daemon_that_starts_serving_clears_away_task_files_left_behind() {
     // A daemon that was killed never dropped its panes, so their task files

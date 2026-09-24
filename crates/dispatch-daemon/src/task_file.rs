@@ -2,6 +2,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use dispatch_core::RequestId;
 
@@ -15,15 +16,67 @@ const SUFFIX: &str = ".txt";
 ///
 /// Held by the pane running the task: the file lives exactly as long as
 /// something might still read it, and a daemon that stops leaves none
-/// behind.
+/// behind. One that cannot be removed then -- on Windows, while a process
+/// being killed still holds it open -- goes to its [`Leftovers`] to be tried
+/// again.
 #[derive(Debug)]
 pub struct TaskFile {
     path: PathBuf,
+    leftovers: Leftovers,
+}
+
+/// Task files whose removal failed, to be tried again.
+///
+/// Shared by every [`TaskFile`] a daemon writes, which puts itself here when
+/// dropping it could not remove it; the daemon tries them again while it
+/// runs, and once more on its way out.
+#[derive(Debug, Clone, Default)]
+pub struct Leftovers(Arc<Mutex<Vec<PathBuf>>>);
+
+impl Leftovers {
+    /// Whether nothing is waiting to be removed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    /// Tries to remove each once more, keeping those that still refuse.
+    pub fn retry(&self) {
+        self.lock().retain(|path| match std::fs::remove_file(path) {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "removed a task's file on a later try");
+                false
+            }
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        });
+    }
+
+    /// Says which are still there, for a daemon that is stopping: the next
+    /// to serve this configuration sweeps them.
+    pub fn report(&self) {
+        for path in self.lock().iter() {
+            tracing::warn!(
+                path = %path.display(),
+                "a task's file is left behind; the next daemon to start removes it"
+            );
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<PathBuf>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 impl TaskFile {
     /// Writes `task` to a new file in `dir` that only this user can read.
-    pub fn write(dir: &Path, request: RequestId, task: &str) -> std::io::Result<Self> {
+    ///
+    /// Should it outlive its removal, it is handed to `leftovers`.
+    pub fn write(
+        dir: &Path,
+        request: RequestId,
+        task: &str,
+        leftovers: &Leftovers,
+    ) -> std::io::Result<Self> {
         dispatch_os::paths::create_private_dir(dir)?;
 
         let path = dir.join(format!("{PREFIX}{request}{SUFFIX}"));
@@ -31,7 +84,10 @@ impl TaskFile {
         // Held only once the file is this call's own: a write that fails
         // part-way removes what it created, and a name that was already
         // taken is left to whoever took it.
-        let file = Self { path };
+        let file = Self {
+            path,
+            leftovers: leftovers.clone(),
+        };
         handle.write_all(task.as_bytes())?;
         handle.flush()?;
 
@@ -51,7 +107,12 @@ impl Drop for TaskFile {
         if let Err(error) = std::fs::remove_file(&self.path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            tracing::warn!(%error, path = %self.path.display(), "failed to remove a task's file");
+            tracing::warn!(
+                %error,
+                path = %self.path.display(),
+                "failed to remove a task's file; trying again later"
+            );
+            self.leftovers.lock().push(std::mem::take(&mut self.path));
         }
     }
 }

@@ -20,7 +20,7 @@ use crate::budgets::Budgets;
 use crate::delegation::Pending;
 use crate::outbox::{Inbox, Outbox, Refused};
 use crate::pane::DaemonPane;
-use crate::task_file::TaskFile;
+use crate::task_file::{Leftovers, TaskFile};
 
 /// How much of a subagent's output its caller is given.
 ///
@@ -45,6 +45,16 @@ const TICK: Duration = Duration::from_millis(8);
 /// path there, not a fallback, and it has to be long enough for ConPTY's pipe to
 /// catch up with the process object.
 const TAIL_GRACE: Duration = Duration::from_millis(250);
+
+/// How often task files that could not be removed are tried again.
+///
+/// Often enough that one outlives the process holding it by about this
+/// long, and seldom enough that a file that keeps refusing costs nothing.
+const RETRY_LEFTOVERS: Duration = Duration::from_secs(1);
+
+/// How long a stopping daemon keeps trying to remove task files its panes'
+/// processes, just ended, still held.
+const LEFTOVERS_AT_SHUTDOWN: Duration = Duration::from_secs(2);
 
 /// How many events may wait for the loop.
 ///
@@ -238,6 +248,10 @@ pub struct Daemon {
     blanket: HashSet<PaneId>,
     /// Where a task delivered in a file is written.
     task_dir: PathBuf,
+    /// Task files whose removal failed, to be tried again.
+    leftovers: Leftovers,
+    /// When `leftovers` was last tried.
+    leftovers_tried: Instant,
 }
 
 impl Daemon {
@@ -271,6 +285,8 @@ impl Daemon {
             pending: HashMap::new(),
             blanket: HashSet::new(),
             task_dir: default_task_dir(),
+            leftovers: Leftovers::default(),
+            leftovers_tried: Instant::now(),
         }
     }
 
@@ -402,6 +418,21 @@ impl Daemon {
         }
 
         self.close_all_panes();
+        self.clear_leftovers_on_the_way_out();
+    }
+
+    /// Tries once more to remove task files a pane's process still held,
+    /// for as long as the processes just ended may take to let go.
+    fn clear_leftovers_on_the_way_out(&mut self) {
+        let deadline = Instant::now() + LEFTOVERS_AT_SHUTDOWN;
+        loop {
+            self.leftovers.retry();
+            if self.leftovers.is_empty() || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        self.leftovers.report();
     }
 
     /// Terminates every pane, so nothing outlives the daemon.
@@ -1165,25 +1196,29 @@ impl Daemon {
         let mut launch = run.launch;
         let task_file = match run.input {
             TaskInput::Argument => None,
-            TaskInput::File => match TaskFile::write(&self.task_dir, request, task) {
-                Ok(file) => {
-                    launch.env.insert(
-                        dispatch_config::TASK_FILE_ENV.to_string(),
-                        file.for_redirect(),
-                    );
-                    Some(file)
+            TaskInput::File => {
+                match TaskFile::write(&self.task_dir, request, task, &self.leftovers) {
+                    Ok(file) => {
+                        launch.env.insert(
+                            dispatch_config::TASK_FILE_ENV.to_string(),
+                            file.for_redirect(),
+                        );
+                        Some(file)
+                    }
+                    Err(error) => {
+                        self.resolve(
+                            request,
+                            caller,
+                            DelegateOutcome::Refused {
+                                reason: format!(
+                                    "could not write the task down for {harness}: {error}"
+                                ),
+                            },
+                        );
+                        return;
+                    }
                 }
-                Err(error) => {
-                    self.resolve(
-                        request,
-                        caller,
-                        DelegateOutcome::Refused {
-                            reason: format!("could not write the task down for {harness}: {error}"),
-                        },
-                    );
-                    return;
-                }
-            },
+            }
         };
 
         let session = match Pty::spawn(&launch, &root, Size::new(size.0, size.1)) {
@@ -1516,6 +1551,11 @@ impl Daemon {
         }
 
         self.expire_requests();
+
+        if !self.leftovers.is_empty() && self.leftovers_tried.elapsed() >= RETRY_LEFTOVERS {
+            self.leftovers_tried = Instant::now();
+            self.leftovers.retry();
+        }
     }
 
     /// Hangs up on clients that ran out of time: one that never said
