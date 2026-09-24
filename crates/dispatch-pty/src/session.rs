@@ -49,9 +49,10 @@ pub const DRAIN_BUDGET: usize = 128 * 1024;
 /// Failures while running a pseudoterminal.
 #[derive(Debug, thiserror::Error)]
 pub enum PtyError {
-    /// The pseudoterminal could not be opened or resized.
-    #[error("failed to open a pseudoterminal: {0}")]
-    Open(#[source] anyhow::Error),
+    /// The pseudoterminal could not be resized. A pseudoterminal that could
+    /// not be opened is reported as [`PtyError::Spawn`].
+    #[error("failed to resize the pseudoterminal: {0}")]
+    Resize(#[source] anyhow::Error),
 
     /// The harness process could not be started.
     #[error("failed to start {command:?}: {source}")]
@@ -275,7 +276,7 @@ impl Pty {
 
         self.terminal
             .resize(size.rows, size.cols)
-            .map_err(|e| PtyError::Open(e.into()))?;
+            .map_err(|e| PtyError::Resize(e.into()))?;
 
         self.size = size;
         Ok(())

@@ -637,3 +637,18 @@ fn dropping_a_pane_that_has_exited_ends_what_it_left_running() {
         "what an exited pane left running outlived the pane: {left:?}"
     );
 }
+
+#[test]
+fn a_failed_resize_says_it_was_a_resize() {
+    // Opening failures are reported as failures to start; only a resize
+    // raises this, and a message about opening sends whoever reads it the
+    // wrong way.
+    let error = PtyError::Resize(anyhow::anyhow!("HRESULT 0x80070057"));
+
+    assert!(
+        error
+            .to_string()
+            .starts_with("failed to resize the pseudoterminal"),
+        "{error}"
+    );
+}
