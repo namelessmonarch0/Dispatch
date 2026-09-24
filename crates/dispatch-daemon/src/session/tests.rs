@@ -40,7 +40,8 @@ fn harnesses(dir: &std::path::Path) -> HarnessRegistry {
 
     // Puts its terminal in raw mode so input is buffered rather than
     // processed, says so, and never reads: an agent busy elsewhere when a
-    // paste arrives.
+    // paste arrives. On Windows it only never reads for itself; see
+    // `a_stalled_pane_does_not_stall_the_daemon` for why that is not enough.
     let stall = if cfg!(windows) {
         "id = \"stall\"\ndisplay_name = \"Stall\"\ncommand = \"cmd.exe\"\nargs = [\"/c\", \"echo READY & ping -n 30 127.0.0.1 >nul\"]\n"
     } else {
@@ -2402,6 +2403,13 @@ fn a_detached_client_cannot_act() {
     assert_eq!(daemon.pane_count(), 0);
 }
 
+/// Unix only, although `stall` has a Windows form: no program on Windows
+/// can stop its pane's input being read. The pipe a pane's input goes down
+/// is read by the pseudoconsole host, not by the program in the console,
+/// and the host moves what arrives into the console's input buffer whether
+/// or not anything reads that. The queue this test fills drains instead,
+/// and the refusal it ends on -- input past the budget, waiting for a pane
+/// that is not reading -- cannot be brought about.
 #[test]
 #[cfg(unix)]
 fn a_stalled_pane_does_not_stall_the_daemon() {
