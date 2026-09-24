@@ -75,6 +75,27 @@ impl FrameClock {
     }
 }
 
+/// Where task files go unless a test says otherwise.
+///
+/// Dispatch's own directory for them, the user's alone. With no home
+/// directory to put that under, a directory of Dispatch's own inside the
+/// temporary directory: `create_private_dir` refuses it if another user
+/// made it first, which it could not do for the temporary directory itself.
+fn default_task_dir() -> PathBuf {
+    match dispatch_os::paths::task_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            let fallback = std::env::temp_dir().join("dispatch-tasks");
+            tracing::warn!(
+                %error,
+                dir = %fallback.display(),
+                "no directory of Dispatch's own for task files; using one in the temporary directory"
+            );
+            fallback
+        }
+    }
+}
+
 /// Releases a client's place against `Budgets::max_clients` once nothing is
 /// left running on its behalf.
 ///
@@ -249,7 +270,7 @@ impl Daemon {
             budgets: Budgets::default(),
             pending: HashMap::new(),
             blanket: HashSet::new(),
-            task_dir: std::env::temp_dir(),
+            task_dir: default_task_dir(),
         }
     }
 
@@ -260,7 +281,7 @@ impl Daemon {
         self.budgets = budgets;
     }
 
-    /// Where task files are written: the system's temporary directory unless
+    /// Where task files are written: [`dispatch_os::paths::task_dir`] unless
     /// told otherwise.
     #[doc(hidden)]
     pub fn set_task_dir(&mut self, dir: PathBuf) {
@@ -315,7 +336,13 @@ impl Daemon {
     }
 
     /// Accepts connections until the listener fails, serving them all.
+    ///
+    /// First sweeps up the task files a daemon that did not stop cleanly
+    /// left behind: `listener` is bound, so this is the one daemon serving
+    /// this configuration, and nothing still means to hand those files over.
     pub fn serve(mut self, listener: Listener) -> Result<(), DaemonError> {
+        crate::task_file::sweep(&self.task_dir);
+
         let sender = self.sender.clone();
         let max_clients = self.budgets.max_clients;
         let live = Arc::new(AtomicUsize::new(0));

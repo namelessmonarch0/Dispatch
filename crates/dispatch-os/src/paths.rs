@@ -92,6 +92,26 @@ pub fn daemon_pid_file() -> Result<PathBuf, PathError> {
     Ok(config_dir()?.join("dispatchd.pid"))
 }
 
+/// Directory holding the files delegated tasks are handed over in.
+///
+/// Dispatch's own, and this user's alone once [`create_private_dir`] has
+/// made it: a task is whatever its user typed, and the system's temporary
+/// directory is shared with every account on the machine. Local rather than
+/// roaming, so a task never travels to a profile server.
+///
+/// Follows [`CONFIG_DIR_ENV`] when it is set, as [`log_file`] does, so a
+/// redirected configuration -- a test's, or a second daemon's -- keeps its
+/// tasks with it.
+pub fn task_dir() -> Result<PathBuf, PathError> {
+    if let Some(path) = std::env::var_os(CONFIG_DIR_ENV)
+        && !path.is_empty()
+    {
+        return Ok(PathBuf::from(path).join("tasks"));
+    }
+
+    Ok(project_dirs()?.data_local_dir().join("tasks"))
+}
+
 /// Resolves `path` into a form a child process can be started in.
 ///
 /// `Path::canonicalize` on Windows returns an extended-length path — `\\?\C:\…`
@@ -111,20 +131,24 @@ pub fn resolve(path: &Path) -> std::io::Result<PathBuf> {
 /// Creates a new file only this user can read or write.
 ///
 /// Refuses one that already exists: a name in a shared directory must not
-/// be one somebody else prepared. On Windows the file takes its directory's
-/// access list, and the directories Dispatch writes these in are the user's
-/// own.
+/// be one somebody else prepared. Private from the moment it exists, never
+/// narrowed afterwards: mode 0600 on Unix, and on Windows a protected DACL
+/// admitting this user alone, so nothing its directory admits reaches it.
 pub fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
     }
 
-    options.open(path)
+    #[cfg(windows)]
+    {
+        private::create_file(path)
+    }
 }
 
 /// Creates `path`, and any directory above it, for this user alone.
@@ -132,8 +156,123 @@ pub fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
 /// Where a delegated task's file is written: the task is whatever its user
 /// typed, and the directory is the first thing standing between it and
 /// every other account on the machine.
+///
+/// On Unix it is made 0700, and one that already exists is narrowed to
+/// that if this user owns it -- something less careful may have made it --
+/// and refused if another user does, since whoever owns a directory decides
+/// what happens to the files in it. On Windows a new one gets a protected
+/// DACL admitting this user alone; one that exists is left as it is, since
+/// each file in it is made private on its own.
 pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(path)
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+
+        let metadata = std::fs::metadata(path)?;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if metadata.uid() != me {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} belongs to another user, who could read or replace what is written there",
+                    path.display()
+                ),
+            ));
+        }
+        // The umask may have narrowed it further, which is fine; wider is
+        // not.
+        if metadata.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        private::create_dir(path)
+    }
+}
+
+/// The Windows half of [`create_private`] and [`create_private_dir`].
+#[cfg(windows)]
+mod private {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use std::path::Path;
+
+    use windows_sys::Win32::Foundation::{
+        ERROR_ALREADY_EXISTS, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
+    };
+
+    use crate::owner_only::OwnerOnly;
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    /// Created with its descriptor, so there is no moment at which it takes
+    /// what its directory admits.
+    pub(super) fn create_file(path: &Path) -> std::io::Result<std::fs::File> {
+        let security = OwnerOnly::new()?;
+        let attributes = security.attributes();
+        let name = wide(path);
+
+        // SAFETY: `name` is NUL-terminated and `attributes` points into
+        // `security`; both outlive the call. Not shared while it is open:
+        // it is written and closed before anything is started to read it.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                &attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // SAFETY: a handle this call just opened, owned by the File from
+        // here on and closed exactly once, by it.
+        Ok(unsafe { std::fs::File::from_raw_handle(handle as _) })
+    }
+
+    /// Created with its descriptor; one that already exists is left alone.
+    pub(super) fn create_dir(path: &Path) -> std::io::Result<()> {
+        let security = OwnerOnly::new()?;
+        let attributes = security.attributes();
+        let name = wide(path);
+
+        // SAFETY: as in `create_file`.
+        if unsafe { CreateDirectoryW(name.as_ptr(), &attributes) } != 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) && path.is_dir() {
+            return Ok(());
+        }
+        Err(error)
+    }
 }
 
 /// `path` as a shell's `<` needs it in the variable that names it.
@@ -423,6 +562,39 @@ mod tests {
                 sid: crate::owner_only::current_user_sid().expect("this process has a user"),
             }],
         }
+    }
+
+    #[test]
+    fn task_files_live_in_a_directory_of_dispatchs_own() {
+        // Not the system's temporary directory, which every account shares,
+        // and not the roaming profile, which travels to a server.
+        let _guard = crate::env_lock();
+        let previous = std::env::var_os(CONFIG_DIR_ENV);
+
+        // SAFETY: every test that sets or reads the variable holds ENV_LOCK.
+        unsafe { std::env::remove_var(CONFIG_DIR_ENV) };
+        let own = task_dir();
+        // SAFETY: as above.
+        unsafe { std::env::set_var(CONFIG_DIR_ENV, "/elsewhere/dispatch") };
+        let redirected = task_dir();
+        // SAFETY: as above.
+        unsafe {
+            match &previous {
+                Some(value) => std::env::set_var(CONFIG_DIR_ENV, value),
+                None => std::env::remove_var(CONFIG_DIR_ENV),
+            }
+        }
+
+        let dirs = project_dirs().expect("a home directory exists in the test environment");
+        assert_eq!(
+            own.expect("it resolves"),
+            dirs.data_local_dir().join("tasks")
+        );
+        assert_eq!(
+            redirected.expect("it resolves"),
+            PathBuf::from("/elsewhere/dispatch").join("tasks"),
+            "a redirected configuration keeps its tasks with it"
+        );
     }
 
     #[test]

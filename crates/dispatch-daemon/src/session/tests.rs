@@ -97,6 +97,7 @@ fn daemon(label: &str) -> (Daemon, ProjectId, TempDir) {
     let registry = harnesses(&dir.0.join("harnesses"));
 
     let mut daemon = Daemon::new(registry, "test-device");
+    daemon.set_task_dir(dir.0.join("tasks"));
     let root = dispatch_os::paths::resolve(&dir.0).expect("the temp dir resolves");
     let project = daemon.open_project(root);
 
@@ -1036,6 +1037,7 @@ fn daemon_with_limits(label: &str, limits: DelegationLimits) -> (Daemon, Project
     let registry = harnesses(&dir.0.join("harnesses"));
 
     let mut daemon = Daemon::with_limits(registry, "test-device", limits);
+    daemon.set_task_dir(dir.0.join("tasks"));
     let root = dispatch_os::paths::resolve(&dir.0).expect("the temp dir resolves");
     let project = daemon.open_project(root);
 
@@ -3562,6 +3564,44 @@ fn a_command_that_becomes_a_batch_file_while_asking_is_refused_at_approval() {
 }
 
 #[test]
+fn a_daemon_that_starts_serving_clears_away_task_files_left_behind() {
+    // A daemon that was killed never dropped its panes, so their task files
+    // stayed. The next to serve this configuration is the only one that
+    // could clear them, and nothing still means to hand them over. Only
+    // names Dispatch gives are touched.
+    let (daemon, _project, dir) = daemon("sweep");
+    let tasks = dir.0.join("tasks");
+    std::fs::create_dir_all(&tasks).expect("temp dir is writable");
+    let left = tasks.join(format!(
+        "dispatch-task-{}.txt",
+        dispatch_core::RequestId::new()
+    ));
+    let lookalike = tasks.join("dispatch-task-notes.txt");
+    let unrelated = tasks.join("notes.txt");
+    for path in [&left, &lookalike, &unrelated] {
+        std::fs::write(path, "a task").expect("temp dir is writable");
+    }
+
+    let listener = Listener::bind_to(&dir.0.join("d.sock")).expect("binding succeeds");
+    let shutdown = daemon.shutdown_handle();
+    let serving = std::thread::spawn(move || {
+        let _ = daemon.serve(listener);
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while left.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    shutdown.request();
+    serving.join().expect("the daemon stops");
+
+    assert!(!left.exists(), "a task file left behind is still there");
+    assert!(
+        lookalike.exists() && unrelated.exists(),
+        "a file Dispatch did not name was removed"
+    );
+}
+
+#[test]
 fn an_argument_form_is_never_handed_a_task_file() {
     // Its task is in its arguments. A DISPATCH_TASK_FILE in its environment
     // could only be stale -- inherited, or set in the harness file -- and a
@@ -3668,6 +3708,7 @@ fn a_task_form_that_would_put_the_task_on_cmds_command_line_is_refused() {
 
     let registry = HarnessRegistry::load_from_dir(&harness_dir).expect("loading succeeds");
     let mut daemon = Daemon::new(registry, "test-device");
+    daemon.set_task_dir(dir.0.join("tasks"));
     let project =
         daemon.open_project(dispatch_os::paths::resolve(&dir.0).expect("the temp dir resolves"));
     let ui = daemon.attach_for_test(1);
