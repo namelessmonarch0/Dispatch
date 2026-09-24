@@ -3293,13 +3293,19 @@ fn assert_a_task_reaches_the_capture_exactly(
 
     let captured = dir.0.join("captured.bin");
     let exe = std::env::current_exe().expect("the test binary");
+    // A harness's own spelling of the task file's variable, naming another
+    // file. On Windows it is the same variable, and the task's file has to
+    // win it; elsewhere it is another variable, and nothing reads it.
+    let decoy = dir.0.join("decoy.txt");
+    std::fs::write(&decoy, "not the task").expect("temp dir is writable");
     std::fs::write(
         harness_dir.join("capture.toml"),
         format!(
             "id = \"capture\"\ndisplay_name = \"Capture\"\ncommand = \"{command}\"\n\n\
-             [env]\nDISPATCH_CAPTURE_TO = '{}'\n\n\
+             [env]\nDISPATCH_CAPTURE_TO = '{}'\nDispatch_Task_File = '{}'\n\n\
              [task]\nargs = {}\ninput = \"file\"\n",
             captured.display(),
+            decoy.display(),
             args(&exe)
         ),
     )
@@ -3746,6 +3752,78 @@ fn only_the_daemon_holding_the_task_directory_sweeps_it() {
     let held = crate::task_file::claim(&tasks);
     assert!(held.is_some(), "a free directory was not claimed");
     assert!(!left.exists(), "the holder did not sweep");
+}
+
+#[test]
+fn a_harness_spelling_of_a_daemon_variable_is_the_one_its_agent_gets() {
+    // On Windows `Dispatch_Pane` and `DISPATCH_PANE` are one variable, so
+    // the harness's spelling replaces the daemon's rather than sitting
+    // beside it for the spawn to choose between. Elsewhere they are two.
+    let spelled = "id = \"spelled\"\ndisplay_name = \"Spelled\"\ncommand = \"agent\"\n\n\
+                   [env]\nDispatch_Pane = \"the harness's\"\n\n\
+                   [task]\nargs = [\"{task}\"]\n";
+    let (daemon, _ui, _caller, _dir) = delegating_to(
+        "case-variant-env",
+        &[("spelled", spelled.to_string())],
+        "spelled",
+        "anything",
+    );
+
+    let run = daemon
+        .task_run("spelled", "anything", PaneId::new())
+        .expect("the harness has a task form");
+    let spellings: Vec<_> = run
+        .launch
+        .env
+        .keys()
+        .filter(|name| name.eq_ignore_ascii_case("DISPATCH_PANE"))
+        .map(String::as_str)
+        .collect();
+
+    if cfg!(windows) {
+        assert_eq!(spellings, ["Dispatch_Pane"], "one variable, the harness's");
+    } else {
+        assert_eq!(
+            spellings,
+            ["DISPATCH_PANE", "Dispatch_Pane"],
+            "two variables"
+        );
+    }
+    assert_eq!(
+        run.launch.env.get("Dispatch_Pane").map(String::as_str),
+        Some("the harness's")
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(windows),
+    ignore = "a batch file runs through cmd.exe only on Windows"
+)]
+fn a_batch_file_on_a_path_spelled_as_windows_spells_it_is_refused() {
+    // `Path` is how Windows itself spells it, and so how a harness written
+    // there does.
+    let bin = TempDir::new("spelled-bin");
+    std::fs::write(bin.0.join("agent.CMD"), "@echo ran\r\n").expect("temp dir is writable");
+    let agent = bare_agent(&bin.0).replace("[env]\nPATH = ", "[env]\nPath = ");
+    assert!(agent.contains("Path = "), "the fixture spells it Path");
+
+    let (daemon, ui, caller, _dir) =
+        delegating_to("spelled-path", &[("agent", agent)], "agent", "anything");
+
+    let told = outcomes(&drain(&caller));
+    assert!(
+        told.iter().any(|o| matches!(
+            o,
+            DelegateOutcome::Refused { reason } if reason.to_lowercase().contains("agent.cmd")
+        )),
+        "the batch file on Path is refused: {told:?}"
+    );
+    assert!(
+        pending(&drain(&ui)).is_none(),
+        "nobody is asked to approve it"
+    );
+    assert_eq!(daemon.pane_count(), 1, "nothing started");
 }
 
 #[test]
