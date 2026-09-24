@@ -114,7 +114,8 @@ pub struct Pty {
     /// than stored: see [`OUTPUT_CHUNKS`].
     events: Receiver<PtyEvent>,
     size: Size,
-    /// Process id of the child, used to terminate its whole tree.
+    /// Process id of the child, used to terminate its whole tree, and
+    /// taken when it does.
     pid: Option<u32>,
     state: RunState,
     /// Whether everything the child printed has been delivered.
@@ -286,7 +287,7 @@ impl Pty {
         self.state
     }
 
-    /// The child's process id, while it is alive.
+    /// The child's process id, until the pane is terminated.
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
         self.pid
@@ -302,8 +303,12 @@ impl Pty {
     ///
     /// Agents start subprocesses, so killing only the direct child would leave
     /// them holding this pane's file descriptors.
+    ///
+    /// Only the first call does anything. Once the tree has been ended,
+    /// nothing keeps its pid from being given to another process, which a
+    /// second ending by that pid could reach.
     pub fn terminate(&mut self) {
-        let Some(pid) = self.pid else {
+        let Some(pid) = self.pid.take() else {
             return;
         };
 
@@ -317,9 +322,12 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        if matches!(self.state, RunState::Running) {
-            self.terminate();
-        }
+        // Whether or not the child is still running. One that exited on its
+        // own may have left something running, which this ends as closing
+        // the pane would. And on Windows its tree is recorded until it is
+        // ended -- its job, and a handle that keeps its pid its own -- which
+        // would otherwise be held for as long as the daemon runs.
+        self.terminate();
     }
 }
 
@@ -407,7 +415,7 @@ impl PtySession {
         self.pty.state()
     }
 
-    /// The child's process id, while it is alive.
+    /// The child's process id, until the pane is terminated.
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
         self.pty.pid()

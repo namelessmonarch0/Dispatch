@@ -574,3 +574,66 @@ fn terminating_a_pane_ends_everything_it_started() {
         "a process the pane started outlived it: {everyone:?}"
     );
 }
+
+/// A script that exits leaving a grandchild running, a moment after
+/// starting it: long enough for a test to see both.
+fn a_tree_that_outlives_its_shell() -> &'static str {
+    if cfg!(windows) {
+        // `start /b` runs the first ping beside cmd rather than waiting for
+        // it.
+        "start /b ping -n 30 127.0.0.1 >nul & ping -n 3 127.0.0.1 >nul"
+    } else {
+        // SIGHUP ignored, so the first sleep outlives its terminal's session
+        // leader.
+        "trap '' HUP; sleep 30 & sleep 2"
+    }
+}
+
+#[test]
+fn dropping_a_pane_that_has_exited_ends_what_it_left_running() {
+    let mut pty = Pty::spawn(
+        &shell(a_tree_that_outlives_its_shell()),
+        &cwd(),
+        Size::new(80, 24),
+    )
+    .expect("the shell starts");
+    let pid = pty.pid().expect("a running pane has a pid");
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while dispatch_os::process::descendants(pid).len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pane never started its children"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let below = dispatch_os::process::descendants(pid);
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while pty.state() == RunState::Running {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pane never exited"
+        );
+        pty.drain();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let left: Vec<u32> = below
+        .into_iter()
+        .filter(|p| dispatch_os::process::is_running(*p))
+        .collect();
+    assert!(!left.is_empty(), "nothing outlived the pane's shell");
+
+    drop(pty);
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while left.iter().any(|p| dispatch_os::process::is_running(*p))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        left.iter().all(|p| !dispatch_os::process::is_running(*p)),
+        "what an exited pane left running outlived the pane: {left:?}"
+    );
+}
