@@ -1184,8 +1184,11 @@ mod windows_tests {
         assert_ne!(assigned, 0, "{}", std::io::Error::last_os_error());
     }
 
-    /// Runs the helper contained, reads its answer, and ends its job.
-    fn run_contained_helper(label: &str, forbid_breakaway: bool) -> String {
+    /// Starts the helper contained, and waits for its answer.
+    fn start_contained_helper(
+        label: &str,
+        forbid_breakaway: bool,
+    ) -> (std::process::Child, String) {
         let dir = std::env::temp_dir().join(format!("dispatch-os-{label}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir is writable");
         let answer = dir.join("answer");
@@ -1205,17 +1208,79 @@ mod windows_tests {
         if forbid_breakaway {
             command.env(HELPER_FORBIDS_BREAKAWAY, "1");
         }
-        let mut helper = spawn_contained(&mut command).expect("the test binary runs");
+        let helper = spawn_contained(&mut command).expect("the test binary runs");
 
         let answered = eventually(Duration::from_secs(10), || answer.exists());
         let said = std::fs::read_to_string(&answer).unwrap_or_default();
-
-        terminate_tree(helper.id(), DEFAULT_GRACE).expect("the helper's job is ended");
-        let _ = helper.wait();
         let _ = std::fs::remove_dir_all(&dir);
-
         assert!(answered, "the helper never answered");
-        said
+
+        (helper, said)
+    }
+
+    /// A process held open, so that its pid cannot come to name another
+    /// once it has exited: a check made by pid alone after ending a job can
+    /// find whatever the system started next in its place.
+    struct Held(windows_sys::Win32::Foundation::HANDLE);
+
+    impl Held {
+        fn open(pid: u32) -> Self {
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+                PROCESS_TERMINATE,
+            };
+
+            // SAFETY: OpenProcess takes access flags and a pid by value.
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                    0,
+                    pid,
+                )
+            };
+            assert!(
+                !handle.is_null(),
+                "pid {pid} does not open: {}",
+                std::io::Error::last_os_error()
+            );
+            Self(handle)
+        }
+
+        fn has_exited(&self) -> bool {
+            use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+            // SAFETY: a live handle opened with SYNCHRONIZE; a zero wait only
+            // asks.
+            unsafe { WaitForSingleObject(self.0, 0) == WAIT_OBJECT_0 }
+        }
+
+        /// Whether it is in any job at all, as far as can be told.
+        fn in_a_job(&self) -> String {
+            use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+
+            let mut inside = 0;
+            // SAFETY: a live handle opened with
+            // PROCESS_QUERY_LIMITED_INFORMATION; a null job asks about any.
+            if unsafe { IsProcessInJob(self.0, std::ptr::null_mut(), &mut inside) } == 0 {
+                return format!("unknown ({})", std::io::Error::last_os_error());
+            }
+            (inside != 0).to_string()
+        }
+
+        fn end(&self) {
+            use windows_sys::Win32::System::Threading::TerminateProcess;
+
+            // SAFETY: a live handle opened with PROCESS_TERMINATE.
+            unsafe { TerminateProcess(self.0, 1) };
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            // SAFETY: opened in `open`, closed exactly once, here.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        }
     }
 
     /// The pid the helper started, or a failure saying what it said instead.
@@ -1275,14 +1340,19 @@ mod windows_tests {
         // A local `dispatchd --stdio` bridge runs contained, as every command
         // transport does, and starts the daemon it bridges to. That daemon
         // owns agents: ending the transport must not end them.
-        let detached = started(&run_contained_helper("breakaway", false));
+        let (mut helper, said) = start_contained_helper("breakaway", false);
+        let detached = Held::open(started(&said));
+        let in_a_job = detached.in_a_job();
 
-        let outlived = is_running(detached);
-        let _ = terminate_tree(detached, DEFAULT_GRACE);
+        terminate_tree(helper.id(), DEFAULT_GRACE).expect("the helper's job is ended");
+        let _ = helper.wait();
+
+        let outlived = !detached.has_exited();
+        detached.end();
         assert!(
             outlived,
-            "the detached process died with the job of the process that started it; \
-             this test process's own job: {}",
+            "the detached process died with the job of the process that started it \
+             (in a job before that: {in_a_job}); this test process's own job: {}",
             own_job()
         );
     }
@@ -1292,10 +1362,14 @@ mod windows_tests {
         // An OpenSSH session on Windows, or a CI runner, may run everything in
         // a job that refuses to let anything leave. The daemon must still
         // start there -- inside that job, since it cannot be anywhere else.
-        started(&run_contained_helper("no-breakaway", true));
+        let (mut helper, said) = start_contained_helper("no-breakaway", true);
+        let detached = Held::open(started(&said));
 
-        // Nothing to clean up: ending the helper's job ended the one nested
-        // in it, and what the helper started with it. Ending its pid again
-        // could end a stranger the system has since given that pid to.
+        terminate_tree(helper.id(), DEFAULT_GRACE).expect("the helper's job is ended");
+        let _ = helper.wait();
+
+        // Ending the helper's job ended the one nested in it, and what the
+        // helper started with it; this is only in case it did not.
+        detached.end();
     }
 }
