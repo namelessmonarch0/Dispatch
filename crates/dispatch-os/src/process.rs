@@ -77,6 +77,21 @@ pub fn terminate_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
     imp::terminate_tree(pid, grace)
 }
 
+/// Asks `pid`'s group or job to stop, and kills what is left after `grace`,
+/// without waiting afterwards for it to be gone.
+///
+/// For a caller that holds what the tree's own reaping needs. A command
+/// transport's closer signals under the lock that keeps its child's pid from
+/// being freed, and the reader half needs that same lock to wait for the
+/// child. On Linux a killed leader nobody has waited for is still a member
+/// of its group, so waiting for the group to vanish while holding the lock
+/// waits for a zombie only the blocked reaper could clear -- every time, for
+/// the whole of [`terminate_tree`]'s kill timeout. Signalling and letting go
+/// lets the reaper finish the job.
+pub(crate) fn signal_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
+    imp::signal_tree(pid, grace)
+}
+
 #[cfg(unix)]
 mod imp {
     use super::{Duration, ProcessError};
@@ -173,6 +188,18 @@ mod imp {
     }
 
     pub(super) fn terminate_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
+        signal_tree(pid, grace)?;
+
+        // SIGKILL is delivered asynchronously, so returning here would let the
+        // caller observe a process that is dead but not yet torn down. Callers
+        // close a pane expecting the tree to be gone, so wait for it. A tree
+        // that went within its grace is already gone, and this returns at once.
+        wait_for_group_to_exit(pid, KILL_TIMEOUT);
+
+        Ok(())
+    }
+
+    pub(super) fn signal_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
         let map = |source| ProcessError::Terminate { pid, source };
 
         if !signal_group(pid, libc::SIGTERM).map_err(map)? {
@@ -187,12 +214,6 @@ mod imp {
         }
 
         signal_group(pid, libc::SIGKILL).map_err(map)?;
-
-        // SIGKILL is delivered asynchronously, so returning here would let the
-        // caller observe a process that is dead but not yet torn down. Callers
-        // close a pane expecting the tree to be gone, so wait for it.
-        wait_for_group_to_exit(pid, KILL_TIMEOUT);
-
         Ok(())
     }
 }
@@ -282,6 +303,13 @@ mod imp {
         }
 
         Ok(())
+    }
+
+    /// The same as [`terminate_tree`] here: a terminated process signals its
+    /// handle whether or not anyone has waited for it, so there is no reaper
+    /// for the wait to hold up.
+    pub(super) fn signal_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
+        terminate_tree(pid, grace)
     }
 }
 

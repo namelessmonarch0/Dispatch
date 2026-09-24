@@ -148,9 +148,9 @@ impl Closer {
     /// Makes both halves of the connection fail, whoever holds them.
     ///
     /// Can block. On Windows it cancels until nothing is in flight on either
-    /// pipe, up to a second for each; for a command transport it waits out
-    /// the tree's teardown -- its grace, then up to two seconds for a killed
-    /// tree to go. Keep it off a thread that cannot afford that.
+    /// pipe, up to a second for each; for a command transport it gives the
+    /// tree its grace before killing it outright. Keep it off a thread that
+    /// cannot afford that.
     pub fn close(&self) {
         let ending = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
 
@@ -162,11 +162,17 @@ impl Closer {
                 }
             }
             Some(Ending::Process(pid)) => {
-                // Held across the kill, so the child cannot be reaped -- and
-                // its pid freed for a stranger -- while it is being signalled.
+                // Held across the signals, so the child cannot be reaped --
+                // and its pid freed for a stranger -- while it is being
+                // signalled. Only across the signals, though: the reader
+                // half's reap needs this lock to wait for the child, and on
+                // Linux a killed leader nobody has waited for keeps its group
+                // alive. Waiting here for the group to go would wait out the
+                // whole kill timeout for a zombie only that reap can clear,
+                // so the tree is signalled and the reap left to finish it.
                 let pid = pid.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(pid) = *pid
-                    && let Err(error) = crate::process::terminate_tree(pid, TEARDOWN_GRACE)
+                    && let Err(error) = crate::process::signal_tree(pid, TEARDOWN_GRACE)
                 {
                     tracing::debug!(%error, pid, "failed to end a command transport");
                 }
