@@ -3670,7 +3670,10 @@ fn a_daemon_that_starts_serving_clears_away_task_files_left_behind() {
     // names Dispatch gives are touched.
     let (daemon, _project, dir) = daemon("sweep");
     let tasks = dir.0.join("tasks");
-    std::fs::create_dir_all(&tasks).expect("temp dir is writable");
+    // Made as the daemon makes it. Made any other way on Windows under an
+    // elevated account -- as CI runs -- the Administrators group would own
+    // it, and the daemon rightly refuses a directory this user does not.
+    dispatch_os::paths::create_private_dir(&tasks).expect("temp dir is writable");
     let left = tasks.join(format!(
         "dispatch-task-{}.txt",
         dispatch_core::RequestId::new()
@@ -3727,7 +3730,10 @@ fn only_the_daemon_holding_the_task_directory_sweeps_it() {
     // so binding proves nothing about the directory. Its lock does.
     let dir = TempDir::new("sweep-lock");
     let tasks = dir.0.join("tasks");
-    std::fs::create_dir(&tasks).expect("temp dir is writable");
+    // Made as the daemon makes it. Made any other way on Windows under an
+    // elevated account -- as CI runs -- the Administrators group would own
+    // it, and the daemon rightly refuses a directory this user does not.
+    dispatch_os::paths::create_private_dir(&tasks).expect("temp dir is writable");
     let left = tasks.join(format!(
         "dispatch-task-{}.txt",
         dispatch_core::RequestId::new()
