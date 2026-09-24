@@ -257,12 +257,7 @@ impl HarnessDef {
     /// way to tell the agent what the task is, so there is nothing to run.
     #[must_use]
     pub fn task_launch_for(&self, os: &str, task: &str) -> Option<TaskRun> {
-        let form = self.task.as_ref()?;
-
-        let (args, input) = match form.platform.get(os) {
-            Some(override_) => (&override_.args, override_.input),
-            None => (&form.args, form.input),
-        };
+        let (args, input) = self.task_form_for(os)?;
         if args.is_empty() {
             return None;
         }
@@ -272,7 +267,7 @@ impl HarnessDef {
             TaskInput::Argument => args.iter().map(|arg| arg.replace("{task}", task)).collect(),
             // Nothing is substituted: the task goes to a file, and the
             // arguments only ever name the file.
-            TaskInput::File => args.clone(),
+            TaskInput::File => args.to_vec(),
         };
 
         Some(TaskRun { launch, input })
@@ -290,11 +285,7 @@ impl HarnessDef {
             return None;
         }
 
-        let form = self.task.as_ref()?;
-        let (args, input) = match form.platform.get(os) {
-            Some(override_) => (&override_.args, override_.input),
-            None => (&form.args, form.input),
-        };
+        let (args, input) = self.task_form_for(os)?;
         let on_the_command_line =
             input == TaskInput::Argument && args.iter().any(|arg| arg.contains("{task}"));
         if !on_the_command_line || !runs_through_cmd(&self.launch_for(os).command) {
@@ -309,6 +300,17 @@ impl HarnessDef {
              to edit, and restart the daemon",
             id = self.id
         ))
+    }
+
+    /// The one-shot form for `os`: its arguments, and how the task reaches
+    /// them. A platform's own form wins whole, input included, so a Windows
+    /// form reading a file never inherits the default's `{task}`.
+    fn task_form_for(&self, os: &str) -> Option<(&[String], TaskInput)> {
+        let form = self.task.as_ref()?;
+        Some(match form.platform.get(os) {
+            Some(override_) => (&override_.args, override_.input),
+            None => (&form.args, form.input),
+        })
     }
 }
 
