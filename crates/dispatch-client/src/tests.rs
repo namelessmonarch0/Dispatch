@@ -1590,3 +1590,172 @@ fn a_socket_dial_that_is_given_up_on_lets_its_thread_go() {
         "the abandoned handshake still holds its connection open"
     );
 }
+
+/// A writer whose every write blocks until the test lets it go, and then
+/// fails: a write to a peer that never reads, until the connection is closed.
+struct Stuck {
+    /// Told each time a write begins.
+    began: Sender<()>,
+    /// Dropped to let the write go.
+    release: Receiver<()>,
+}
+
+impl Write for Stuck {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        let _ = self.began.send(());
+        let _ = self.release.recv();
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A stuck writer, word of each write it begins, and what lets it go.
+fn stuck() -> (Stuck, Receiver<()>, Sender<()>) {
+    let (began, beginning) = channel();
+    let (release, released) = channel();
+    (
+        Stuck {
+            began,
+            release: released,
+        },
+        beginning,
+        release,
+    )
+}
+
+/// A wire up on connection 1, writing to `writer`, with nothing to close.
+fn wired(liveness: Liveness, writer: impl Write + Send + 'static) -> Arc<Wire> {
+    let wire = Wire::new(
+        Role::Interface,
+        "test",
+        liveness,
+        Dial::Endpoint(PathBuf::new()),
+    );
+    *wire.line.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(Arc::new(Line::new(1, Box::new(writer), Closer::default())));
+    wire.generation.store(1, Ordering::Relaxed);
+    wire.connected.store(true, Ordering::Relaxed);
+    Arc::new(wire)
+}
+
+#[test]
+fn checking_liveness_never_waits_on_the_connection() {
+    // Both deadlines -- the stuck write and the silence -- are enforced by
+    // the thread that checks liveness, so that thread must never be the one
+    // a write holds. A ping written by it, even one that only started when
+    // nothing else was writing, blocked it in a write a peer that never
+    // reads would hold for good, and then nothing enforced either.
+    let (writer, _began, release) = stuck();
+    let wire = wired(
+        Liveness {
+            interval: Duration::from_millis(10),
+            silence: Duration::from_secs(60),
+        },
+        writer,
+    );
+
+    // Quiet for longer than the interval, so a question is due.
+    std::thread::sleep(Duration::from_millis(50));
+
+    let (outbox, queued) = channel();
+    let (done, checked) = channel();
+    let checking = Arc::clone(&wire);
+    std::thread::spawn(move || {
+        check_liveness(&checking, &outbox);
+        let _ = done.send(());
+    });
+
+    assert!(
+        checked.recv_timeout(Duration::from_secs(2)).is_ok(),
+        "the liveness check is stuck in a write the peer never takes"
+    );
+    assert!(
+        matches!(queued.try_recv(), Ok(ClientMessage::Ping { .. })),
+        "the question is still asked, through the queue"
+    );
+
+    drop(release);
+}
+
+#[test]
+fn a_stale_write_that_fails_cannot_take_its_successor_down() {
+    // A write stuck on a connection that has been given up on fails only
+    // once that connection is closed -- by which time its replacement may be
+    // up. The failure has to end the connection it was written to, not
+    // whichever one is current.
+    let (writer, began, release) = stuck();
+    let wire = wired(Liveness::default(), writer);
+
+    let (done, wrote) = channel();
+    let writing = Arc::clone(&wire);
+    std::thread::spawn(move || {
+        let _ = done.send(writing.write(&ClientMessage::Subscribe));
+    });
+    began
+        .recv_timeout(PATIENCE)
+        .expect("the write to connection 1 is under way");
+
+    // Replaced while that write is still stuck, as the supervisor does.
+    {
+        let mut slot = wire.line.lock().unwrap_or_else(|e| e.into_inner());
+        wire.generation.store(2, Ordering::Relaxed);
+        *slot = Some(Arc::new(Line::new(
+            2,
+            Box::new(std::io::sink()),
+            Closer::default(),
+        )));
+        wire.connected.store(true, Ordering::Relaxed);
+    }
+
+    // The old write fails, as closing its connection makes it.
+    drop(release);
+    assert_eq!(
+        wrote.recv_timeout(PATIENCE),
+        Ok(false),
+        "the stuck write reports that its connection is gone"
+    );
+
+    assert_eq!(
+        wire.current().map(|line| line.generation),
+        Some(2),
+        "the old connection's failed write took its replacement out"
+    );
+    assert!(
+        wire.connected.load(Ordering::Relaxed),
+        "the old connection's failed write marked its replacement down"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_dial_given_up_on_before_it_opened_anything_is_closed_once_it_does() {
+    // The caller can stop waiting before the dialling thread has recorded
+    // what it opened -- the opening is what took too long. What it opens
+    // after that is nobody's to close unless recording it closes it.
+    let dialling = Dialling::default();
+    dialling.abandon();
+
+    let connection = Connection::over_command(
+        std::ffi::OsStr::new("sh"),
+        &[OsString::from("-c"), OsString::from("sleep 30")],
+    )
+    .expect("sh exists");
+    let closer = connection.closer();
+    let (mut reader, _writer) = connection.split();
+    let (ended, read_ended) = channel();
+    std::thread::spawn(move || {
+        let mut byte = [0u8; 1];
+        while reader.read(&mut byte).is_ok_and(|n| n > 0) {}
+        let _ = ended.send(());
+    });
+
+    dialling.record(closer);
+
+    assert!(
+        read_ended.recv_timeout(PATIENCE).is_ok(),
+        "a dial recorded after it was abandoned is still open"
+    );
+}

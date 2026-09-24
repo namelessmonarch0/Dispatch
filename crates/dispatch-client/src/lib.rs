@@ -160,20 +160,45 @@ fn next_backoff(current: Duration, dial: &Dial) -> Duration {
 /// let go.
 ///
 /// Recorded before the handshake begins, because the handshake is the part
-/// that may never finish.
+/// that may never finish. Giving up can still come first -- opening the
+/// connection may be what took too long -- so giving up leaves word behind,
+/// and what is recorded after it is closed as it is recorded rather than
+/// left open with nobody to close it.
 #[derive(Clone, Default)]
-struct Dialling(Arc<Mutex<Option<Closer>>>);
+struct Dialling(Arc<Mutex<Dialled>>);
+
+/// How far a dial has got, as far as ending it goes.
+#[derive(Default)]
+enum Dialled {
+    /// Nothing is open yet.
+    #[default]
+    Nothing,
+    /// A connection is open, and this ends it.
+    Opened(Closer),
+    /// Given up on: anything opened from now on is closed at once.
+    Abandoned,
+}
 
 impl Dialling {
-    /// Remembers how to end what this dial opened.
+    /// Remembers how to end what this dial opened -- or, when the dial has
+    /// already been given up on, ends it now.
     fn record(&self, closer: Closer) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(closer);
+        let mut dialled = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(*dialled, Dialled::Abandoned) {
+            drop(dialled);
+            closer.close();
+            return;
+        }
+        *dialled = Dialled::Opened(closer);
     }
 
-    /// Ends whatever the dial started, if it started anything.
+    /// Ends whatever the dial started, and whatever it starts from now on.
     fn abandon(&self) {
-        let closer = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(closer) = closer {
+        let dialled = std::mem::replace(
+            &mut *self.0.lock().unwrap_or_else(|e| e.into_inner()),
+            Dialled::Abandoned,
+        );
+        if let Dialled::Opened(closer) = dialled {
             closer.close();
         }
     }
@@ -216,6 +241,12 @@ struct Line {
     /// Which connection this is.
     generation: u64,
     /// Where everything sent is written, one frame at a time.
+    ///
+    /// Taken before [`Wire::line`] whenever both are held, never after: a
+    /// write that fails reports it through `Wire::lost` with this still
+    /// held, and the supervisor holds a new line's writer while it
+    /// publishes the line. Everything else takes the line only for as long
+    /// as it takes to clone it, and lets go before locking a writer.
     writer: Mutex<Box<dyn Write + Send>>,
     /// Ends both halves, and the process behind a command dial.
     closer: Closer,
@@ -259,6 +290,8 @@ struct Wire {
     /// Only ever held for a moment, and never across a read or a write: so
     /// declaring a connection dead, or putting a new one in its place, never
     /// waits on a write that is stuck.
+    ///
+    /// Taken after a line's writer when both are held; see [`Line::writer`].
     line: Mutex<Option<Arc<Line>>>,
     connected: AtomicBool,
     /// Incremented for each connection. A change tells a caller its view is of
@@ -330,21 +363,6 @@ impl Wire {
 
         let mut writer = line.writer.lock().unwrap_or_else(|e| e.into_inner());
         self.write_on(&line, &mut writer, message)
-    }
-
-    /// Writes one message, unless a write is already under way.
-    ///
-    /// For the supervisor's ping, which must never wait behind a write that
-    /// may be stuck: the write deadline deals with that one.
-    fn try_write(&self, message: &ClientMessage) {
-        let Some(line) = self.current() else { return };
-
-        let mut writer = match line.writer.try_lock() {
-            Ok(writer) => writer,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return,
-        };
-        self.write_on(&line, &mut writer, message);
     }
 
     /// Writes `message` to `line`, timing the write.
@@ -658,7 +676,7 @@ impl Client {
             read_from(reader, generation, &incoming, &wire);
         }
         write_to(outgoing, &wire);
-        supervise(incoming, &wire);
+        supervise(incoming, outbox.clone(), &wire);
 
         Self {
             handle: Handle {
@@ -988,7 +1006,10 @@ fn write_to(outgoing: Receiver<ClientMessage>, wire: &Arc<Wire>) {
 
 /// Reconnects whenever the connection is down — and, for a client made by
 /// [`Client::dial`], connects in the first place.
-fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
+///
+/// `outbox` is the queue the interface's messages go out through, which is
+/// where this puts its pings: see [`check_liveness`].
+fn supervise(incoming: Sender<ServerMessage>, outbox: Sender<ClientMessage>, wire: &Arc<Wire>) {
     let wire = Arc::clone(wire);
 
     std::thread::spawn(move || {
@@ -1004,7 +1025,7 @@ fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
             }
 
             if wire.connected.load(Ordering::Relaxed) {
-                check_liveness(&wire);
+                check_liveness(&wire, &outbox);
                 std::thread::sleep(FIRST_RETRY);
                 backoff = first_retry;
                 continue;
@@ -1024,20 +1045,19 @@ fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
 
             let patience = patience_for(&wire.dial);
             match connect_within(&wire.name, wire.role, &wire.dial, patience) {
-                Ok(mut connected) => {
-                    // Asked for before the line is put in place, rather than
-                    // through the queue or once it is up: the queue's writer
-                    // may be mid-message, and a subscribe that arrives after
-                    // the first keystroke would lose the panes -- and once
-                    // the line is up that writer may be stuck on it, and the
-                    // supervisor must never wait behind a write. Until then
-                    // nothing else can reach this writer, and a few bytes
-                    // into a fresh connection do not block. One that cannot
-                    // take them is already broken, and its next write or its
-                    // reader will say so.
-                    if wire.subscribed.load(Ordering::Relaxed) {
-                        let _ = Frame::write(&mut connected.writer, &ClientMessage::Subscribe);
-                    }
+                Ok(connected) => {
+                    // Nothing but this thread counts a supervised client's
+                    // connections, so the next number is known before the
+                    // lock is taken.
+                    let generation = wire.generation.load(Ordering::Relaxed) + 1;
+                    let line = Arc::new(Line::new(generation, connected.writer, connected.closer));
+
+                    // Its writer is taken before the line is published, while
+                    // nothing else can reach it: whatever the queue has for
+                    // it then waits for the subscribe below rather than going
+                    // first, and the supervisor never waits behind a write --
+                    // a few bytes into a fresh connection do not block.
+                    let mut writer = line.writer.lock().unwrap_or_else(|e| e.into_inner());
 
                     // Checked under the lock `Client::drop` takes to clear the
                     // line, so whichever of the two gets there first, the
@@ -1046,28 +1066,38 @@ fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
                     // it: an interface that sees the generation move sees
                     // the device that came with it, and `lost` never finds a
                     // line without its generation counted.
-                    let generation = {
+                    //
+                    // `subscribed` is read under it too. `Client::subscribe`
+                    // sets it before queueing its own subscribe, and the queue
+                    // looks for a line under this lock: either that subscribe
+                    // finds this line, or this reads the flag it set.
+                    let subscribed = {
                         let mut slot = wire.line.lock().unwrap_or_else(|e| e.into_inner());
                         if wire.closed.load(Ordering::Relaxed) {
                             drop(slot);
-                            connected.closer.close();
+                            drop(writer);
+                            line.closer.close();
                             return;
                         }
 
                         *wire.device.lock().unwrap_or_else(|e| e.into_inner()) = connected.device;
-                        let generation = wire.generation.fetch_add(1, Ordering::Relaxed) + 1;
-                        *slot = Some(Arc::new(Line::new(
-                            generation,
-                            connected.writer,
-                            connected.closer,
-                        )));
+                        wire.generation.store(generation, Ordering::Relaxed);
+                        *slot = Some(Arc::clone(&line));
                         wire.heard();
                         wire.connected.store(true, Ordering::Relaxed);
-                        generation
+                        wire.subscribed.load(Ordering::Relaxed)
                     };
 
                     *wire.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     read_from(connected.reader, generation, &incoming, &wire);
+
+                    // Written directly rather than queued, and first: a
+                    // subscribe that arrived after the first keystroke would
+                    // lose the panes. A failure goes where any write's does.
+                    if subscribed {
+                        wire.write_on(&line, &mut writer, &ClientMessage::Subscribe);
+                    }
+                    drop(writer);
 
                     tracing::info!(generation, dial = %wire.dial, "connected to the daemon");
                     backoff = first_retry;
@@ -1085,7 +1115,7 @@ fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
 /// Asks a quiet daemon whether it is there, and gives up on one that never
 /// says -- or on one a write has been stuck on for as long as silence is
 /// allowed.
-fn check_liveness(wire: &Wire) {
+fn check_liveness(wire: &Wire, outbox: &Sender<ClientMessage>) {
     // First, because a peer that talks but never reads is never quiet: its
     // chatter would pass every check below while nothing sent reaches it.
     if let Some(line) = wire.current()
@@ -1120,12 +1150,17 @@ fn check_liveness(wire: &Wire) {
     *asked = Instant::now();
     drop(asked);
 
-    // Written straight to the socket rather than queued -- the queue carries
-    // the interface's traffic -- but only if no write is under way: a ping
-    // that waited behind a stuck write would stall the supervisor with it.
-    wire.try_write(&ClientMessage::Ping {
+    // Queued rather than written here. This thread enforces both deadlines,
+    // so it must never be the one a write holds -- and a ping's own write
+    // blocks as surely as any other once a peer has stopped reading. In the
+    // queue it is an ordinary write, timed like the rest, which this thread
+    // can give up on.
+    let ping = ClientMessage::Ping {
         token: u64::try_from(quiet.as_millis()).unwrap_or(u64::MAX),
-    });
+    };
+    if outbox.send(ping).is_err() {
+        wire.lost_current();
+    }
 }
 
 /// Lets a test drive an interface's message path without a daemon.
@@ -1211,14 +1246,17 @@ impl Drop for Client {
         // And the connection -- a socket, or a command's whole process tree
         // -- would outlive the client that wanted it: the reader that owns it
         // is parked, and nothing else is ever going to wake it.
-        let line = self
-            .wire
-            .line
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        //
+        // Marked down under the lock, as `Wire::lost` does; closed after it.
+        let line = {
+            let mut slot = self.wire.line.lock().unwrap_or_else(|e| e.into_inner());
+            let line = slot.take();
+            if line.is_some() {
+                self.wire.connected.store(false, Ordering::Relaxed);
+            }
+            line
+        };
         if let Some(line) = line {
-            self.wire.connected.store(false, Ordering::Relaxed);
             line.closer.close();
         }
     }
