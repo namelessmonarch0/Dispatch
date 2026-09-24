@@ -5628,6 +5628,7 @@ mod tests {
                 command: "sh".to_string(),
                 args: Vec::new(),
                 env: Default::default(),
+                ..Default::default()
             },
             ..Default::default()
         };

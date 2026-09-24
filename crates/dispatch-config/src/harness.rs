@@ -4,7 +4,7 @@
 //! TOML file into the harnesses directory, or through the harness manager in
 //! the TUI, without Dispatch being rebuilt.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use dispatch_core::HarnessId;
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,13 @@ pub struct Launch {
     /// inherits.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Variables the child must not have at all: not set by `env`, and not
+    /// inherited either.
+    ///
+    /// Never read from a harness file. Whoever starts the launch decides it,
+    /// for a variable whose inherited value could only be stale.
+    #[serde(skip)]
+    pub unset: BTreeSet<String>,
 }
 
 /// How a one-shot run is given its task.

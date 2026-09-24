@@ -3512,6 +3512,36 @@ fn a_command_windows_finds_as_a_batch_file_is_refused_before_anyone_is_asked() {
 }
 
 #[test]
+fn an_argument_form_is_never_handed_a_task_file() {
+    // Its task is in its arguments. A DISPATCH_TASK_FILE in its environment
+    // could only be stale -- inherited, or set in the harness file -- and a
+    // redirect written against it would read some other file.
+    let argue = "id = \"argue\"\ndisplay_name = \"Argue\"\ncommand = \"agent\"\n\n\
+                 [env]\nDISPATCH_TASK_FILE = \"elsewhere.txt\"\n\n\
+                 [task]\nargs = [\"{task}\"]\n";
+    let (daemon, _ui, _caller, _dir) = delegating_to(
+        "argument-form-env",
+        &[("argue", argue.to_string())],
+        "argue",
+        "anything",
+    );
+
+    let run = daemon
+        .task_run("argue", "anything", PaneId::new())
+        .expect("the harness has a task form");
+    assert_eq!(run.input, TaskInput::Argument);
+    assert!(
+        !run.launch.env.contains_key(dispatch_config::TASK_FILE_ENV),
+        "the harness file's value is passed on: {:?}",
+        run.launch.env
+    );
+    assert!(
+        run.launch.unset.contains(dispatch_config::TASK_FILE_ENV),
+        "a value this process holds would be inherited"
+    );
+}
+
+#[test]
 fn a_file_form_that_also_names_the_task_is_refused_before_anyone_is_asked() {
     // On every platform: a file form fills nothing in, so its `{task}` would
     // reach the agent as those six characters.

@@ -299,6 +299,7 @@ impl Harness {
             command: env!("CARGO_BIN_EXE_dispatch").to_string(),
             args,
             env: fixture.env(),
+            ..Default::default()
         };
 
         let session = PtySession::spawn(&launch, fixture.config.path(), size)

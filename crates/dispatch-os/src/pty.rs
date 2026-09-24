@@ -5,7 +5,7 @@
 //! suspended and put in a Job Object before it runs, or anything it starts
 //! first escapes the job -- and `portable-pty` starts it running.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +22,9 @@ pub struct PtyCommand<'a> {
     pub args: &'a [String],
     /// Variables set on top of the environment this process has.
     pub env: &'a BTreeMap<String, String>,
+    /// Variables it must not have at all, whether `env` or this process's
+    /// environment would give them one.
+    pub env_remove: &'a BTreeSet<String>,
     /// Where it starts.
     pub cwd: &'a Path,
 }
@@ -131,6 +134,9 @@ fn refuse_nul(command: &PtyCommand<'_>) -> std::io::Result<()> {
         .iter()
         .find(|(key, value)| key.contains('\0') || value.contains('\0'))
     {
+        return refuse(format!("environment variable {key:?}"));
+    }
+    if let Some(key) = command.env_remove.iter().find(|key| key.contains('\0')) {
         return refuse(format!("environment variable {key:?}"));
     }
     if command.cwd.as_os_str().as_encoded_bytes().contains(&0) {
@@ -297,6 +303,10 @@ mod imp {
         for (key, value) in command.env {
             builder.env(key, value);
         }
+        // After `env`, so a variable that is both set and removed is gone.
+        for key in command.env_remove {
+            builder.env_remove(key);
+        }
 
         let child = pair
             .slave
@@ -332,7 +342,7 @@ use self::windows as imp;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io::ErrorKind;
 
     use super::{PtyCommand, find_with_pathext, quote_for_crt, refuse_nul, resolve_program, spawn};
@@ -427,11 +437,13 @@ mod tests {
     fn a_nul_anywhere_in_a_command_is_refused() {
         let args = vec!["-c".to_string(), "echo hi".to_string()];
         let env = BTreeMap::from([("KEY".to_string(), "value".to_string())]);
+        let none = BTreeSet::new();
         let cwd = std::env::temp_dir();
         let clean = PtyCommand {
             program: "sh",
             args: &args,
             env: &env,
+            env_remove: &none,
             cwd: &cwd,
         };
         refuse_nul(&clean).expect("a command with no NUL in it is let through");
@@ -470,6 +482,14 @@ mod tests {
             },
             "environment",
         );
+        let removed = BTreeSet::from(["K\0EY".to_string()]);
+        refused(
+            PtyCommand {
+                env_remove: &removed,
+                ..clean
+            },
+            "environment",
+        );
         let dir = cwd.join("a\0b");
         refused(PtyCommand { cwd: &dir, ..clean }, "directory");
     }
@@ -494,6 +514,7 @@ mod tests {
                 program,
                 args: &args,
                 env: &env,
+                env_remove: &BTreeSet::new(),
                 cwd: &cwd,
             },
             24,

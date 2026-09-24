@@ -13,12 +13,14 @@ fn shell(script: &str) -> Launch {
             command: "cmd.exe".into(),
             args: vec!["/c".into(), script.into()],
             env: Default::default(),
+            ..Default::default()
         }
     } else {
         Launch {
             command: "sh".into(),
             args: vec!["-c".into(), script.into()],
             env: Default::default(),
+            ..Default::default()
         }
     }
 }
@@ -30,12 +32,14 @@ fn interactive_shell() -> Launch {
             command: "cmd.exe".into(),
             args: Vec::new(),
             env: Default::default(),
+            ..Default::default()
         }
     } else {
         Launch {
             command: "sh".into(),
             args: Vec::new(),
             env: Default::default(),
+            ..Default::default()
         }
     }
 }
@@ -233,6 +237,7 @@ fn a_missing_command_is_reported_rather_than_panicking() {
         command: "dispatch-no-such-binary".into(),
         args: Vec::new(),
         env: Default::default(),
+        ..Default::default()
     };
 
     let error = PtySession::spawn(&launch, &cwd(), Size::new(80, 24))
@@ -281,6 +286,34 @@ fn a_bare_pty_hands_over_bytes() {
     assert!(
         String::from_utf8_lossy(&output).contains("hello-from-a-pty"),
         "expected the child's output, got {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn a_variable_the_launch_unsets_is_not_inherited() {
+    // Removed from what the child would inherit from this process, not just
+    // left unset by the launch: a stale value is exactly what inheriting
+    // brings.
+    let (variable, script, absent) = if cfg!(windows) {
+        ("USERPROFILE", "echo [%USERPROFILE%]", "[%USERPROFILE%]")
+    } else {
+        ("HOME", "echo \"[${HOME-unset}]\"", "[unset]")
+    };
+    assert!(
+        std::env::var_os(variable).is_some(),
+        "{variable} is set here, so the child would inherit it"
+    );
+    let mut launch = shell(script);
+    launch.unset.insert(variable.to_string());
+
+    let mut pty = Pty::spawn(&launch, &cwd(), Size::new(80, 24)).expect("the shell starts");
+    let (state, output) = pty.drain_until_exit(Duration::from_secs(10));
+
+    assert_eq!(state, RunState::Exited(0));
+    assert!(
+        String::from_utf8_lossy(&output).contains(absent),
+        "{variable} reached the child: {:?}",
         String::from_utf8_lossy(&output)
     );
 }

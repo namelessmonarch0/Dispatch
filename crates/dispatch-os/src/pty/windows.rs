@@ -156,7 +156,7 @@ fn start(command: &super::PtyCommand<'_>, console: HPCON) -> std::io::Result<(Ow
     startup.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
     startup.lpAttributeList = attributes.as_mut_ptr();
 
-    let environment = environment(command.env);
+    let environment = environment(command.env, command.env_remove);
     let program = resolve(command.program, &environment);
     let application = wide(program.as_os_str());
     let mut line = command_line(&program, command.args);
@@ -305,14 +305,20 @@ impl Drop for AttributeList {
     }
 }
 
-/// This process's environment with `overrides` on top, keyed as Windows
-/// keys it: case-insensitively.
-fn environment(overrides: &BTreeMap<String, String>) -> BTreeMap<String, (OsString, OsString)> {
+/// This process's environment with `overrides` on top and `removed` taken
+/// out, keyed as Windows keys it: case-insensitively.
+fn environment(
+    overrides: &BTreeMap<String, String>,
+    removed: &std::collections::BTreeSet<String>,
+) -> BTreeMap<String, (OsString, OsString)> {
     let mut environment: BTreeMap<String, (OsString, OsString)> = std::env::vars_os()
         .map(|(key, value)| (key.to_string_lossy().to_uppercase(), (key, value)))
         .collect();
     for (key, value) in overrides {
         environment.insert(key.to_uppercase(), (key.into(), value.into()));
+    }
+    for key in removed {
+        environment.remove(&key.to_uppercase());
     }
     environment
 }

@@ -905,6 +905,16 @@ impl Daemon {
         for (key, value) in self.pane_env(pane) {
             run.launch.env.entry(key).or_insert(value);
         }
+        if run.input == TaskInput::Argument {
+            // Its task is in its arguments, so a task file named in its
+            // environment could only be stale -- inherited, or set in the
+            // harness file -- and a redirect against it would read another
+            // file than the task.
+            run.launch.env.remove(dispatch_config::TASK_FILE_ENV);
+            run.launch
+                .unset
+                .insert(dispatch_config::TASK_FILE_ENV.to_string());
+        }
         Some(run)
     }
 

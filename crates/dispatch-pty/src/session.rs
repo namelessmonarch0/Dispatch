@@ -155,6 +155,7 @@ impl Pty {
                 program: &launch.command,
                 args: &launch.args,
                 env: &launch.env,
+                env_remove: &launch.unset,
                 cwd,
             },
             size.rows,
