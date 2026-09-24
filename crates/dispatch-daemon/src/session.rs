@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
 use dispatch_config::{DelegationLimits, HarnessRegistry};
@@ -44,6 +44,35 @@ const TICK: Duration = Duration::from_millis(8);
 /// path there, not a fallback, and it has to be long enough for ConPTY's pipe to
 /// catch up with the process object.
 const TAIL_GRACE: Duration = Duration::from_millis(250);
+
+/// How many events may wait for the loop.
+///
+/// Full, a client's reader thread waits to hand its next request over, and
+/// the socket behind it fills: a client sending faster than the daemon acts
+/// is slowed down rather than queued for.
+const EVENT_BACKLOG: usize = 1024;
+
+/// When the frame a client is part-way through began, while it is
+/// part-way through one.
+///
+/// Set by the client's reader thread, read by the loop, so a client that
+/// starts a frame and stops can be told from one that is merely idle.
+#[derive(Clone, Default)]
+struct FrameClock(Arc<std::sync::Mutex<Option<Instant>>>);
+
+impl FrameClock {
+    fn start(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
+
+    fn finish(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn since(&self) -> Option<Instant> {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 /// Failures starting or running the daemon.
 #[derive(Debug, thiserror::Error)]
@@ -87,6 +116,8 @@ struct Wiring {
     outbox: Outbox,
     /// Ends its connection, both halves, whoever holds them.
     closer: Closer,
+    /// When it is part-way through a frame, set by its reader thread.
+    frame: FrameClock,
 }
 
 /// Something the loop reacts to.
@@ -117,6 +148,12 @@ struct Client {
     /// said which protocol it speaks may mean something else by every byte
     /// that follows, and one that was refused must not get to act anyway.
     ready: bool,
+    /// When it is part-way through a frame, so [`Daemon::enforce_deadlines`]
+    /// can tell a stalled client from an idle one.
+    frame: FrameClock,
+    /// When it attached, so [`Daemon::enforce_deadlines`] can tell a client
+    /// that is taking too long to say `Hello`.
+    attached: Instant,
 }
 
 /// The daemon.
@@ -126,7 +163,7 @@ pub struct Daemon {
     harnesses: HarnessRegistry,
     projects: HashMap<ProjectId, Project>,
     events: Receiver<Event>,
-    sender: Sender<Event>,
+    sender: SyncSender<Event>,
     device: String,
     stop: Arc<AtomicBool>,
     limits: DelegationLimits,
@@ -154,7 +191,7 @@ impl Daemon {
         device: impl Into<String>,
         limits: DelegationLimits,
     ) -> Self {
-        let (sender, events) = channel();
+        let (sender, events) = sync_channel(EVENT_BACKLOG);
 
         Self {
             panes: HashMap::new(),
@@ -229,6 +266,8 @@ impl Daemon {
     /// Accepts connections until the listener fails, serving them all.
     pub fn serve(mut self, listener: Listener) -> Result<(), DaemonError> {
         let sender = self.sender.clone();
+        let max_clients = self.budgets.max_clients;
+        let live = Arc::new(AtomicUsize::new(0));
         let mut next_id = 0;
 
         // Accepting blocks, so it runs on its own thread and hands each
@@ -237,8 +276,18 @@ impl Daemon {
             loop {
                 match listener.accept() {
                     Ok(connection) => {
+                        // Counted by the readers, which are what a client
+                        // costs; closed at once rather than served badly.
+                        if live.load(Ordering::Relaxed) >= max_clients {
+                            tracing::warn!(
+                                max_clients,
+                                "turning a client away: too many are connected"
+                            );
+                            connection.closer().close();
+                            continue;
+                        }
                         next_id += 1;
-                        if spawn_client(next_id, connection, &sender).is_err() {
+                        if spawn_client(next_id, connection, &sender, &live).is_err() {
                             break;
                         }
                     }
@@ -270,6 +319,7 @@ impl Daemon {
             }
 
             self.pump_panes();
+            self.enforce_deadlines();
         }
 
         self.close_all_panes();
@@ -289,6 +339,7 @@ impl Daemon {
             self.handle(event);
         }
         self.pump_panes();
+        self.enforce_deadlines();
     }
 
     fn handle(&mut self, event: Event) {
@@ -302,6 +353,8 @@ impl Daemon {
                         subscribed: false,
                         role: Role::default(),
                         ready: false,
+                        frame: wiring.frame,
+                        attached: Instant::now(),
                     },
                 );
                 tracing::info!(client = id, "client attached");
@@ -1296,6 +1349,39 @@ impl Daemon {
         self.expire_requests();
     }
 
+    /// Hangs up on clients that ran out of time: one that never said
+    /// `Hello`, and one that began a frame and never finished it.
+    fn enforce_deadlines(&mut self) {
+        let now = Instant::now();
+
+        let late: Vec<(ClientId, &'static str)> = self
+            .clients
+            .iter()
+            .filter_map(|(id, client)| {
+                if !client.ready && now.duration_since(client.attached) >= self.budgets.handshake {
+                    return Some((*id, "it never said hello"));
+                }
+                if client
+                    .frame
+                    .since()
+                    .is_some_and(|began| now.duration_since(began) >= self.budgets.frame)
+                {
+                    return Some((*id, "it stopped part-way through a message"));
+                }
+                None
+            })
+            .collect();
+
+        for (id, why) in late {
+            tracing::info!(
+                client = id,
+                why,
+                "hanging up on a client that ran out of time"
+            );
+            self.hang_up(id);
+        }
+    }
+
     /// Forgets a client, ends its connection at once, and drops what it was
     /// waiting on.
     ///
@@ -1458,7 +1544,8 @@ fn client_binary_dir() -> Option<PathBuf> {
 fn spawn_client(
     id: ClientId,
     connection: Connection,
-    events: &Sender<Event>,
+    events: &SyncSender<Event>,
+    live: &Arc<AtomicUsize>,
 ) -> Result<(), dispatch_os::ipc::IpcError> {
     let closer = connection.closer();
     // The writer thread gets its own clone: `Daemon::hang_up` closes the one
@@ -1469,19 +1556,30 @@ fn spawn_client(
     let writer_closer = closer.clone();
     let (mut reader, mut writer) = connection.split();
     let (outbox, inbox) = crate::outbox::pair();
+    let frame = FrameClock::default();
 
     if events
-        .send(Event::Attached(id, Wiring { outbox, closer }))
+        .send(Event::Attached(
+            id,
+            Wiring {
+                outbox,
+                closer,
+                frame: frame.clone(),
+            },
+        ))
         .is_err()
     {
         return Ok(());
     }
+    live.fetch_add(1, Ordering::Relaxed);
 
     let incoming = events.clone();
+    let live = Arc::clone(live);
     std::thread::spawn(move || {
         loop {
-            match Frame::read::<_, ClientMessage>(&mut reader) {
+            match Frame::read_watched::<_, ClientMessage>(&mut reader, || frame.start()) {
                 Ok(message) => {
+                    frame.finish();
                     if incoming.send(Event::Request(id, message)).is_err() {
                         break;
                     }
@@ -1494,6 +1592,7 @@ fn spawn_client(
             }
         }
 
+        live.fetch_sub(1, Ordering::Relaxed);
         let _ = incoming.send(Event::Detached(id));
     });
 
@@ -1536,6 +1635,7 @@ impl Daemon {
             Wiring {
                 outbox,
                 closer: Closer::default(),
+                frame: FrameClock::default(),
             },
         ));
         inbox

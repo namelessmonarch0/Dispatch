@@ -624,7 +624,7 @@ fn a_requested_shutdown_stops_the_loop_and_kills_the_panes() {
     // The loop runs on another thread so a missing shutdown check fails the
     // test rather than hanging it.
     let shutdown = daemon.shutdown_handle();
-    let (done, finished) = channel();
+    let (done, finished) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         daemon.run();
         let _ = done.send(daemon.pane_count());
@@ -2467,6 +2467,10 @@ fn subscribe_and_collect(endpoint: &Path, window: Duration) -> Vec<ServerMessage
 }
 
 /// The output bytes among `messages`, however many panes they came from.
+///
+/// Used only by the budget tests below, which are `#[cfg(unix)]`: without
+/// the same gate here, a Windows build has nothing left that calls it.
+#[cfg(unix)]
 fn output_bytes(messages: &[ServerMessage]) -> usize {
     messages
         .iter()
@@ -2476,6 +2480,10 @@ fn output_bytes(messages: &[ServerMessage]) -> usize {
         })
         .sum()
 }
+
+/// How long a test waits for the daemon to hang up on a client, well past
+/// any budget these tests set.
+const PATIENCE: Duration = Duration::from_secs(10);
 
 #[test]
 #[cfg(unix)]
@@ -2797,5 +2805,130 @@ fn many_refused_clients_are_all_told_why_before_the_connection_ends() {
         handle
             .join()
             .unwrap_or_else(|e| std::panic::resume_unwind(e));
+    }
+}
+
+/// Whether the daemon ends the connection `reader` reads from within
+/// `patience`, discarding whatever arrives first.
+fn hung_up(mut reader: RawReader, patience: Duration) -> bool {
+    let (ended, end) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        while Frame::read::<_, ServerMessage>(&mut reader).is_ok() {}
+        let _ = ended.send(());
+    });
+    end.recv_timeout(patience).is_ok()
+}
+
+#[test]
+fn a_refused_client_is_hung_up_on_and_its_pipelined_request_ignored() {
+    // A Hello the daemon refuses, with a SpawnPane right behind it in the
+    // same burst: the shape that got a pane started for a refused client.
+    let served = served("refused", Budgets::default());
+    let (mut reader, mut writer) = raw_client(&served.endpoint);
+
+    Frame::write(
+        &mut writer,
+        &ClientMessage::Hello {
+            version: dispatch_proto::Version {
+                major: 99,
+                minor: 0,
+            },
+            client: "future".into(),
+            role: dispatch_proto::Role::Interface,
+        },
+    )
+    .expect("writing succeeds");
+    let _ = Frame::write(&mut writer, &spawn_request(served.project));
+
+    let answer: ServerMessage = Frame::read(&mut reader).expect("refused out loud");
+    assert!(matches!(
+        answer,
+        ServerMessage::Error {
+            error: ProtocolError::IncompatibleVersion { .. }
+        }
+    ));
+    assert!(hung_up(reader, PATIENCE), "the half it reads was left open");
+    assert!(
+        stops_listening(writer, PATIENCE),
+        "the half it writes to was left open"
+    );
+
+    let seen = subscribe_and_collect(&served.endpoint, Duration::from_millis(500));
+    assert!(
+        !seen
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. })),
+        "the refused client's request was acted on: {seen:#?}"
+    );
+}
+
+#[test]
+fn a_client_that_never_says_hello_is_hung_up_on() {
+    let served = served(
+        "no-hello",
+        Budgets {
+            handshake: Duration::from_millis(200),
+            ..Budgets::default()
+        },
+    );
+    let (reader, _writer) = raw_client(&served.endpoint);
+
+    assert!(
+        hung_up(reader, PATIENCE),
+        "a silent client is still connected"
+    );
+}
+
+#[test]
+fn a_client_that_stops_mid_frame_is_hung_up_on() {
+    let served = served(
+        "mid-frame",
+        Budgets {
+            frame: Duration::from_millis(200),
+            ..Budgets::default()
+        },
+    );
+    let (reader, mut writer) = raw_client(&served.endpoint);
+    Frame::write(&mut writer, &hello()).expect("writing succeeds");
+
+    // A length prefix promising a hundred bytes, then three of them.
+    writer
+        .write_all(&100u32.to_be_bytes())
+        .and_then(|()| writer.write_all(b"abc"))
+        .and_then(|()| writer.flush())
+        .expect("writing succeeds");
+
+    assert!(
+        hung_up(reader, PATIENCE),
+        "a client stalled part-way through a frame is still connected"
+    );
+}
+
+#[test]
+fn clients_past_the_limit_are_turned_away() {
+    let served = served(
+        "quota",
+        Budgets {
+            max_clients: 2,
+            ..Budgets::default()
+        },
+    );
+
+    let first = raw_client(&served.endpoint);
+    let second = raw_client(&served.endpoint);
+    // Both must be counted before the third arrives.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let (third_reader, _third_writer) = raw_client(&served.endpoint);
+    assert!(
+        hung_up(third_reader, PATIENCE),
+        "a third client was let in past a limit of two"
+    );
+
+    // The two already in are unaffected.
+    for (mut reader, mut writer) in [first, second] {
+        Frame::write(&mut writer, &hello()).expect("writing succeeds");
+        let answer: ServerMessage = Frame::read(&mut reader).expect("still served");
+        assert!(matches!(answer, ServerMessage::Welcome { .. }));
     }
 }
