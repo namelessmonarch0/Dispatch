@@ -43,7 +43,17 @@ dispatch-tui = { path = "crates/dispatch-tui" }
 # move under us on the next minor," not "unverified now." 0.30 rather than
 # 0.29 because 0.29's layout cache pulled in an `lru` with two soundness
 # advisories and the unmaintained `paste`.
-ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+#
+# Default features off: they name every backend's crate, so termwiz and
+# termina sat in Cargo.lock -- and in every audit -- with nothing using them.
+# What is kept is what is used: the crossterm backend, the layout cache
+# (behaviour, not API: without it every layout is solved afresh each frame),
+# and the line count above. Nothing uses the calendar widget or the macros.
+ratatui = { version = "0.30", default-features = false, features = [
+    "crossterm",
+    "layout-cache",
+    "unstable-rendered-line-info",
+] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 
 # Runtime
