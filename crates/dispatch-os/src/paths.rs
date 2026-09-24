@@ -557,6 +557,32 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    fn a_junction_where_a_private_directory_should_be_is_refused() {
+        // A reparse point there is somebody's choice of where the tasks go:
+        // each file would still be private, but in a directory anybody who
+        // can change the junction decides.
+        let scratch = Scratch::new("private-dir-junction");
+        let target = scratch.0.join("elsewhere");
+        std::fs::create_dir(&target).expect("temp dir is writable");
+        let link = scratch.0.join("tasks");
+        // A junction needs no privilege, unlike a symbolic link.
+        let made = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .expect("cmd.exe runs");
+        assert!(
+            made.status.success(),
+            "mklink /J failed: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+
+        create_private_dir(&link).expect_err("a junction is not a private directory");
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn a_private_directory_admits_its_owner_alone() {
         let scratch = Scratch::new("private-dir");
         let dir = scratch.0.join("made").join("tasks");
