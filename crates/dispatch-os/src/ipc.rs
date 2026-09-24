@@ -1841,6 +1841,69 @@ mod tests {
         );
     }
 
+    /// Whether anything is left of the process group `leader` leads, an
+    /// unreaped leader included.
+    #[cfg(unix)]
+    fn group_exists(leader: u32) -> bool {
+        let leader = libc::pid_t::try_from(leader).expect("a pid fits in pid_t");
+        // SAFETY: signal 0 is delivered to nobody; killpg only reports
+        // whether the group has members, and touches no memory of ours.
+        if unsafe { libc::killpg(leader, 0) } == 0 {
+            return true;
+        }
+        // macOS answers EPERM for a group whose only member is a zombie:
+        // still there until its parent waits for it.
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn closing_a_command_transport_does_not_wait_out_its_tree() {
+        // Closing holds the lock the reader half's reap needs, and on Linux a
+        // killed leader nobody has waited for is still a member of its group.
+        // A close that waited for the group to vanish waited for a zombie only
+        // the reap it was blocking could clear: the whole kill timeout, on
+        // every client dropped and every connection given up on.
+        let connection = Connection::over_command(
+            std::ffi::OsStr::new("sh"),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("sleep 30 & sleep 30"),
+            ],
+        )
+        .expect("sh exists");
+        let leader = connection.child_id().expect("a command has a pid");
+        let closer = connection.closer();
+        let (reader, _writer) = connection.split();
+        // Parked in a read, as a client's reader is: the tree dying wakes it,
+        // and its reap is what needs the lock `close` holds.
+        let parked = reading(reader);
+
+        let started = std::time::Instant::now();
+        closer.close();
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(500),
+            "closing a command transport took {took:?}"
+        );
+
+        // Not waiting is not leaving it running: the tree is signalled, and
+        // the reap the lock was holding up waits its leader.
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while group_exists(leader) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !group_exists(leader),
+            "the command's tree outlived its closing"
+        );
+        assert_eq!(
+            parked.recv_timeout(PATIENCE),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "the read on a closed command's stdout is still parked"
+        );
+    }
+
     /// The pid `closer` would signal if it were closed now.
     #[cfg(unix)]
     fn aimed_at(closer: &Closer) -> Option<u32> {
