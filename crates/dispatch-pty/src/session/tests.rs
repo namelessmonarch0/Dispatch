@@ -652,3 +652,39 @@ fn a_failed_resize_says_it_was_a_resize() {
         "{error}"
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn a_dropped_pane_lets_go_of_a_terminal_something_else_still_holds() {
+    // A process that leaves the pane's session -- so ending the pane does not
+    // end it -- and prints to the terminal until printing fails, then says
+    // so. On Linux printing fails only once nothing holds the terminal's
+    // other side; macOS revokes the terminal from everyone as soon as the
+    // pane's session leader exits, so there this passes either way. perl,
+    // because macOS has no setsid(1); it gives up after 20 s regardless.
+    let dir = std::env::temp_dir().join(format!("dispatch-pty-held-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir is writable");
+    let gone = dir.join("gone");
+    let script = format!(
+        "perl -e 'use POSIX; exit 0 if fork; POSIX::setsid(); $SIG{{HUP}} = \"IGNORE\"; $| = 1; \
+         for (1..400) {{ unless (print \"tick\\n\") {{ open(my $f, \">\", $ARGV[0]); print $f \"gone\"; exit 0 }} \
+         select(undef, undef, undef, 0.05) }}' \"{}\"",
+        gone.display()
+    );
+
+    let mut pty = Pty::spawn(&shell(&script), &cwd(), Size::new(80, 24)).expect("the shell starts");
+    drain_until(&mut pty, "tick");
+    drop(pty);
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while !gone.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let let_go = gone.exists();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        let_go,
+        "the pane's side of the terminal was still open after the pane was dropped"
+    );
+}
