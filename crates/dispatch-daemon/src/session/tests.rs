@@ -135,6 +135,14 @@ fn drain(inbox: &Inbox) -> Vec<ServerMessage> {
     messages
 }
 
+/// How long [`wait_for`] ticks the daemon before giving up.
+///
+/// A deadline, not a delay: a passing test returns the moment its predicate
+/// holds, so this costs only a test that is failing anyway. Thirty seconds
+/// because a delegation test on Windows starts two cold PowerShell one-shots
+/// back to back, and a loaded runner once took longer than ten over them.
+const WAIT_FOR_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Ticks the daemon until `predicate` holds, or gives up.
 fn wait_for(
     daemon: &mut Daemon,
@@ -142,7 +150,7 @@ fn wait_for(
     predicate: impl Fn(&[ServerMessage]) -> bool,
 ) -> Vec<ServerMessage> {
     let mut seen = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT_FOR_DEADLINE;
 
     loop {
         daemon.tick();
