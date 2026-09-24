@@ -104,6 +104,12 @@ was started in. Opening Dispatch in a directory adds it to that list, and it is
 there on every later start, whichever directory you started in. The list lives
 in `projects.toml` beside the rest of the configuration.
 
+Beside it, and beside `machines.toml`, a change leaves an empty
+`projects.toml.lock` or `machines.toml.lock`: the lock two Dispatches take in
+turn to change the list. It is safe to ignore; delete one only while no
+Dispatch is running, or two of them can each take a lock of their own and
+write over each other.
+
 `^a o` opens a directory browser: arrows walk it, `→` steps into a directory
 and `←` back out, typing filters the listing, and a typed path with a `/` in it
 is read as a path instead -- Tab completes it. `^g` lists every git repository
