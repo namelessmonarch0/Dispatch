@@ -683,6 +683,56 @@ fn an_upgrade_replaces_the_file_rather_than_rewriting_it() {
 
 #[test]
 #[cfg(unix)]
+fn an_upgrade_keeps_the_files_permissions() {
+    // A file the user made readable to themselves alone stays that way: the
+    // body is Dispatch's to bring up to date, the mode is not.
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new("upgrade-keeps-mode");
+    let path = dir.write(
+        "claude.toml",
+        include_str!("../harnesses/superseded/claude-5.toml"),
+    );
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("permissions change");
+
+    let written = write_missing_built_ins(dir.path()).expect("writing succeeds");
+
+    assert!(written.contains(&"claude"), "{written:?}");
+    let mode = std::fs::metadata(&path)
+        .expect("it exists")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "the upgrade changed the file's mode");
+}
+
+#[test]
+fn a_file_that_changed_after_it_was_judged_is_not_replaced() {
+    // The user saved an edit between the upgrade reading the file and
+    // replacing it: the edit is theirs, and stays.
+    let dir = TempDir::new("upgrade-changed-underneath");
+    let path = dir.write("claude.toml", "an edit made a moment ago");
+
+    let replaced = crate::store::replace_unless_changed(&path, "the new body", |current| {
+        current == "what was judged unedited"
+    })
+    .expect("nothing fails");
+
+    assert!(!replaced, "it says it replaced the file");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("it reads"),
+        "an edit made a moment ago"
+    );
+    let left: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("it reads")
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
+    assert_eq!(left, ["claude.toml"], "the staged body was left behind");
+}
+
+#[test]
+#[cfg(unix)]
 fn an_upgrade_through_a_link_changes_the_file_it_names() {
     // Harness files kept elsewhere -- in a dotfiles repository, say -- and
     // linked in: the link is the user's arrangement, and stays.

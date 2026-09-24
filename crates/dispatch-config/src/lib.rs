@@ -271,12 +271,23 @@ fn upgrade(path: &Path, built_in: &defaults::BuiltIn) -> Result<bool, ConfigErro
         path.to_path_buf()
     };
 
-    store::replace_unlocked(&target, built_in.toml)?;
-    tracing::info!(
-        harness = built_in.id,
-        "upgraded a built-in harness nobody edited"
-    );
-    Ok(true)
+    // Judged again at the last moment: a user saving their own edit while
+    // this ran keeps it.
+    let replaced = store::replace_unless_changed(&target, built_in.toml, |current| {
+        unix(current) == unix(&existing)
+    })?;
+    if replaced {
+        tracing::info!(
+            harness = built_in.id,
+            "upgraded a built-in harness nobody edited"
+        );
+    } else {
+        tracing::info!(
+            harness = built_in.id,
+            "a built-in harness changed while it was being upgraded; left as it now is"
+        );
+    }
+    Ok(replaced)
 }
 
 #[cfg(test)]
