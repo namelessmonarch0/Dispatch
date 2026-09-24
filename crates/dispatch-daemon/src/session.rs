@@ -1153,6 +1153,21 @@ impl Daemon {
         };
         let project = asking.project;
 
+        // An exited pane keeps its row so its last output can be read, but
+        // the agent that asked is gone: a subagent started now would work for
+        // nobody. A blanket approval outlives the agent the same way, so this
+        // is asked on its path too.
+        if matches!(asking.session.state(), RunState::Exited(_)) {
+            self.resolve(
+                request,
+                caller,
+                DelegateOutcome::Refused {
+                    reason: "the pane that asked has exited".into(),
+                },
+            );
+            return;
+        }
+
         let Some(root) = self.projects.get(&project).map(|p| p.root.clone()) else {
             self.send(
                 caller,

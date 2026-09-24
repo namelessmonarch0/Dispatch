@@ -1543,6 +1543,114 @@ fn closing_the_asking_pane_refuses_its_pending_request() {
     );
 }
 
+/// Ends `pane`'s shell, and ticks until its exit has been reported.
+fn exit_pane(daemon: &mut Daemon, ui: &Inbox, pane: PaneId) {
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane,
+            bytes: b"exit 0\r".to_vec(),
+        },
+    );
+    wait_for(daemon, ui, |m| {
+        m.iter().any(|m| {
+            matches!(
+                m,
+                ServerMessage::PaneChanged {
+                    pane: p,
+                    update: PaneUpdate::Status {
+                        status: PaneStatus::Exited(_)
+                    },
+                } if *p == pane
+            )
+        })
+    });
+}
+
+/// Why a caller's request was refused, if it was.
+fn refusal(messages: &[ServerMessage]) -> Option<String> {
+    messages.iter().find_map(|m| match m {
+        ServerMessage::DelegateResolved {
+            outcome: dispatch_proto::DelegateOutcome::Refused { reason },
+            ..
+        } => Some(reason.clone()),
+        _ => None,
+    })
+}
+
+#[test]
+fn approving_a_request_from_a_pane_that_has_exited_starts_nothing() {
+    // An exited pane keeps its row, so its last output can be read, but the
+    // agent that asked is gone: a subagent started for it would work for
+    // nobody, under a parent nothing will ever close.
+    let (mut daemon, project, _dir) = daemon("delegate-parent-exited");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask(&mut daemon, parent, "echo never");
+    let request = pending(&drain(&ui)).expect("the interface is asked");
+
+    exit_pane(&mut daemon, &ui, parent);
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+
+    let seen = drain(&caller);
+    assert_eq!(
+        refusal(&seen).as_deref(),
+        Some("the pane that asked has exited"),
+        "the caller is told why, got {seen:#?}"
+    );
+    assert_eq!(daemon.pane_count(), 1, "no subagent was started");
+}
+
+#[test]
+fn a_blanket_approval_starts_nothing_for_a_pane_that_has_exited() {
+    // The blanket outlives the agent it was given to, since the row does;
+    // what it approved was that agent's requests, and there are no more.
+    let (mut daemon, project, _dir) = daemon("delegate-blanket-exited");
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let parent = spawn_pane_for_test(&mut daemon, &ui, project);
+
+    let first = ask(&mut daemon, parent, "echo one");
+    let request = pending(&drain(&ui)).expect("the first is asked about");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: true,
+        },
+    );
+    wait_for(&mut daemon, &first, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::DelegateFinished { .. }))
+    });
+
+    exit_pane(&mut daemon, &ui, parent);
+    let second = ask(&mut daemon, parent, "echo two");
+
+    let seen = drain(&second);
+    assert_eq!(
+        refusal(&seen).as_deref(),
+        Some("the pane that asked has exited"),
+        "the caller is told why, got {seen:#?}"
+    );
+    assert_eq!(
+        daemon.pane_count(),
+        2,
+        "the parent and its first subagent, and nothing started since"
+    );
+}
+
 #[test]
 fn every_interface_client_is_told_when_a_request_is_resolved() {
     // The next task draws the prompt on every interface client that saw it;
