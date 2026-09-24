@@ -6,7 +6,7 @@
 //! first escapes the job -- and `portable-pty` starts it running.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -191,6 +191,61 @@ fn quote_for_crt(arg: &str) -> String {
     quoted
 }
 
+/// A child's environment as the Windows spawn builds it: what it inherits,
+/// with overrides on top and removals taken out, every name matched without
+/// regard to case -- one variable, however it is spelled.
+///
+/// The one place names are folded. The spawn builds the child's
+/// environment with it, and whoever judges what the child will run --
+/// which file its `PATH` makes of a bare command -- reads it back through
+/// the same fold, so the two can never see different values. Of overrides
+/// spelled alike but for case, the one later in `BTreeMap` order wins and
+/// keeps its spelling: `Path` over `PATH`.
+///
+/// Not behind a `#[cfg]`: the rule is Windows', but what is judged for
+/// Windows is judged, and tested, everywhere.
+#[derive(Debug, Clone, Default)]
+pub struct WindowsEnvironment(BTreeMap<String, (OsString, OsString)>);
+
+impl WindowsEnvironment {
+    /// `inherited`, with `overrides` set on top and `removed` taken out.
+    pub fn new(
+        inherited: impl IntoIterator<Item = (OsString, OsString)>,
+        overrides: &BTreeMap<String, String>,
+        removed: &BTreeSet<String>,
+    ) -> Self {
+        let mut variables: BTreeMap<String, (OsString, OsString)> = inherited
+            .into_iter()
+            .map(|(name, value)| (fold(&name.to_string_lossy()), (name, value)))
+            .collect();
+        for (name, value) in overrides {
+            variables.insert(fold(name), (name.into(), value.into()));
+        }
+        for name in removed {
+            variables.remove(&fold(name));
+        }
+        Self(variables)
+    }
+
+    /// The value of `name`, however either is spelled.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&OsStr> {
+        self.0.get(&fold(name)).map(|(_, value)| value.as_os_str())
+    }
+
+    /// Every variable, once, as its winning spelling has it.
+    pub fn variables(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
+        self.0
+            .values()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
+    }
+}
+
+/// A variable's name as Windows compares names.
+fn fold(name: &str) -> String {
+    name.to_uppercase()
+}
+
 /// The file the Windows spawn starts for `program`, given the child's `PATH`
 /// and `PATHEXT`.
 ///
@@ -345,7 +400,10 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::ErrorKind;
 
-    use super::{PtyCommand, find_with_pathext, quote_for_crt, refuse_nul, resolve_program, spawn};
+    use super::{
+        PtyCommand, WindowsEnvironment, find_with_pathext, quote_for_crt, refuse_nul,
+        resolve_program, spawn,
+    };
 
     /// A fresh directory holding an empty file for each of `names`.
     fn a_dir_with(label: &str, names: &[&str]) -> std::path::PathBuf {
@@ -394,6 +452,42 @@ mod tests {
         assert_eq!(find_with_pathext(&dir.join("missing"), PATHEXT), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_windows_environment_holds_one_variable_for_every_spelling() {
+        use std::ffi::{OsStr, OsString};
+
+        let inherited = [
+            (OsString::from("Path"), OsString::from("inherited")),
+            (OsString::from("TEMP"), OsString::from("scratch")),
+            (OsString::from("Keep"), OsString::from("kept")),
+        ];
+        let overrides = BTreeMap::from([
+            ("PATH".to_string(), "the daemon's".to_string()),
+            ("Path".to_string(), "the harness's".to_string()),
+            ("Extra".to_string(), "added".to_string()),
+        ]);
+        let removed = BTreeSet::from(["temp".to_string()]);
+
+        let environment = WindowsEnvironment::new(inherited, &overrides, &removed);
+
+        assert_eq!(
+            environment.get("path"),
+            Some(OsStr::new("the harness's")),
+            "an override replaces what is inherited, and of two spellings the \
+             later in order wins, as the spawn has always had it"
+        );
+        assert_eq!(environment.get("TEMP"), None, "removed whatever its case");
+        assert_eq!(environment.get("KEEP"), Some(OsStr::new("kept")));
+        assert_eq!(environment.get("extra"), Some(OsStr::new("added")));
+
+        let names: Vec<_> = environment.variables().map(|(name, _)| name).collect();
+        assert_eq!(
+            names,
+            [OsStr::new("Extra"), OsStr::new("Keep"), OsStr::new("Path")],
+            "one of each, spelled as the winner spelled it"
+        );
     }
 
     #[test]

@@ -929,6 +929,40 @@ fn a_command_windows_finds_as_a_batch_file_puts_the_task_on_cmds_command_line_to
 }
 
 #[test]
+fn the_path_judged_is_the_path_the_spawn_uses_whatever_its_case() {
+    // The daemon sets PATH; a harness written for Windows sets Path. Windows
+    // holds one variable for both, and the refusal must look where the
+    // spawn will: at the value that wins there.
+    let def: HarnessDef = toml::from_str(
+        "id = \"bare\"\ndisplay_name = \"Bare\"\ncommand = \"claude\"\n\n\
+         [task]\nargs = [\"-p\", \"{task}\"]\n",
+    )
+    .expect("the definition parses");
+    let nothing = TempDir::new("case-path-empty");
+    let shim = TempDir::new("case-path-shim");
+    shim.write("claude.CMD", "");
+
+    let mut launch = def.launch_for("windows");
+    launch
+        .env
+        .insert("PATH".into(), nothing.path().display().to_string());
+    launch
+        .env
+        .insert("Path".into(), shim.path().display().to_string());
+    launch
+        .env
+        .insert("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD".into());
+
+    let reason = def
+        .task_refusal_as("windows", &launch)
+        .expect("the batch file the spawn would find is refused");
+    assert!(
+        reason.to_lowercase().contains("claude.cmd"),
+        "the refusal says what was found: {reason}"
+    );
+}
+
+#[test]
 fn a_file_form_that_also_names_the_task_is_refused_everywhere() {
     // A file form fills in nothing, so `{task}` would reach the agent as
     // those six characters: a form that cannot mean what it says.

@@ -5,8 +5,7 @@
 //! before it runs a single instruction, so nothing it starts can escape the
 //! job that `process::terminate_tree` ends.
 
-use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::{Path, PathBuf};
@@ -156,7 +155,8 @@ fn start(command: &super::PtyCommand<'_>, console: HPCON) -> std::io::Result<(Ow
     startup.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
     startup.lpAttributeList = attributes.as_mut_ptr();
 
-    let environment = environment(command.env, command.env_remove);
+    let environment =
+        super::WindowsEnvironment::new(std::env::vars_os(), command.env, command.env_remove);
     let program = resolve(command.program, &environment);
     let application = wide(program.as_os_str());
     let mut line = command_line(&program, command.args);
@@ -305,29 +305,11 @@ impl Drop for AttributeList {
     }
 }
 
-/// This process's environment with `overrides` on top and `removed` taken
-/// out, keyed as Windows keys it: case-insensitively.
-fn environment(
-    overrides: &BTreeMap<String, String>,
-    removed: &std::collections::BTreeSet<String>,
-) -> BTreeMap<String, (OsString, OsString)> {
-    let mut environment: BTreeMap<String, (OsString, OsString)> = std::env::vars_os()
-        .map(|(key, value)| (key.to_string_lossy().to_uppercase(), (key, value)))
-        .collect();
-    for (key, value) in overrides {
-        environment.insert(key.to_uppercase(), (key.into(), value.into()));
-    }
-    for key in removed {
-        environment.remove(&key.to_uppercase());
-    }
-    environment
-}
-
 /// The environment as `CreateProcessW` takes it: `KEY=VALUE` strings, each
 /// NUL-terminated, sorted, ending in one more NUL.
-fn environment_block(environment: &BTreeMap<String, (OsString, OsString)>) -> Vec<u16> {
+fn environment_block(environment: &super::WindowsEnvironment) -> Vec<u16> {
     let mut block = Vec::new();
-    for (key, value) in environment.values() {
+    for (key, value) in environment.variables() {
         block.extend(key.encode_wide());
         block.push(u16::from(b'='));
         block.extend(value.encode_wide());
@@ -342,19 +324,16 @@ fn environment_block(environment: &BTreeMap<String, (OsString, OsString)>) -> Ve
 
 /// The file `program` names, found as [`super::resolve_program`] finds it
 /// with the child's own `PATH` and `PATHEXT`.
-fn resolve(program: &str, environment: &BTreeMap<String, (OsString, OsString)>) -> PathBuf {
-    let value = |key: &str| environment.get(key).map(|(_, value)| value.as_os_str());
-    super::resolve_program(program, value("PATH"), value("PATHEXT"))
+fn resolve(program: &str, environment: &super::WindowsEnvironment) -> PathBuf {
+    super::resolve_program(program, environment.get("PATH"), environment.get("PATHEXT"))
 }
 
 /// Where the process starts: `cwd` when it is a directory, and otherwise the
 /// user's profile, as `portable-pty` did -- and, with the home directory,
 /// still does on Unix -- so a pane whose directory has gone still starts.
 /// `None` leaves it in this process's own directory.
-fn start_in(cwd: &Path, environment: &BTreeMap<String, (OsString, OsString)>) -> Option<Vec<u16>> {
-    let profile = environment
-        .get("USERPROFILE")
-        .map(|(_, value)| Path::new(value));
+fn start_in(cwd: &Path, environment: &super::WindowsEnvironment) -> Option<Vec<u16>> {
+    let profile = environment.get("USERPROFILE").map(Path::new);
     let dir = Some(cwd)
         .filter(|dir| dir.is_dir())
         .or(profile.filter(|dir| dir.is_dir()))?;

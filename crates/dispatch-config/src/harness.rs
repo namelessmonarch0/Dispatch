@@ -363,22 +363,17 @@ impl HarnessDef {
 /// The file Windows would start for `launch`: its command, looked for on its
 /// `PATH` and completed with its `PATHEXT` exactly as the spawn does.
 ///
-/// A variable `launch` sets wins, matched as Windows matches names, without
-/// regard to case; one it does not set is this process's, which the child
-/// inherits.
+/// Both read through the environment the spawn would build --
+/// [`dispatch_os::pty::WindowsEnvironment`], this process's variables with
+/// `launch`'s on top and its removals taken out, names folded as Windows
+/// folds them -- so of `PATH` and `Path` this sees the one the child gets.
 fn found_as(launch: &Launch) -> std::path::PathBuf {
-    let variable = |name: &str| {
-        launch
-            .env
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| std::ffi::OsString::from(value))
-            .or_else(|| std::env::var_os(name))
-    };
+    let environment =
+        dispatch_os::pty::WindowsEnvironment::new(std::env::vars_os(), &launch.env, &launch.unset);
     dispatch_os::pty::resolve_program(
         &launch.command,
-        variable("PATH").as_deref(),
-        variable("PATHEXT").as_deref(),
+        environment.get("PATH"),
+        environment.get("PATHEXT"),
     )
 }
 
