@@ -99,8 +99,8 @@ impl Outbox {
     /// judged against a client's live-traffic budget at all -- that is what
     /// distinguishes this from `send_within` -- but a client cannot grow
     /// this queue forever by asking for things it never reads either, so
-    /// asking again before the last answer was taken is refused as
-    /// [`Refused::Behind`].
+    /// asking again once the asked-for backlog already exceeds `budget` is
+    /// refused as [`Refused::Behind`].
     pub fn send_all(
         &self,
         messages: impl IntoIterator<Item = ServerMessage>,
@@ -122,7 +122,7 @@ impl Outbox {
     ///
     /// For what the fleet does on its own -- output, statuses, prompts --
     /// which is what piles up behind a client that has stopped reading.
-    /// What the client asked for does not count here: see [`Self::send`].
+    /// What the client asked for does not count here: see [`Self::send_all`].
     pub fn send_within(&self, message: ServerMessage, budget: usize) -> Result<(), Refused> {
         let live = self.live.load(Ordering::Acquire);
         if live > budget {

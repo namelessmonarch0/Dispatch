@@ -2620,10 +2620,35 @@ fn a_late_subscriber_is_not_hung_up_for_the_replay_it_asked_for() {
     daemon.request_for_test(2, hello());
     daemon.request_for_test(2, ClientMessage::Subscribe);
 
+    // One tick before anything is drained, with the whole reply still
+    // sitting unread: this is exactly the moment a live broadcast used to
+    // see the reply's own bulk as backlog and hang the client up for it
+    // (round 1, finding 1) -- ticking here, rather than draining first,
+    // gives that bug a real chance to happen before this test would ever
+    // notice.
+    daemon.tick();
+
+    // Drained together, and not counted below: both are what was asked
+    // for, or arrived before this client had a chance to read anything --
+    // not the ongoing live traffic the loop below measures.
+    let replay = drain(&subscriber);
+    assert!(
+        output_bytes(&replay) >= 256 * 1024,
+        "the replay should have carried the pane's full history, got {} bytes",
+        output_bytes(&replay)
+    );
+    assert!(
+        !matches!(
+            subscriber.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ),
+        "the daemon hung up on the subscriber before it had read anything"
+    );
+
     // Reading in lock-step, like any subscribed client, it goes on being
-    // sent live output well past the live-traffic budget above -- proving
-    // the replay it was just handed did not eat into it -- and is never
-    // hung up.
+    // sent LIVE output well past the live-traffic budget above -- proving
+    // that traffic, arriving over time, is not eaten into by the replay
+    // already delivered -- and is never hung up, for as long as it reads.
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut total = 0;
     while total < 3 * BUDGET {
