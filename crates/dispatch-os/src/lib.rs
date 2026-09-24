@@ -8,6 +8,7 @@ pub mod host;
 pub mod ipc;
 pub mod paths;
 pub mod process;
+pub mod pty;
 pub mod signal;
 
 /// Serialises the tests that move the process-wide configuration directory.

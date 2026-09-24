@@ -18,7 +18,6 @@ use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, channel, sync_
 use std::time::Duration;
 
 use dispatch_config::Launch;
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::vt::{Size, VtError, VtTerminal};
 
@@ -50,7 +49,7 @@ pub const DRAIN_BUDGET: usize = 128 * 1024;
 /// Failures while running a pseudoterminal.
 #[derive(Debug, thiserror::Error)]
 pub enum PtyError {
-    /// The pseudoterminal could not be opened.
+    /// The pseudoterminal could not be opened or resized.
     #[error("failed to open a pseudoterminal: {0}")]
     Open(#[source] anyhow::Error),
 
@@ -103,10 +102,6 @@ pub enum RunState {
 /// Carries bytes rather than a screen. Use [`PtySession`] to draw a pane;
 /// use this to move a pane's output somewhere else.
 pub struct Pty {
-    master: Box<dyn MasterPty + Send>,
-    /// Held only on Windows, where dropping the slave closes the ConPTY
-    /// pseudoconsole and leaves the child writing into a dead console.
-    _slave: Option<Box<dyn portable_pty::SlavePty + Send>>,
     /// Input waiting for the pane, written by a thread of its own.
     ///
     /// A write to a pseudoterminal blocks once its buffer is full, and it
@@ -124,6 +119,15 @@ pub struct Pty {
     state: RunState,
     /// Whether everything the child printed has been delivered.
     finished: bool,
+    /// The pseudoterminal, for resizing, held for as long as the pane is: on
+    /// Windows, ending it leaves the child writing into a console that is
+    /// gone.
+    ///
+    /// Last, so it is dropped after `events`. Closing a Windows
+    /// pseudoconsole waits for what it still has to say to be read, and the
+    /// reader cannot read while it waits for room in a channel someone still
+    /// holds.
+    terminal: dispatch_os::pty::Terminal,
 }
 
 impl std::fmt::Debug for Pty {
@@ -139,77 +143,43 @@ impl std::fmt::Debug for Pty {
 impl Pty {
     /// Starts `launch` in a new pseudoterminal rooted at `cwd`.
     pub fn spawn(launch: &Launch, cwd: &Path, size: Size) -> Result<Self, PtyError> {
-        // Must happen before the pseudoterminal layer loads anything. On
-        // Windows it decides whether ConPTY comes from the kernel or from
-        // whatever conpty.dll happens to sit on PATH.
+        // Must happen before anything loads a library for a pane. On Windows
+        // it keeps a DLL another program left on PATH from being loaded in
+        // place of the system's own.
         dispatch_os::dll::restrict_search_path();
 
-        let pty_size = PtySize {
-            rows: size.rows,
-            cols: size.cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-
-        let pair = native_pty_system()
-            .openpty(pty_size)
-            .map_err(PtyError::Open)?;
-
-        let mut command = CommandBuilder::new(&launch.command);
-        command.args(&launch.args);
-        command.cwd(cwd);
-        for (key, value) in &launch.env {
-            command.env(key, value);
-        }
-
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|source| PtyError::Spawn {
-                command: launch.command.clone(),
-                source,
-            })?;
-
-        // On Unix the slave is held open by the child, and dropping our copy
-        // is what lets the reader see end-of-file when the child exits.
-        //
-        // On Windows the same drop closes the ConPTY pseudoconsole out from
-        // under the child, which then blocks writing into a dead console: no
-        // output ever arrives and it never exits on its own. Hold it instead.
-        // Exit is detected by waiting on the child either way, so nothing here
-        // depends on end-of-file.
-        let slave = if cfg!(windows) {
-            Some(pair.slave)
-        } else {
-            None
-        };
-
-        let pid = child.process_id();
-
-        let reader = pair.master.try_clone_reader().map_err(PtyError::Open)?;
-        let writer = pair.master.take_writer().map_err(PtyError::Open)?;
-
-        let mut writer = writer;
-        answer_inherit_cursor_handshake(&mut writer);
+        let process = dispatch_os::pty::spawn(
+            &dispatch_os::pty::PtyCommand {
+                program: &launch.command,
+                args: &launch.args,
+                env: &launch.env,
+                cwd,
+            },
+            size.rows,
+            size.cols,
+        )
+        .map_err(|source| PtyError::Spawn {
+            command: launch.command.clone(),
+            source: source.into(),
+        })?;
 
         let (input, queued) = channel();
         let waiting = Arc::new(AtomicUsize::new(0));
-        spawn_writer(writer, queued, Arc::clone(&waiting));
+        spawn_writer(process.writer, queued, Arc::clone(&waiting));
 
         let (tx, events) = sync_channel(OUTPUT_CHUNKS);
-        spawn_reader(reader, tx.clone());
-        spawn_waiter(child, tx);
+        spawn_reader(process.reader, tx.clone());
+        spawn_waiter(process.child, tx);
 
         Ok(Self {
-            master: pair.master,
-            _slave: slave,
             input,
             waiting,
             events,
             size,
-            pid,
+            pid: process.pid,
             state: RunState::Running,
             finished: false,
+            terminal: process.terminal,
         })
     }
 
@@ -302,14 +272,9 @@ impl Pty {
             return Ok(());
         }
 
-        self.master
-            .resize(PtySize {
-                rows: size.rows,
-                cols: size.cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(PtyError::Open)?;
+        self.terminal
+            .resize(size.rows, size.cols)
+            .map_err(|e| PtyError::Open(e.into()))?;
 
         self.size = size;
         Ok(())
@@ -460,26 +425,6 @@ impl PtySession {
     }
 }
 
-/// Unblocks ConPTY's inherit-cursor handshake on Windows.
-///
-/// `portable-pty` creates the pseudoconsole with `PSEUDOCONSOLE_INHERIT_CURSOR`,
-/// which makes ConPTY ask the containing terminal where its cursor is and wait
-/// for the answer before it starts pumping. A terminal emulator answers because
-/// it is one; Dispatch embeds the pseudoconsole instead, so without this the
-/// child starts, produces no output, and never exits.
-///
-/// Sends a cursor position report for row 1, column 1. A failure here is not
-/// fatal on its own, so it is logged rather than returned.
-fn answer_inherit_cursor_handshake(writer: &mut Box<dyn Write + Send>) {
-    if !cfg!(windows) {
-        return;
-    }
-
-    if let Err(error) = writer.write_all(b"\x1b[1;1R").and_then(|()| writer.flush()) {
-        tracing::warn!(%error, "failed to answer the ConPTY inherit-cursor handshake");
-    }
-}
-
 /// What one pass over a pane's events found.
 struct Drained {
     /// The output taken.
@@ -521,19 +466,23 @@ fn drain_from(events: &Receiver<PtyEvent>, budget: usize) -> Drained {
 }
 
 /// Reads the pseudoterminal until end-of-file, forwarding bytes.
+///
+/// Reads on after the pane has gone, dropping what arrives: on Windows the
+/// pseudoconsole only finishes closing once its output pipe is drained, so a
+/// reader that stopped would leave that close waiting forever.
 fn spawn_reader(mut reader: Box<dyn Read + Send>, tx: SyncSender<PtyEvent>) {
     std::thread::spawn(move || {
         // Large enough that a burst of output is a few reads rather than
         // hundreds, small enough not to sit idle holding memory per pane.
         let mut buf = [0u8; 8192];
+        let mut delivering = true;
 
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if tx.send(PtyEvent::Output(buf[..n].to_vec())).is_err() {
-                        // The session is gone; nothing left to deliver to.
-                        break;
+                    if delivering && tx.send(PtyEvent::Output(buf[..n].to_vec())).is_err() {
+                        delivering = false;
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -567,23 +516,9 @@ fn spawn_writer(
 }
 
 /// Waits for the child and reports its exit status.
-fn spawn_waiter(mut child: Box<dyn portable_pty::Child + Send + Sync>, tx: SyncSender<PtyEvent>) {
+fn spawn_waiter(child: dispatch_os::pty::Child, tx: SyncSender<PtyEvent>) {
     std::thread::spawn(move || {
-        let code = match child.wait() {
-            Ok(status) => {
-                // ExitStatus reports success plus a platform code; a failed
-                // exit with no code still has to be distinguishable from a
-                // clean one.
-                if status.success() {
-                    0
-                } else {
-                    i32::try_from(status.exit_code()).unwrap_or(1)
-                }
-            }
-            Err(_) => 1,
-        };
-
-        let _ = tx.send(PtyEvent::Exited(code));
+        let _ = tx.send(PtyEvent::Exited(child.wait()));
     });
 }
 

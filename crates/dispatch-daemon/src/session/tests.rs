@@ -53,6 +53,14 @@ fn harnesses(dir: &std::path::Path) -> HarnessRegistry {
     };
     std::fs::write(dir.join("flood.toml"), flood).expect("temp dir is writable");
 
+    // A pane with a grandchild, so shutdown can be seen to end the whole tree.
+    let tree = if cfg!(windows) {
+        "id = \"tree\"\ndisplay_name = \"Tree\"\ncommand = \"cmd.exe\"\nargs = [\"/c\", \"ping -n 30 127.0.0.1 >nul\"]\n"
+    } else {
+        "id = \"tree\"\ndisplay_name = \"Tree\"\ncommand = \"sh\"\nargs = [\"-c\", \"sleep 30 & sleep 30\"]\n"
+    };
+    std::fs::write(dir.join("tree.toml"), tree).expect("temp dir is writable");
+
     HarnessRegistry::load_from_dir(dir).expect("loading succeeds")
 }
 
@@ -3186,5 +3194,61 @@ fn a_seat_held_by_a_refused_clients_stuck_writer_is_not_released_early() {
     assert!(
         admitted,
         "a second client was never admitted once the first was fully gone"
+    );
+}
+
+#[test]
+fn shutting_down_ends_every_panes_whole_tree() {
+    let (mut daemon, project, _dir) = daemon("tree-down");
+    let inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    daemon.request_for_test(
+        1,
+        ClientMessage::SpawnPane {
+            project,
+            harness: "tree".into(),
+            size: (80, 24),
+        },
+    );
+    wait_for(&mut daemon, &inbox, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { .. }))
+    });
+
+    let pid = daemon
+        .pane_pids_for_test()
+        .into_iter()
+        .next()
+        .expect("the pane has a pid");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let everyone = loop {
+        let below = dispatch_os::process::descendants(pid);
+        if !below.is_empty() {
+            break std::iter::once(pid).chain(below).collect::<Vec<_>>();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the pane never started its children"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    daemon.shutdown_handle().request();
+    daemon.run();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while everyone
+        .iter()
+        .any(|p| dispatch_os::process::is_running(*p))
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        everyone
+            .iter()
+            .all(|p| !dispatch_os::process::is_running(*p)),
+        "a process a pane started outlived the daemon: {everyone:?}"
     );
 }

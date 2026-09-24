@@ -1719,6 +1719,16 @@ impl Daemon {
     pub fn detach_for_test(&mut self, id: u64) {
         self.handle(Event::Detached(id));
     }
+
+    /// The pid of every pane's process, for tests that watch a tree end.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pane_pids_for_test(&self) -> Vec<u32> {
+        self.panes
+            .values()
+            .filter_map(|pane| pane.session.pid())
+            .collect()
+    }
 }
 
 #[cfg(test)]

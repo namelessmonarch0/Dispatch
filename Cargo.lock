@@ -513,6 +513,7 @@ version = "0.1.0"
 dependencies = [
  "directories",
  "libc",
+ "portable-pty",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -538,7 +539,6 @@ dependencies = [
  "dispatch-config",
  "dispatch-core",
  "dispatch-os",
- "portable-pty",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

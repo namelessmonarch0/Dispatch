@@ -418,15 +418,14 @@ fn a_pane_that_stops_reading_does_not_block_its_writer() {
 #[test]
 #[cfg_attr(
     windows,
-    ignore = "the pseudoconsole is held open on purpose, so the master never reaches end-of-file"
+    ignore = "the pseudoconsole is held open on purpose, so its output never reaches end-of-file"
 )]
 fn a_finished_pty_is_one_whose_output_is_complete() {
     // `is_finished` is the honest signal: both senders gone means the reader
     // reached end-of-file and the waiter reported the exit. Windows cannot give
-    // it -- `Pty` holds the slave so the pseudoconsole stays alive, which is what
-    // keeps a child from writing into a dead console -- so there the daemon's
-    // grace period is the only rule, and the test above is the one that covers
-    // it.
+    // it -- `Pty` holds the pseudoconsole open, which is what keeps a child from
+    // writing into a dead console -- so there the daemon's grace period is the
+    // only rule, and the test above is the one that covers it.
     let mut pty = Pty::spawn(&shell("echo complete-marker"), &cwd(), Size::new(80, 24))
         .expect("spawning succeeds");
 
@@ -521,5 +520,57 @@ fn a_drain_stops_at_its_budget_and_the_next_takes_the_rest() {
         [first, second].concat(),
         sent,
         "the next drain hands over the rest, in order"
+    );
+}
+
+/// A script that starts something and waits, on every platform: a pane
+/// with a grandchild.
+fn a_tree() -> &'static str {
+    if cfg!(windows) {
+        "ping -n 30 127.0.0.1 >nul"
+    } else {
+        "sleep 30 & sleep 30"
+    }
+}
+
+/// How many processes below the pane `a_tree` starts.
+fn tree_size() -> usize {
+    if cfg!(windows) { 1 } else { 2 }
+}
+
+#[test]
+fn terminating_a_pane_ends_everything_it_started() {
+    let mut pty =
+        Pty::spawn(&shell(a_tree()), &cwd(), Size::new(80, 24)).expect("the shell starts");
+    let pid = pty.pid().expect("a running pane has a pid");
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while dispatch_os::process::descendants(pid).len() < tree_size() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pane never started its children"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let everyone: Vec<u32> = std::iter::once(pid)
+        .chain(dispatch_os::process::descendants(pid))
+        .collect();
+
+    pty.terminate();
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while everyone
+        .iter()
+        .any(|p| dispatch_os::process::is_running(*p))
+        && std::time::Instant::now() < deadline
+    {
+        pty.drain();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        everyone
+            .iter()
+            .all(|p| !dispatch_os::process::is_running(*p)),
+        "a process the pane started outlived it: {everyone:?}"
     );
 }

@@ -6,15 +6,13 @@
 ///
 /// Called once, before anything can load a library on our behalf.
 ///
-/// Two reasons. `portable-pty` probes for a sideloaded `conpty.dll` through
-/// the bare DLL search path and prefers it over the ConPTY exports in
-/// `kernel32.dll`. When an unrelated `conpty.dll` happens to sit on `PATH`,
-/// `CreatePseudoConsole` still succeeds but nothing pumps the pseudoconsole:
-/// children start, produce no output, and never exit. Restricting the search
-/// makes that probe miss, so the kernel's own implementation is used.
-///
-/// It also means Dispatch never loads another application's DLL from `PATH`,
-/// which is the DLL planting problem the same search path creates.
+/// So that Dispatch never loads another application's DLL from `PATH`, which
+/// is the DLL planting problem the default search path creates. Panes met it
+/// first: `portable-pty` probed for a sideloaded `conpty.dll` that way and
+/// preferred it over the kernel's, and an unrelated one on `PATH` left
+/// children that started, printed nothing, and never exited. Panes now call
+/// the kernel's ConPTY directly ([`crate::pty`]); anything else that loads a
+/// library by name still searches.
 pub fn restrict_search_path() {
     imp::restrict_search_path();
 }

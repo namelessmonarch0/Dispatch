@@ -13,7 +13,6 @@ workspace = true
 dispatch-core = { workspace = true }
 dispatch-config = { workspace = true }
 dispatch-os = { workspace = true }
-portable-pty = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

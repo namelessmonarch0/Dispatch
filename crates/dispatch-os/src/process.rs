@@ -164,10 +164,6 @@ pub fn descendants(pid: u32) -> Vec<u32> {
 /// started with `CreateProcessW` to attach a pseudoconsole, which a `Command`
 /// cannot do. It is to be ended as one [`spawn_contained`] started is.
 #[cfg(windows)]
-#[expect(
-    unused_imports,
-    reason = "made for the pane backend, which creates its processes itself and does not call this yet"
-)]
 pub(crate) use imp::contain;
 
 /// The pids reachable downward from `root` through `(pid, parent)` pairs,
