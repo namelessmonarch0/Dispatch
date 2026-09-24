@@ -401,9 +401,7 @@ impl Daemon {
                             continue;
                         }
                         next_id += 1;
-                        if spawn_client(next_id, connection, &sender, &live).is_err() {
-                            break;
-                        }
+                        spawn_client(next_id, connection, &sender, &live);
                     }
                     Err(error) => {
                         tracing::warn!(%error, "failed to accept a connection");
@@ -1783,7 +1781,7 @@ fn spawn_client(
     connection: Connection,
     events: &SyncSender<Event>,
     live: &Arc<AtomicUsize>,
-) -> Result<(), dispatch_os::ipc::IpcError> {
+) {
     let closer = connection.closer();
     // The writer thread gets its own clone: `Daemon::hang_up` closes the one
     // in `Wiring` at once, for a client stuck mid-write, while this one ends
@@ -1806,7 +1804,7 @@ fn spawn_client(
         ))
         .is_err()
     {
-        return Ok(());
+        return;
     }
     live.fetch_add(1, Ordering::Relaxed);
     // Held by both threads below; the seat is freed once whichever of them
@@ -1862,8 +1860,6 @@ fn spawn_client(
         writer_closer.close();
         drop(seat);
     });
-
-    Ok(())
 }
 
 /// Lets a test drive the loop without a socket.
