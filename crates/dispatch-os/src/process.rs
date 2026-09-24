@@ -748,6 +748,17 @@ mod imp {
 
         super::below(pid, &pairs)
     }
+
+    /// The job a contained pid was put in, for a test that asks what is in
+    /// it. Good only while the record lasts.
+    #[cfg(test)]
+    pub(super) fn job_of(pid: u32) -> Option<HANDLE> {
+        jobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pid)
+            .map(|job| job.0.0)
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1005,6 +1016,7 @@ mod tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
+    use std::io::Write as _;
 
     /// Waits for `condition`, returning whether it held in time.
     fn eventually(patience: Duration, condition: impl Fn() -> bool) -> bool {
@@ -1257,12 +1269,18 @@ mod windows_tests {
 
         /// Whether it is in any job at all, as far as can be told.
         fn in_a_job(&self) -> String {
+            self.in_job(std::ptr::null_mut())
+        }
+
+        /// Whether it is in `job`, or in any job when `job` is null.
+        fn in_job(&self, job: windows_sys::Win32::Foundation::HANDLE) -> String {
             use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 
             let mut inside = 0;
             // SAFETY: a live handle opened with
-            // PROCESS_QUERY_LIMITED_INFORMATION; a null job asks about any.
-            if unsafe { IsProcessInJob(self.0, std::ptr::null_mut(), &mut inside) } == 0 {
+            // PROCESS_QUERY_LIMITED_INFORMATION; `job` is null or a live job
+            // handle the record holds.
+            if unsafe { IsProcessInJob(self.0, job, &mut inside) } == 0 {
                 return format!("unknown ({})", std::io::Error::last_os_error());
             }
             (inside != 0).to_string()
@@ -1342,7 +1360,28 @@ mod windows_tests {
         // owns agents: ending the transport must not end them.
         let (mut helper, said) = start_contained_helper("breakaway", false);
         let detached = Held::open(started(&said));
-        let in_a_job = detached.in_a_job();
+
+        // Where everything stood before the job was ended: whether this can
+        // fail at all depends on jobs this test does not make.
+        let starter = Held::open(helper.id());
+        let evidence = match super::imp::job_of(helper.id()) {
+            Some(job) => format!(
+                "this test process's job: {}; the helper in a job: {}, in its own: {}; \
+                 what it started in a job: {}, in the helper's: {}",
+                own_job(),
+                starter.in_a_job(),
+                starter.in_job(job),
+                detached.in_a_job(),
+                detached.in_job(job)
+            ),
+            None => format!(
+                "this test process's job: {}; the helper was never contained",
+                own_job()
+            ),
+        };
+        // Straight to stderr: the harness captures `eprintln!` from a test
+        // that passes, and this belongs in the CI log either way.
+        let _ = writeln!(std::io::stderr(), "breakaway evidence: {evidence}");
 
         terminate_tree(helper.id(), DEFAULT_GRACE).expect("the helper's job is ended");
         let _ = helper.wait();
@@ -1351,9 +1390,7 @@ mod windows_tests {
         detached.end();
         assert!(
             outlived,
-            "the detached process died with the job of the process that started it \
-             (in a job before that: {in_a_job}); this test process's own job: {}",
-            own_job()
+            "the detached process died with the job of the process that started it ({evidence})"
         );
     }
 
