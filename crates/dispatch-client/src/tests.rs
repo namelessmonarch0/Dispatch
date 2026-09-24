@@ -1427,3 +1427,166 @@ fn a_daemon_speaking_another_major_version_is_refused_by_the_client() {
         "expected an incompatible version, got {error:?}"
     );
 }
+
+/// A message far bigger than any pipe or socket buffer, so writing it
+/// blocks until the peer reads.
+fn huge() -> ClientMessage {
+    ClientMessage::OpenProject {
+        root: PathBuf::from("x".repeat(4 * 1024 * 1024)),
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_peer_that_never_reads_is_given_up_on_despite_a_stuck_write() {
+    // The audit's probe: welcomed, then the peer neither reads nor speaks.
+    // The big write blocked holding the lock the supervisor needed, and the
+    // client went on reporting itself connected long past its silence limit.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut encoded = Vec::new();
+    Frame::write(&mut encoded, &welcome()).expect("writing succeeds");
+
+    let client = Client::attach_over(
+        Role::Interface,
+        "test",
+        Liveness {
+            interval: Duration::from_millis(50),
+            silence: Duration::from_millis(300),
+        },
+        OsString::from("sh"),
+        vec![
+            OsString::from("-c"),
+            OsString::from(format!("printf '{}'; sleep 30", octal(&encoded))),
+        ],
+    )
+    .expect("the command answers the handshake");
+
+    client.send(huge());
+
+    // Given up on and redialled -- the command answers again -- well inside
+    // the thirty seconds the first peer would otherwise have held it.
+    assert!(
+        wait_until(Duration::from_secs(5), || client.generation() >= 2),
+        "the client never gave up on a peer it could not write to"
+    );
+
+    let started = Instant::now();
+    drop(client);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "dropping the client took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_peer_that_talks_but_never_reads_is_given_up_on() {
+    // Never silent -- it answers on its own every twenty milliseconds -- so
+    // only a deadline on the write itself can notice that nothing sent
+    // reaches it. The replacement then answers like a live daemon, and the
+    // old connection's stuck write, failing once it is closed, must not take
+    // the replacement down.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _endpoint = Endpoint::new("talks-only");
+
+    let listener = Listener::bind().expect("binding succeeds");
+    let endpoint = dispatch_os::ipc::endpoint().expect("the endpoint resolves");
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+
+    let server = std::thread::spawn(move || {
+        let (mut first_reader, mut first_writer) =
+            listener.accept().expect("the first dial arrives").split();
+        let _ = Frame::read::<_, ClientMessage>(&mut first_reader);
+        Frame::write(&mut first_writer, &welcome()).expect("the welcome goes out");
+        std::thread::spawn(move || {
+            while Frame::write(&mut first_writer, &ServerMessage::Pong { token: 0 }).is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let (mut second_reader, mut second_writer) =
+            listener.accept().expect("the redial arrives").split();
+        let _ = Frame::read::<_, ClientMessage>(&mut second_reader);
+        Frame::write(&mut second_writer, &welcome()).expect("the welcome goes out");
+        std::thread::spawn(move || {
+            while let Ok(message) = Frame::read::<_, ClientMessage>(&mut second_reader) {
+                if let ClientMessage::Ping { token } = message
+                    && Frame::write(&mut second_writer, &ServerMessage::Pong { token }).is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        let _ = stopped.recv();
+        (listener, first_reader)
+    });
+
+    let client = Client::attach_at(
+        Role::Interface,
+        "test",
+        Liveness {
+            interval: Duration::from_millis(50),
+            silence: Duration::from_millis(300),
+        },
+        endpoint,
+    )
+    .expect("the first connection is welcomed");
+
+    client.send(huge());
+
+    assert!(
+        wait_until(PATIENCE, || client.generation() == 2
+            && client.is_connected()),
+        "a peer that never read was not given up on"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        assert!(
+            client.is_connected() && client.generation() == 2,
+            "the old connection's stuck write took down its replacement"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    drop(client);
+    let _ = stop.send(());
+    drop(server.join());
+}
+
+#[test]
+fn a_socket_dial_that_is_given_up_on_lets_its_thread_go() {
+    // A peer that accepts and never answers the handshake. The dial gives
+    // up at its patience; the thread it left parked in the read used to stay
+    // parked until the peer closed -- one per retry, forever.
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _endpoint = Endpoint::new("mute-socket");
+
+    let listener = Listener::bind().expect("binding succeeds");
+    let endpoint = dispatch_os::ipc::endpoint().expect("the endpoint resolves");
+    let (closed, ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut reader, _writer) = listener.accept().expect("the dial arrives").split();
+        let _ = Frame::read::<_, ClientMessage>(&mut reader);
+        // Now say nothing, and report when the client has let go.
+        let mut byte = [0u8; 1];
+        while reader.read(&mut byte).is_ok_and(|n| n > 0) {}
+        let _ = closed.send(());
+        drop(listener);
+    });
+
+    let dialled = connect_within(
+        "test",
+        Role::Interface,
+        &Dial::Endpoint(endpoint),
+        Duration::from_millis(300),
+    );
+    assert!(matches!(dialled, Err(ClientError::Handshake(_))));
+
+    assert!(
+        ended.recv_timeout(PATIENCE).is_ok(),
+        "the abandoned handshake still holds its connection open"
+    );
+}

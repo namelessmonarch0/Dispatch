@@ -21,7 +21,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use dispatch_os::ipc::{Connection, IpcError, StderrHint};
+use dispatch_os::ipc::{Closer, Connection, IpcError, StderrHint};
 use dispatch_proto::{ClientMessage, Frame, ProtocolError, Role, ServerMessage};
 
 /// How a client reaches a daemon, and reaches it again after a drop.
@@ -115,15 +115,6 @@ fn patience_for(dial: &Dial) -> Duration {
     }
 }
 
-/// How long a dialled process tree is given to exit before it is killed
-/// outright.
-///
-/// Shorter than [`process::DEFAULT_GRACE`](dispatch_os::process::DEFAULT_GRACE):
-/// that grace waits on an agent being asked to close a pane, this one on a
-/// transport that has already been replaced or given up on, and nothing --
-/// least of all a reconnection -- should wait on it.
-const DIAL_TEARDOWN_GRACE: Duration = Duration::from_millis(50);
-
 /// The longest gap between reconnection attempts.
 ///
 /// A daemon being restarted is back within a second or two, and a daemon that
@@ -158,44 +149,33 @@ fn next_backoff(current: Duration, dial: &Dial) -> Duration {
     (current * 2).min(retry_for(dial).1)
 }
 
-/// Where a dial leaves its child's pid, for whoever may have to kill it.
+/// Where a dial leaves the means to end what it started, for whoever stops
+/// waiting on it.
 ///
-/// [`Connection::split`] hands the process to the reader half, so nothing but
-/// that reader being dropped reaps it -- and the reader is exactly what stays
-/// blocked when a peer accepts and then never speaks. Two callers walk away
-/// from a reader in that state: a handshake that times out, and a connection
-/// liveness has declared dead. Both would leave an `ssh` running for as long
-/// as the kernel takes to give up on it, while the supervisor dials another.
+/// The handshake runs on a thread of its own, and a peer that accepts and
+/// then never speaks leaves that thread parked in a read. Whoever gives up
+/// on the handshake closes the connection through this: the parked thread
+/// returns and, for a command, the process is ended -- rather than an `ssh`
+/// left running, or a socket left open, for as long as the peer takes to
+/// let go.
 ///
-/// Recorded before the handshake begins rather than after it succeeds: the
-/// handshake is the part that may never finish.
+/// Recorded before the handshake begins, because the handshake is the part
+/// that may never finish.
 #[derive(Clone, Default)]
-struct DialledChild(Arc<Mutex<Option<u32>>>);
+struct Dialling(Arc<Mutex<Option<Closer>>>);
 
-impl DialledChild {
-    /// Remembers the process this dial started, if it started one.
-    fn record(&self, pid: Option<u32>) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = pid;
+impl Dialling {
+    /// Remembers how to end what this dial opened.
+    fn record(&self, closer: Closer) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(closer);
     }
 
-    /// Takes the pid, leaving nothing behind.
-    ///
-    /// Taking rather than reading: whoever takes it owns the killing, and a
-    /// pid killed twice could by then belong to somebody else's process.
-    fn take(&self) -> Option<u32> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
-    }
-}
-
-/// Kills what a command dial started, if it started anything.
-///
-/// A socket dial has no process of its own, which is why this takes an
-/// `Option` rather than making every caller ask first.
-fn reap_dialled(pid: Option<u32>) {
-    let Some(pid) = pid else { return };
-
-    if let Err(error) = dispatch_os::process::terminate_tree(pid, DIAL_TEARDOWN_GRACE) {
-        tracing::warn!(%error, pid, "failed to stop the process behind a dial");
+    /// Ends whatever the dial started, if it started anything.
+    fn abandon(&self) {
+        let closer = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(closer) = closer {
+            closer.close();
+        }
     }
 }
 
@@ -226,13 +206,60 @@ pub enum ClientError {
     Unexpected(String),
 }
 
+/// One connection: where to write, how to end it, and whether a write on it
+/// is under way.
+///
+/// Held by `Arc`, so a write already under way on a connection that has
+/// been replaced carries on against the old one -- and fails, once that is
+/// closed -- without anything having to wait for it.
+struct Line {
+    /// Which connection this is.
+    generation: u64,
+    /// Where everything sent is written, one frame at a time.
+    writer: Mutex<Box<dyn Write + Send>>,
+    /// Ends both halves, and the process behind a command dial.
+    closer: Closer,
+    /// When the write under way began, while one is.
+    ///
+    /// A peer that talks but never reads is never silent, so this is what
+    /// notices it: a write not finished within the silence the connection
+    /// is allowed is not going to finish.
+    writing_since: Mutex<Option<Instant>>,
+}
+
+impl Line {
+    /// A connection with no write under way on it yet.
+    fn new(generation: u64, writer: Box<dyn Write + Send>, closer: Closer) -> Self {
+        Self {
+            generation,
+            writer: Mutex::new(writer),
+            closer,
+            writing_since: Mutex::new(None),
+        }
+    }
+
+    /// How long the write under way has been going, if one is.
+    fn stuck_for(&self) -> Option<Duration> {
+        self.writing_since
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|since| since.elapsed())
+    }
+}
+
 /// The socket, and what is known about it.
 ///
-/// Shared by the reader, the writer and the supervisor. The writer is behind a
-/// lock and behind an `Option` because reconnecting replaces it: senders keep
-/// the same [`Handle`] across a reconnection rather than being handed a new one.
+/// Shared by the reader, the writer and the supervisor. The connection is
+/// behind a lock and an `Option` because reconnecting replaces it: senders
+/// keep the same [`Handle`] across a reconnection rather than being handed a
+/// new one.
 struct Wire {
-    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    /// The connection now, if there is one.
+    ///
+    /// Only ever held for a moment, and never across a read or a write: so
+    /// declaring a connection dead, or putting a new one in its place, never
+    /// waits on a write that is stuck.
+    line: Mutex<Option<Arc<Line>>>,
     connected: AtomicBool,
     /// Incremented for each connection. A change tells a caller its view is of
     /// a connection that no longer exists and has to be rebuilt.
@@ -259,8 +286,6 @@ struct Wire {
     last_asked: Mutex<Instant>,
     /// How patient to be with silence.
     liveness: Liveness,
-    /// The process behind the current connection, when the dial is a command.
-    child: DialledChild,
     /// Why the last dial failed, until one succeeds.
     ///
     /// Kept for the interface rather than only logged: a machine that stays
@@ -273,7 +298,7 @@ impl Wire {
     /// A wire with nothing on it yet: down, at generation 0, and nameless.
     fn new(role: Role, name: &str, liveness: Liveness, dial: Dial) -> Self {
         Self {
-            writer: Mutex::new(None),
+            line: Mutex::new(None),
             connected: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             subscribed: AtomicBool::new(false),
@@ -285,30 +310,58 @@ impl Wire {
             last_heard: Mutex::new(Instant::now()),
             last_asked: Mutex::new(Instant::now()),
             liveness,
-            child: DialledChild::default(),
             last_error: Mutex::new(None),
         }
     }
 
+    /// The connection now, if there is one.
+    fn current(&self) -> Option<Arc<Line>> {
+        self.line.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Writes one message, or reports that the connection is gone.
     fn write(&self, message: &ClientMessage) -> bool {
-        let mut guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-
-        let Some(writer) = guard.as_mut() else {
+        let Some(line) = self.current() else {
             // Disconnected: dropped rather than queued. A keystroke that
             // arrives at an agent minutes later, out of order with the rest,
             // is worse than one that never arrives.
             return false;
         };
 
-        if Frame::write(writer, message).is_err() {
-            let child = self.child.take();
-            *guard = None;
-            self.connected.store(false, Ordering::Relaxed);
-            drop(guard);
+        let mut writer = line.writer.lock().unwrap_or_else(|e| e.into_inner());
+        self.write_on(&line, &mut writer, message)
+    }
+
+    /// Writes one message, unless a write is already under way.
+    ///
+    /// For the supervisor's ping, which must never wait behind a write that
+    /// may be stuck: the write deadline deals with that one.
+    fn try_write(&self, message: &ClientMessage) {
+        let Some(line) = self.current() else { return };
+
+        let mut writer = match line.writer.try_lock() {
+            Ok(writer) => writer,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        self.write_on(&line, &mut writer, message);
+    }
+
+    /// Writes `message` to `line`, timing the write.
+    fn write_on(
+        &self,
+        line: &Line,
+        writer: &mut Box<dyn Write + Send>,
+        message: &ClientMessage,
+    ) -> bool {
+        *line.writing_since.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        let written = Frame::write(writer, message);
+        *line.writing_since.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+        if written.is_err() {
             // The writer going is only half of it: a command whose stdin
-            // closes need not exit, and `ssh` does not.
-            reap_dialled(child);
+            // closes need not exit, and `ssh` does not. `lost` ends the lot.
+            self.lost(line.generation);
             return false;
         }
 
@@ -329,48 +382,46 @@ impl Wire {
             .elapsed()
     }
 
-    /// Records that the connection has broken, and ends the process behind it.
+    /// Records that connection `generation` has broken, and ends it.
     ///
-    /// Dropping the writer closes a command's stdin, which is not enough:
-    /// `ssh` does not exit on it, and the reader that owns the process is
-    /// parked on a peer that has stopped speaking -- the very case liveness
-    /// declares dead. Left alone it would sit there for the kernel's own TCP
-    /// timeout, a quarter of an hour, while the supervisor dialled a second
-    /// one beside it.
+    /// A connection already replaced is left alone: a reader parked on a
+    /// peer liveness gave up on wakes only when that peer finally closes, and
+    /// a write stuck on it fails only once it is closed -- by which time the
+    /// supervisor may have dialled a replacement, which "whatever is current"
+    /// would tear down. Compared under the lock the supervisor installs a
+    /// connection under, so the check cannot fall between a replacement being
+    /// put in place and its generation being counted.
     ///
-    /// The pid is taken *before* the connection is marked down, because down
-    /// is what lets the supervisor dial again: taking second could hand this
-    /// call the fresh connection's child and kill that instead.
-    ///
-    /// `generation` names the connection the caller is reporting on, and a
-    /// connection that has already been replaced is left alone. A reader
-    /// parked on a peer that liveness gave up on wakes only when that peer
-    /// finally closes -- by which time the supervisor may have dialled a
-    /// replacement, and acting on "whatever is current" would clear the
-    /// replacement's writer and kill its child. Compared under the writer
-    /// lock, which the supervisor holds while it installs a connection, so
-    /// the check cannot fall between a replacement's child being recorded
-    /// and its generation being counted.
+    /// Marked down under that lock too, so `connected` never disagrees with
+    /// whether there is a line. Closed after, outside it: ending a command's
+    /// process tree can take a moment, and nothing else should wait for it.
     fn lost(&self, generation: u64) {
-        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        if self.generation.load(Ordering::Relaxed) != generation {
-            return;
-        }
+        let line = {
+            let mut slot = self.line.lock().unwrap_or_else(|e| e.into_inner());
+            if slot
+                .as_ref()
+                .is_none_or(|line| line.generation != generation)
+            {
+                return;
+            }
+            self.connected.store(false, Ordering::Relaxed);
+            slot.take()
+        };
 
-        let child = self.child.take();
-        *writer = None;
-        self.connected.store(false, Ordering::Relaxed);
-        drop(writer);
-        reap_dialled(child);
+        if let Some(line) = line {
+            line.closer.close();
+        }
     }
 
     /// Records that the current connection has broken.
     ///
     /// For callers that are about the connection as it stands rather than
-    /// one they were handed: the supervisor, which is the only thing that
-    /// replaces it, and a queue whose writer thread has gone.
+    /// one they were handed: the supervisor, and a queue whose writer thread
+    /// has gone.
     fn lost_current(&self) {
-        self.lost(self.generation.load(Ordering::Relaxed));
+        if let Some(line) = self.current() {
+            self.lost(line.generation);
+        }
     }
 }
 
@@ -571,9 +622,9 @@ impl Client {
         let connected = connect_within(name, role, &dial, patience_for(&dial))?;
 
         let wire = Wire::new(role, name, liveness, dial);
-        wire.child.record(connected.child);
         *wire.device.lock().unwrap_or_else(|e| e.into_inner()) = connected.device;
-        *wire.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(connected.writer);
+        *wire.line.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Arc::new(Line::new(1, connected.writer, connected.closer)));
         wire.generation.store(1, Ordering::Relaxed);
         wire.connected.store(true, Ordering::Relaxed);
 
@@ -708,23 +759,23 @@ struct Connected {
     writer: Box<dyn Write + Send>,
     /// What the daemon calls itself.
     device: String,
-    /// The process behind a command dial, so whatever supervises this
-    /// connection can end it without waiting on the reader that owns it.
-    child: Option<u32>,
+    /// Ends this connection, both halves and any process behind it.
+    closer: Closer,
 }
 
 /// Connects and shakes hands, giving up if the peer does not answer in time.
 ///
 /// The handshake runs on a thread of its own so a peer that accepts and then
-/// says nothing costs one abandoned thread — which ends when that peer finally
-/// closes — rather than the client's ability to connect at all.
+/// says nothing costs one thread for as long as the handshake is given --
+/// rather than the client's ability to connect at all.
 ///
-/// Abandoning the thread is not abandoning what it started: a command dial
-/// records its process before shaking hands, and giving up on the handshake
-/// kills it. Without that, the thread stays blocked in the read forever
-/// holding both halves, so the command's stdin is never even closed — and the
-/// supervisor, which repeats the dial every couple of seconds, would start a
-/// fresh one each time.
+/// Abandoning the thread is not abandoning what it started: a dial records
+/// how to end its connection before shaking hands, and giving up on the
+/// handshake closes what the dial opened -- the socket, or the command's
+/// whole process tree. Without that, the thread stays blocked in the read
+/// holding both halves until the peer lets go, so a command's stdin is never
+/// even closed -- and the supervisor, which repeats the dial every couple of
+/// seconds, would leave one more behind each time.
 fn connect_within(
     name: &str,
     role: Role,
@@ -734,8 +785,8 @@ fn connect_within(
     let (done, answer) = channel();
     let name = name.to_string();
     let for_thread = dial.clone();
-    let started = DialledChild::default();
-    let recording = started.clone();
+    let dialling = Dialling::default();
+    let recording = dialling.clone();
 
     std::thread::spawn(move || {
         let _ = done.send(connect(&name, role, &for_thread, &recording));
@@ -748,7 +799,7 @@ fn connect_within(
         // from the caller's side and cannot carry a stderr hint that only the
         // thread holds.
         Err(_) => {
-            reap_dialled(started.take());
+            dialling.abandon();
             Err(ClientError::Handshake(format!(
                 "{dial} did not answer within {patience:?}"
             )))
@@ -759,12 +810,12 @@ fn connect_within(
 /// Connects and shakes hands, returning the two halves and the daemon's name.
 ///
 /// `started` is filled in before the handshake, so a caller that stops waiting
-/// still has something to kill; see [`DialledChild`].
+/// still has something to close; see [`Dialling`].
 fn connect(
     name: &str,
     role: Role,
     dial: &Dial,
-    started: &DialledChild,
+    started: &Dialling,
 ) -> Result<Connected, ClientError> {
     let (connection, hint) = match dial {
         Dial::Endpoint(endpoint) => match Connection::connect_to(endpoint) {
@@ -781,8 +832,8 @@ fn connect(
         }
     };
 
-    let child = connection.child_id();
-    started.record(child);
+    let closer = connection.closer();
+    started.record(closer.clone());
 
     let (mut reader, mut writer) = connection.split();
 
@@ -827,7 +878,7 @@ fn connect(
         reader,
         writer,
         device,
-        child,
+        closer,
     })
 }
 
@@ -965,49 +1016,52 @@ fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
 
             let patience = patience_for(&wire.dial);
             match connect_within(&wire.name, wire.role, &wire.dial, patience) {
-                Ok(connected) => {
-                    // Recorded, then checked: `Client::drop` sets `closed`
-                    // and then takes the pid, so whichever order the two
-                    // threads meet in, exactly one of them finds it. Checked
-                    // only at the top of the loop, a dial that finished after
-                    // the client was dropped left a process nobody would
-                    // ever take.
-                    //
-                    // All of it under the writer lock, which `Wire::lost`
-                    // takes to compare generations: a stale reader's report
-                    // then sees either the old generation with the old
-                    // child already gone, or the new generation and leaves
-                    // it alone -- never the new child under the old number.
-                    let mut writer = wire.writer.lock().unwrap_or_else(|e| e.into_inner());
-                    wire.child.record(connected.child);
-                    if wire.closed.load(Ordering::Relaxed) {
-                        drop(writer);
-                        reap_dialled(wire.child.take());
-                        return;
+                Ok(mut connected) => {
+                    // Asked for before the line is put in place, rather than
+                    // through the queue or once it is up: the queue's writer
+                    // may be mid-message, and a subscribe that arrives after
+                    // the first keystroke would lose the panes -- and once
+                    // the line is up that writer may be stuck on it, and the
+                    // supervisor must never wait behind a write. Until then
+                    // nothing else can reach this writer, and a few bytes
+                    // into a fresh connection do not block. One that cannot
+                    // take them is already broken, and its next write or its
+                    // reader will say so.
+                    if wire.subscribed.load(Ordering::Relaxed) {
+                        let _ = Frame::write(&mut connected.writer, &ClientMessage::Subscribe);
                     }
 
-                    *wire.device.lock().unwrap_or_else(|e| e.into_inner()) = connected.device;
-                    *writer = Some(connected.writer);
-                    let generation = wire.generation.fetch_add(1, Ordering::Relaxed) + 1;
-                    drop(writer);
+                    // Checked under the lock `Client::drop` takes to clear the
+                    // line, so whichever of the two gets there first, the
+                    // connection is closed exactly once. Device, line,
+                    // generation and `connected` all change together under
+                    // it: an interface that sees the generation move sees
+                    // the device that came with it, and `lost` never finds a
+                    // line without its generation counted.
+                    let generation = {
+                        let mut slot = wire.line.lock().unwrap_or_else(|e| e.into_inner());
+                        if wire.closed.load(Ordering::Relaxed) {
+                            drop(slot);
+                            connected.closer.close();
+                            return;
+                        }
+
+                        *wire.device.lock().unwrap_or_else(|e| e.into_inner()) = connected.device;
+                        let generation = wire.generation.fetch_add(1, Ordering::Relaxed) + 1;
+                        *slot = Some(Arc::new(Line::new(
+                            generation,
+                            connected.writer,
+                            connected.closer,
+                        )));
+                        wire.heard();
+                        wire.connected.store(true, Ordering::Relaxed);
+                        generation
+                    };
 
                     *wire.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                    wire.heard();
-                    wire.connected.store(true, Ordering::Relaxed);
                     read_from(connected.reader, generation, &incoming, &wire);
 
-                    // Sent directly rather than through the queue: the queue's
-                    // writer may be mid-message, and a subscribe that arrives
-                    // after the first keystroke would lose the panes.
-                    if wire.subscribed.load(Ordering::Relaxed) {
-                        wire.write(&ClientMessage::Subscribe);
-                    }
-
-                    tracing::info!(
-                        generation = wire.generation.load(Ordering::Relaxed),
-                        dial = %wire.dial,
-                        "connected to the daemon"
-                    );
+                    tracing::info!(generation, dial = %wire.dial, "connected to the daemon");
                     backoff = first_retry;
                 }
                 Err(error) => {
@@ -1020,8 +1074,22 @@ fn supervise(incoming: Sender<ServerMessage>, wire: &Arc<Wire>) {
     });
 }
 
-/// Asks a quiet daemon whether it is there, and gives up on one that never says.
+/// Asks a quiet daemon whether it is there, and gives up on one that never
+/// says -- or on one a write has been stuck on for as long as silence is
+/// allowed.
 fn check_liveness(wire: &Wire) {
+    // First, because a peer that talks but never reads is never quiet: its
+    // chatter would pass every check below while nothing sent reaches it.
+    if let Some(line) = wire.current()
+        && line
+            .stuck_for()
+            .is_some_and(|stuck| stuck >= wire.liveness.silence)
+    {
+        tracing::info!("a write to the daemon never finished");
+        wire.lost(line.generation);
+        return;
+    }
+
     let quiet = wire.quiet_for();
 
     if quiet >= wire.liveness.silence {
@@ -1044,10 +1112,10 @@ fn check_liveness(wire: &Wire) {
     *asked = Instant::now();
     drop(asked);
 
-    // Written straight to the socket rather than queued: the queue carries the
-    // interface's traffic, and a write that fails here is itself the answer,
-    // because the connection is gone.
-    wire.write(&ClientMessage::Ping {
+    // Written straight to the socket rather than queued -- the queue carries
+    // the interface's traffic -- but only if no write is under way: a ping
+    // that waited behind a stuck write would stall the supervisor with it.
+    wire.try_write(&ClientMessage::Ping {
         token: u64::try_from(quiet.as_millis()).unwrap_or(u64::MAX),
     });
 }
@@ -1132,10 +1200,19 @@ impl Drop for Client {
         // is listening to, for as long as the process lives.
         self.wire.closed.store(true, Ordering::Relaxed);
 
-        // And the command the last dial started would outlive the client that
-        // wanted it: the reader that owns it is parked, and nothing else is
-        // ever going to wake it.
-        reap_dialled(self.wire.child.take());
+        // And the connection -- a socket, or a command's whole process tree
+        // -- would outlive the client that wanted it: the reader that owns it
+        // is parked, and nothing else is ever going to wake it.
+        let line = self
+            .wire
+            .line
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(line) = line {
+            self.wire.connected.store(false, Ordering::Relaxed);
+            line.closer.close();
+        }
     }
 }
 
