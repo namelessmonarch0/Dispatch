@@ -3512,6 +3512,56 @@ fn a_command_windows_finds_as_a_batch_file_is_refused_before_anyone_is_asked() {
 }
 
 #[test]
+#[cfg_attr(
+    not(windows),
+    ignore = "a batch file runs through cmd.exe only on Windows"
+)]
+fn a_command_that_becomes_a_batch_file_while_asking_is_refused_at_approval() {
+    // Judged when the request arrived, `agent` found nothing. By the time
+    // the user approves, `agent.CMD` is there -- and what starts is decided
+    // when it starts.
+    let bin = TempDir::new("late-bin");
+    let (mut daemon, ui, caller, dir) = delegating_to(
+        "late-batch",
+        &[("agent", bare_agent(&bin.0))],
+        "agent",
+        // No space, so no quotes around it on the command line: the shape
+        // that ran a second command.
+        "x&echo.DISPATCH_AUDIT_MARKER>marker.txt",
+    );
+    let request = pending(&drain(&ui)).expect("nothing is a batch file yet, so the user is asked");
+
+    std::fs::write(bin.0.join("agent.CMD"), "@echo ran\r\n").expect("temp dir is writable");
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+
+    let told = outcomes(&drain(&caller));
+    assert!(
+        told.iter().any(|o| matches!(
+            o,
+            DelegateOutcome::Refused { reason } if reason.to_lowercase().contains("agent.cmd")
+        )),
+        "the approval is judged again on what would start: {told:?}"
+    );
+    assert_eq!(daemon.pane_count(), 1, "nothing started");
+    // Given time to have run, had it started.
+    for _ in 0..50 {
+        daemon.tick();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !dir.0.join("marker.txt").exists(),
+        "a command inside the task ran"
+    );
+}
+
+#[test]
 fn an_argument_form_is_never_handed_a_task_file() {
     // Its task is in its arguments. A DISPATCH_TASK_FILE in its environment
     // could only be stale -- inherited, or set in the harness file -- and a
