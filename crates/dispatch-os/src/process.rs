@@ -83,16 +83,24 @@ pub fn terminate_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
 /// Asks `pid`'s group or job to stop, and kills what is left after `grace`,
 /// without waiting afterwards for it to be gone.
 ///
-/// For a caller that holds what the tree's own reaping needs. A command
+/// On Linux a killed leader nobody has waited for is still a member of its
+/// group, so waiting for the group to vanish before the leader is reaped
+/// waits out the whole of [`terminate_tree`]'s kill timeout on a zombie.
+/// This is for the callers that reap, or hold what reaping needs. A command
 /// transport's closer signals under the lock that keeps its child's pid from
-/// being freed, and the reader half needs that same lock to wait for the
-/// child. On Linux a killed leader nobody has waited for is still a member
-/// of its group, so waiting for the group to vanish while holding the lock
-/// waits for a zombie only the blocked reaper could clear -- every time, for
-/// the whole of [`terminate_tree`]'s kill timeout. Signalling and letting go
-/// lets the reaper finish the job.
+/// being freed, which the reaper needs too; the reaper signals, waits for
+/// the leader, and only then waits for the rest with [`wait_for_tree`].
 pub(crate) fn signal_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
     imp::signal_tree(pid, grace)
+}
+
+/// Waits, for at most the kill timeout, until nothing is left of the group
+/// or job `pid` led, once `pid` itself has been signalled and reaped.
+///
+/// Sends nothing: it only asks. Once the group empties, its id is free for
+/// the system to give away, so a signal from here could reach a stranger.
+pub(crate) fn wait_for_tree(pid: u32) {
+    imp::wait_for_tree(pid);
 }
 
 /// Starts `command` so that [`terminate_tree`] reaches everything it starts.
@@ -282,6 +290,10 @@ mod imp {
 
         signal_group(pid, libc::SIGKILL).map_err(map)?;
         Ok(())
+    }
+
+    pub(super) fn wait_for_tree(pid: u32) {
+        wait_for_group_to_exit(pid, KILL_TIMEOUT);
     }
 
     pub(super) fn spawn_contained(
@@ -623,7 +635,7 @@ mod imp {
 
     /// Ends a contained pid's job as [`terminate_tree`] does, without waiting
     /// for it to empty; the job stays recorded, so a later `terminate_tree`
-    /// can do that waiting.
+    /// or [`wait_for_tree`] can do that waiting.
     ///
     /// Nothing here needs a reaper -- a terminated process signals its
     /// handle whether or not anyone has waited for it -- so a process that
@@ -638,6 +650,19 @@ mod imp {
         drop(jobs);
 
         terminate_one(pid, grace)
+    }
+
+    pub(super) fn wait_for_tree(pid: u32) {
+        let job = jobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&pid);
+        // Whatever is still in it when the wait gives up is ended as the job
+        // closes. A process that was never contained has no rest to wait
+        // for: the leader was all there was, and it has been waited for.
+        if let Some(job) = job {
+            let _ = job.wait_until_empty();
+        }
     }
 
     /// Ends one process that was never contained -- a daemon started

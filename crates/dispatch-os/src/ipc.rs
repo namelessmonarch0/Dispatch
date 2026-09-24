@@ -430,17 +430,25 @@ struct Spawned {
     pid: Arc<Mutex<Option<u32>>>,
 }
 
-/// Terminates a command transport's whole process tree, then reaps its
+/// Terminates a command transport's whole process tree, reaping its
 /// immediate child.
 ///
 /// `ssh` and `sh -c` both fork; killing only the process this crate spawned
 /// would leave those orphaned and holding the pipes this `Connection` reads
 /// and writes, which is what [`process::spawn_contained`](crate::process::spawn_contained)
 /// and [`process::terminate_tree`](crate::process::terminate_tree) are for.
+///
+/// The tree is signalled, then the child waited for, and only then the rest
+/// of the tree. On Linux a leader nobody has waited for is still a member of
+/// its group, so waiting for the group first sat out the whole kill timeout
+/// on this transport's own zombie: on every drop, and before a dial whose
+/// command had already failed could say so.
 fn reap(spawned: &mut Spawned) {
+    let pid = spawned.child.id();
     spawned.pid.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let _ = crate::process::terminate_tree(spawned.child.id(), TEARDOWN_GRACE);
+    let _ = crate::process::signal_tree(pid, TEARDOWN_GRACE);
     let _ = spawned.child.wait();
+    crate::process::wait_for_tree(pid);
 }
 
 /// A reader that reaps its process when it is dropped.
