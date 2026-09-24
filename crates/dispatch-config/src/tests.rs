@@ -801,6 +801,36 @@ fn an_edited_built_in_from_an_older_release_is_left_alone() {
 }
 
 #[test]
+fn a_batch_file_named_with_trailing_dots_or_spaces_is_still_a_batch_file() {
+    // Windows drops trailing dots and spaces when it opens a file, so
+    // `agent.cmd.` is agent.cmd -- and cmd.exe runs it.
+    let form = |command: &str| -> HarnessDef {
+        toml::from_str(&format!(
+            "id = \"shim\"\ndisplay_name = \"Shim\"\ncommand = '{command}'\n\n\
+             [task]\nargs = [\"-p\", \"{{task}}\"]\n"
+        ))
+        .expect("the definition parses")
+    };
+
+    for command in [
+        "agent.cmd.",
+        "agent.bat ",
+        r"C:\tools\AGENT.CMD. .",
+        "cmd.exe.",
+    ] {
+        assert!(
+            form(command).task_refusal_for("windows").is_some(),
+            "{command:?} runs through cmd.exe"
+        );
+    }
+    assert_eq!(
+        form("agent.exe. ").task_refusal_for("windows"),
+        None,
+        "an executable with the same trimming is still started directly"
+    );
+}
+
+#[test]
 fn a_command_windows_finds_as_a_batch_file_puts_the_task_on_cmds_command_line_too() {
     // `claude` written bare is `claude.cmd` once Windows looks for it, and
     // a batch file runs through cmd.exe: the file found decides, not the

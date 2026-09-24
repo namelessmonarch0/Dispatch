@@ -384,11 +384,15 @@ fn found_as(launch: &Launch) -> std::path::PathBuf {
 
 /// Whether `command` runs through `cmd.exe`: the program itself, or a batch
 /// file, which Windows runs with it.
+///
+/// Judged on the name Windows opens, which has lost any trailing dots and
+/// spaces: `agent.cmd.` is `agent.cmd`.
 fn runs_through_cmd(command: &str) -> bool {
     let name = std::path::Path::new(command)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(command)
+        .trim_end_matches(['.', ' '])
         .to_ascii_lowercase();
 
     name == "cmd" || name == "cmd.exe" || name.ends_with(".cmd") || name.ends_with(".bat")
