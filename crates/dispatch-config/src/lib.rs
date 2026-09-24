@@ -190,6 +190,12 @@ impl HarnessRegistry {
 /// Returns the ids written. A file the user has edited is left alone, so an
 /// upgrade never discards local changes; one nobody touched is brought up to
 /// date, so a fix to a built-in reaches installations made before it.
+///
+/// An upgrade that fails is logged and skipped rather than returned: the
+/// file it would have replaced is still a valid harness, and a Windows form
+/// it leaves in place is refused when used, so nothing is gained by stopping
+/// Dispatch from starting over it. Failing to write a missing file is still
+/// an error, as it always was.
 pub fn write_missing_built_ins(dir: &Path) -> Result<Vec<&'static str>, ConfigError> {
     std::fs::create_dir_all(dir).map_err(|source| ConfigError::Io {
         path: dir.to_path_buf(),
@@ -201,35 +207,76 @@ pub fn write_missing_built_ins(dir: &Path) -> Result<Vec<&'static str>, ConfigEr
     for built_in in defaults::BUILT_INS {
         let path = dir.join(format!("{}.toml", built_in.id));
 
-        if path.exists() {
-            // Compared without carriage returns: a file written from a
-            // checkout with CRLF line endings is still the same file.
-            let unix = |text: &str| text.replace("\r\n", "\n");
-            let existing = std::fs::read_to_string(&path).map_err(|source| ConfigError::Io {
+        if !path.exists() {
+            std::fs::write(&path, built_in.toml).map_err(|source| ConfigError::Io {
                 path: path.clone(),
                 source,
             })?;
-            let untouched = built_in
-                .superseded
-                .iter()
-                .any(|old| unix(old) == unix(&existing));
-            if !untouched {
-                continue;
-            }
-            tracing::info!(
-                harness = built_in.id,
-                "upgrading a built-in harness nobody edited"
-            );
+            written.push(built_in.id);
+            continue;
         }
 
-        std::fs::write(&path, built_in.toml).map_err(|source| ConfigError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        written.push(built_in.id);
+        match upgrade(&path, built_in) {
+            Ok(true) => written.push(built_in.id),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                harness = built_in.id,
+                %error,
+                "could not upgrade a built-in harness nobody edited; it is left as it was"
+            ),
+        }
     }
 
     Ok(written)
+}
+
+/// Replaces `path` with `built_in`'s current body if it is still exactly a
+/// body an earlier Dispatch wrote, and says whether it did.
+///
+/// Replaced, never rewritten in place, so another Dispatch starting at the
+/// same moment reads the old body or the new and never part of either. A
+/// link is followed first: the file it names is what gets replaced, and the
+/// link -- the user's arrangement -- stays.
+fn upgrade(path: &Path, built_in: &defaults::BuiltIn) -> Result<bool, ConfigError> {
+    let io = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| ConfigError::Io { path, source }
+    };
+
+    let existing = match std::fs::read_to_string(path) {
+        Ok(existing) => existing,
+        // Not text, so not anything Dispatch wrote.
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => return Ok(false),
+        Err(error) => return Err(io(path)(error)),
+    };
+
+    // Compared without carriage returns: a file written from a checkout
+    // with CRLF line endings is still the same file.
+    let unix = |text: &str| text.replace("\r\n", "\n");
+    let untouched = built_in
+        .superseded
+        .iter()
+        .any(|old| unix(old) == unix(&existing));
+    if !untouched {
+        return Ok(false);
+    }
+
+    let is_link = std::fs::symlink_metadata(path)
+        .map_err(io(path))?
+        .file_type()
+        .is_symlink();
+    let target = if is_link {
+        std::fs::canonicalize(path).map_err(io(path))?
+    } else {
+        path.to_path_buf()
+    };
+
+    store::replace_unlocked(&target, built_in.toml)?;
+    tracing::info!(
+        harness = built_in.id,
+        "upgraded a built-in harness nobody edited"
+    );
+    Ok(true)
 }
 
 #[cfg(test)]

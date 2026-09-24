@@ -652,6 +652,113 @@ fn every_body_an_earlier_dispatch_wrote_is_upgraded() {
 }
 
 #[test]
+#[cfg(unix)]
+fn an_upgrade_replaces_the_file_rather_than_rewriting_it() {
+    // A reader -- another Dispatch starting -- must see the old body or the
+    // new, never part of either. A second name for the old file shows which
+    // happened: a file replaced leaves it holding the old body, and one
+    // rewritten in place changes under it.
+    let dir = TempDir::new("upgrade-replaces");
+    let old = include_str!("../harnesses/superseded/claude-5.toml");
+    dir.write("claude.toml", old);
+    std::fs::hard_link(
+        dir.path().join("claude.toml"),
+        dir.path().join("claude.old"),
+    )
+    .expect("the file system links");
+
+    let written = write_missing_built_ins(dir.path()).expect("writing succeeds");
+
+    assert!(written.contains(&"claude"), "{written:?}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("claude.old")).expect("it reads"),
+        old,
+        "the old file was written over rather than replaced"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("claude.toml")).expect("it reads"),
+        defaults::BUILT_INS[0].toml
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn an_upgrade_through_a_link_changes_the_file_it_names() {
+    // Harness files kept elsewhere -- in a dotfiles repository, say -- and
+    // linked in: the link is the user's arrangement, and stays.
+    let dir = TempDir::new("upgrade-through-link");
+    let kept = TempDir::new("upgrade-link-target");
+    kept.write(
+        "claude.toml",
+        include_str!("../harnesses/superseded/claude-5.toml"),
+    );
+    std::os::unix::fs::symlink(
+        kept.path().join("claude.toml"),
+        dir.path().join("claude.toml"),
+    )
+    .expect("the file system links");
+
+    let written = write_missing_built_ins(dir.path()).expect("writing succeeds");
+
+    assert!(written.contains(&"claude"), "{written:?}");
+    assert!(
+        std::fs::symlink_metadata(dir.path().join("claude.toml"))
+            .expect("the link is there")
+            .file_type()
+            .is_symlink(),
+        "the link was replaced by a file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(kept.path().join("claude.toml")).expect("it reads"),
+        defaults::BUILT_INS[0].toml,
+        "the file the link names was not upgraded"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn an_upgrade_that_cannot_be_written_leaves_everything_else_working() {
+    // The old form stays refused on Windows, so a file that cannot be
+    // upgraded is safe to leave; stopping Dispatch from starting over it is
+    // not.
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new("upgrade-read-only");
+    let old = include_str!("../harnesses/superseded/claude-5.toml");
+    dir.write("claude.toml", old);
+    write_missing_built_ins(dir.path()).expect("the others are written first");
+    dir.write("claude.toml", old);
+
+    let read_only = |mode| {
+        std::fs::set_permissions(
+            dir.path().join("claude.toml"),
+            std::fs::Permissions::from_mode(mode & 0o666),
+        )
+        .expect("permissions change");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode))
+            .expect("permissions change");
+    };
+    read_only(0o555);
+    if std::fs::write(dir.path().join("probe"), "").is_ok() {
+        // Permissions stop nobody running as root.
+        read_only(0o755);
+        eprintln!("skipped: permissions do not stop this user writing");
+        return;
+    }
+
+    let result = write_missing_built_ins(dir.path());
+    let after = std::fs::read_to_string(dir.path().join("claude.toml"));
+    read_only(0o755);
+
+    assert_eq!(
+        result.expect("a failed upgrade is not an error"),
+        Vec::<&str>::new(),
+        "nothing was written"
+    );
+    assert_eq!(after.expect("it reads"), old, "the file is as it was");
+}
+
+#[test]
 fn an_older_built_in_checked_out_with_crlf_is_still_recognised() {
     let dir = TempDir::new("upgrade-crlf");
     // Made LF first: a Windows checkout already has CRLF in what

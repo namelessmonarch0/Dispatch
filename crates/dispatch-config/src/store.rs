@@ -9,6 +9,7 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -94,9 +95,49 @@ fn lock(dir: &Path, file: &str) -> Result<std::fs::File, ConfigError> {
 /// lock writes it.
 fn replace(path: &Path, text: &str) -> Result<(), ConfigError> {
     let staged = path.with_extension("toml.tmp");
+    stage_then_rename(&staged, path, text, |staged| std::fs::File::create(staged))
+}
 
+/// Replaces `path` with `text` without taking a lock, as [`update`]
+/// replaces a registry: staged beside it, on disk, then moved into place.
+///
+/// The staging name is this process's own and created new, never opened if
+/// it exists, so two writers cannot share one and neither can be handed a
+/// file somebody else prepared. Hidden and ending in `.tmp`, so nothing
+/// loading a directory of `.toml` files reads one left by a crash.
+pub(crate) fn replace_unlocked(path: &Path, text: &str) -> Result<(), ConfigError> {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let staged = path.with_file_name(format!(
+        ".{name}.{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    stage_then_rename(&staged, path, text, |staged| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(staged)
+    })
+}
+
+/// Writes `text` to `staged`, opened by `open`, and renames it over `path`.
+///
+/// A failure at any step leaves `path` as it was and removes the staging
+/// file.
+fn stage_then_rename(
+    staged: &Path,
+    path: &Path,
+    text: &str,
+    open: impl FnOnce(&Path) -> std::io::Result<std::fs::File>,
+) -> Result<(), ConfigError> {
     let written = (|| {
-        let mut file = std::fs::File::create(&staged)?;
+        let mut file = open(staged)?;
         file.write_all(text.as_bytes())?;
         // On disk before the rename: a rename that reached the disk first
         // would, after a crash, leave the name pointing at nothing.
@@ -104,15 +145,15 @@ fn replace(path: &Path, text: &str) -> Result<(), ConfigError> {
     })();
 
     if let Err(source) = written {
-        let _ = std::fs::remove_file(&staged);
+        let _ = std::fs::remove_file(staged);
         return Err(ConfigError::Io {
-            path: staged,
+            path: staged.to_path_buf(),
             source,
         });
     }
 
-    std::fs::rename(&staged, path).map_err(|source| {
-        let _ = std::fs::remove_file(&staged);
+    std::fs::rename(staged, path).map_err(|source| {
+        let _ = std::fs::remove_file(staged);
         ConfigError::Io {
             path: path.to_path_buf(),
             source,
