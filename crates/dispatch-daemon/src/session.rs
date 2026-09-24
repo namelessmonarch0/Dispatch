@@ -74,6 +74,25 @@ impl FrameClock {
     }
 }
 
+/// Releases a client's place against `Budgets::max_clients` once nothing is
+/// left running on its behalf.
+///
+/// A seat is taken once, when a client attaches, but two threads act for it
+/// afterwards -- its reader and its writer -- and either can outlive the
+/// other: a writer can go on delivering to a client whose reader has
+/// already ended, so freeing the seat the moment either thread exits would
+/// let the other go on costing a slot nothing accounts for. Wrapped in an
+/// `Arc` and cloned once per thread, so `Drop` runs exactly once, whichever
+/// thread's clone happens to be the last to go -- which also covers a
+/// thread that panics rather than returning.
+struct Seat(Arc<AtomicUsize>);
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Failures starting or running the daemon.
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -276,8 +295,9 @@ impl Daemon {
             loop {
                 match listener.accept() {
                     Ok(connection) => {
-                        // Counted by the readers, which are what a client
-                        // costs; closed at once rather than served badly.
+                        // Counted by seats, held until both of a client's
+                        // threads have ended; closed at once rather than
+                        // served badly.
                         if live.load(Ordering::Relaxed) >= max_clients {
                             tracing::warn!(
                                 max_clients,
@@ -360,8 +380,22 @@ impl Daemon {
                 tracing::info!(client = id, "client attached");
             }
             Event::Detached(id) => {
-                self.clients.remove(&id);
-                self.abandon(id);
+                // A client `refuse`d or already `hang_up`'d on is forgotten
+                // already: its writer thread is on its own from here,
+                // flushing a refusal or already being closed.
+                if self.clients.contains_key(&id) {
+                    // The reader ending only means no more frames are
+                    // coming; the writer can still be stuck delivering to a
+                    // peer that stopped reading, or one that is gone but
+                    // has not yet failed a write of its own. Closing the
+                    // connection now is what frees it -- and the seat it is
+                    // holding open with it -- rather than waiting however
+                    // long that write would otherwise take to fail on its
+                    // own.
+                    self.hang_up(id);
+                } else {
+                    self.abandon(id);
+                }
                 tracing::info!(client = id, "client detached");
             }
             Event::Request(id, message) => self.handle_request(id, message),
@@ -1572,9 +1606,12 @@ fn spawn_client(
         return Ok(());
     }
     live.fetch_add(1, Ordering::Relaxed);
+    // Held by both threads below; the seat is freed once whichever of them
+    // ends last drops its clone, not when the first of the two does.
+    let seat = Arc::new(Seat(Arc::clone(live)));
 
     let incoming = events.clone();
-    let live = Arc::clone(live);
+    let reader_seat = Arc::clone(&seat);
     std::thread::spawn(move || {
         loop {
             match Frame::read_watched::<_, ClientMessage>(&mut reader, || frame.start()) {
@@ -1592,7 +1629,7 @@ fn spawn_client(
             }
         }
 
-        live.fetch_sub(1, Ordering::Relaxed);
+        drop(reader_seat);
         let _ = incoming.send(Event::Detached(id));
     });
 
@@ -1616,6 +1653,7 @@ fn spawn_client(
         // itself, immediately, for a client this thread is instead stuck
         // mid-write to.
         writer_closer.close();
+        drop(seat);
     });
 
     Ok(())

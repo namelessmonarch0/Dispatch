@@ -2481,8 +2481,13 @@ fn output_bytes(messages: &[ServerMessage]) -> usize {
         .sum()
 }
 
-/// How long a test waits for the daemon to hang up on a client, well past
-/// any budget these tests set.
+/// How long a test waits for something the daemon is expected to do about a
+/// client -- hang up on it, or admit the next one.
+///
+/// Not itself past every budget a test sets: the default `handshake` is
+/// exactly this long. A test that cares about a different deadline and
+/// must rule the handshake one out raises it clear of `PATIENCE` instead,
+/// so a failure cannot be mistaken for the wrong cause.
 const PATIENCE: Duration = Duration::from_secs(10);
 
 #[test]
@@ -2910,6 +2915,11 @@ fn clients_past_the_limit_are_turned_away() {
         "quota",
         Budgets {
             max_clients: 2,
+            // Clear of PATIENCE, which equals the default: otherwise a
+            // broken quota could be masked by the handshake deadline
+            // hanging the third client up on its own, and the assertion
+            // below would point at the wrong cause.
+            handshake: Duration::from_secs(60),
             ..Budgets::default()
         },
     );
@@ -2931,4 +2941,136 @@ fn clients_past_the_limit_are_turned_away() {
         let answer: ServerMessage = Frame::read(&mut reader).expect("still served");
         assert!(matches!(answer, ServerMessage::Welcome { .. }));
     }
+}
+
+/// Round 1, finding 1(a): a client that disconnects cleanly must free its
+/// seat, not merely stop being able to use it.
+#[test]
+fn a_seat_freed_by_a_disconnected_client_admits_the_next_one() {
+    let served = served(
+        "seat-freed",
+        Budgets {
+            max_clients: 1,
+            ..Budgets::default()
+        },
+    );
+
+    {
+        let (mut reader, mut writer) = raw_client(&served.endpoint);
+        Frame::write(&mut writer, &hello()).expect("writing succeeds");
+        let welcome: ServerMessage = Frame::read(&mut reader).expect("welcomed");
+        assert!(matches!(welcome, ServerMessage::Welcome { .. }));
+        // Both halves drop here, disconnecting.
+    }
+
+    // Retried rather than tried once: freeing the seat is asynchronous with
+    // this end noticing the first client is gone, so the very next connect
+    // attempt can still land before the daemon has caught up.
+    let deadline = Instant::now() + PATIENCE;
+    let mut admitted = false;
+    while Instant::now() < deadline && !admitted {
+        let (mut reader, mut writer) = raw_client(&served.endpoint);
+        if Frame::write(&mut writer, &hello()).is_ok()
+            && matches!(
+                Frame::read::<_, ServerMessage>(&mut reader),
+                Ok(ServerMessage::Welcome { .. })
+            )
+        {
+            admitted = true;
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    assert!(
+        admitted,
+        "the seat freed by the first client was never reused"
+    );
+}
+
+/// Round 1, finding 1(b): the audit's probe. A client whose reader has
+/// ended -- an ordinary disconnect, from the daemon's point of view -- can
+/// still be holding its seat open through a writer stuck delivering to it,
+/// if freeing the seat is counted per thread rather than per connection.
+#[test]
+#[cfg(unix)]
+fn a_seat_held_by_a_stuck_writer_is_freed_once_the_daemon_notices() {
+    let served = served(
+        "stuck-writer",
+        Budgets {
+            max_clients: 1,
+            ..Budgets::default()
+        },
+    );
+
+    let (reader, mut writer) = raw_client(&served.endpoint);
+    Frame::write(&mut writer, &hello()).expect("writing succeeds");
+    Frame::write(&mut writer, &ClientMessage::Subscribe).expect("writing succeeds");
+    Frame::write(
+        &mut writer,
+        &ClientMessage::SpawnPane {
+            project: served.project,
+            harness: "flood".into(),
+            size: (80, 24),
+        },
+    )
+    .expect("writing succeeds");
+
+    // Shuts down only the half the daemon reads from -- an ordinary
+    // disconnect to its reader thread -- while its writer, fed by a pane
+    // that never stops printing and never drained on this end, is left to
+    // block once the socket fills. Never reading from `reader` is what
+    // lets that happen; it stays open, not dropped, until the loop below no
+    // longer needs it.
+    drop(writer);
+
+    let deadline = Instant::now() + PATIENCE;
+    let mut admitted = false;
+    while Instant::now() < deadline && !admitted {
+        let (mut second_reader, mut second_writer) = raw_client(&served.endpoint);
+        if Frame::write(&mut second_writer, &hello()).is_ok()
+            && matches!(
+                Frame::read::<_, ServerMessage>(&mut second_reader),
+                Ok(ServerMessage::Welcome { .. })
+            )
+        {
+            admitted = true;
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    drop(reader);
+    assert!(
+        admitted,
+        "a second client was never admitted past the limit of one"
+    );
+}
+
+/// Round 1, finding 3: `enforce_deadlines` must not mistake an idle,
+/// already-welcomed client for one that is late -- only a `Hello` not yet
+/// said, or a frame started and not finished, is a deadline at all.
+#[test]
+fn a_ready_client_left_idle_past_its_budgets_is_still_served() {
+    let served = served(
+        "idle-ready",
+        Budgets {
+            frame: Duration::from_millis(200),
+            handshake: Duration::from_millis(200),
+            ..Budgets::default()
+        },
+    );
+
+    let (mut reader, mut writer) = raw_client(&served.endpoint);
+    Frame::write(&mut writer, &hello()).expect("writing succeeds");
+    let welcome: ServerMessage = Frame::read(&mut reader).expect("welcomed");
+    assert!(matches!(welcome, ServerMessage::Welcome { .. }));
+
+    // Well past both budgets above, with nothing sent in between.
+    std::thread::sleep(Duration::from_secs(1));
+
+    Frame::write(&mut writer, &ClientMessage::Ping { token: 7 }).expect("writing succeeds");
+    let answer: ServerMessage =
+        Frame::read(&mut reader).expect("an idle, welcomed client is still served");
+    assert!(matches!(answer, ServerMessage::Pong { token: 7 }));
 }
