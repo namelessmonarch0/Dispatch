@@ -85,6 +85,22 @@ impl FrameClock {
     }
 }
 
+/// Adds each of `extra` that `env` does not already name.
+///
+/// Named as this platform names variables: on Windows a harness's `Path`
+/// is the daemon's `PATH`, so the harness's spelling stays and the
+/// daemon's is not added beside it for the spawn to choose between.
+fn add_missing(env: &mut BTreeMap<String, String>, extra: BTreeMap<String, String>) {
+    for (name, value) in extra {
+        if !env
+            .keys()
+            .any(|existing| dispatch_os::pty::same_variable(existing, &name))
+        {
+            env.insert(name, value);
+        }
+    }
+}
+
 /// Where task files go unless a test says otherwise.
 ///
 /// Dispatch's own directory for them, the user's alone. With no home
@@ -870,9 +886,7 @@ impl Daemon {
 
         let mut launch = def.launch_for_current_platform();
         let id = PaneId::new();
-        for (key, value) in self.pane_env(id) {
-            launch.env.entry(key).or_insert(value);
-        }
+        add_missing(&mut launch.env, self.pane_env(id));
 
         let session = match Pty::spawn(&launch, &root, size) {
             Ok(session) => session,
@@ -963,15 +977,15 @@ impl Daemon {
     /// starts.
     fn task_run(&self, harness: &str, task: &str, pane: PaneId) -> Option<TaskRun> {
         let mut run = self.harnesses.get(harness)?.task_launch(task)?;
-        for (key, value) in self.pane_env(pane) {
-            run.launch.env.entry(key).or_insert(value);
-        }
+        add_missing(&mut run.launch.env, self.pane_env(pane));
         if run.input == TaskInput::Argument {
             // Its task is in its arguments, so a task file named in its
             // environment could only be stale -- inherited, or set in the
             // harness file -- and a redirect against it would read another
             // file than the task.
-            run.launch.env.remove(dispatch_config::TASK_FILE_ENV);
+            run.launch.env.retain(|name, _| {
+                !dispatch_os::pty::same_variable(name, dispatch_config::TASK_FILE_ENV)
+            });
             run.launch
                 .unset
                 .insert(dispatch_config::TASK_FILE_ENV.to_string());
@@ -1202,6 +1216,12 @@ impl Daemon {
             TaskInput::File => {
                 match TaskFile::write(&self.task_dir, request, task, &self.leftovers) {
                     Ok(file) => {
+                        // Last, and in place of any spelling of it the
+                        // harness set: the file Dispatch wrote is the one
+                        // the form reads.
+                        launch.env.retain(|name, _| {
+                            !dispatch_os::pty::same_variable(name, dispatch_config::TASK_FILE_ENV)
+                        });
                         launch.env.insert(
                             dispatch_config::TASK_FILE_ENV.to_string(),
                             file.for_redirect(),

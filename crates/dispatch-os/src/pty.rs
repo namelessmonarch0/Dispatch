@@ -246,6 +246,21 @@ fn fold(name: &str) -> String {
     name.to_uppercase()
 }
 
+/// Whether `a` and `b` name one environment variable here: compared as
+/// [`WindowsEnvironment`] compares them on Windows, exactly elsewhere.
+///
+/// For whoever merges variables into a child's environment: two spellings
+/// of one Windows variable left side by side are resolved by the spawn's
+/// rule rather than the merger's intent.
+#[must_use]
+pub fn same_variable(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        fold(a) == fold(b)
+    } else {
+        a == b
+    }
+}
+
 /// The file the Windows spawn starts for `program`, given the child's `PATH`
 /// and `PATHEXT`.
 ///
