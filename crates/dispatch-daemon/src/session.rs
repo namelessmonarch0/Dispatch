@@ -450,8 +450,24 @@ impl Daemon {
                     return;
                 };
 
-                if let Err(error) = target.session.write(&bytes) {
-                    tracing::warn!(%error, "failed to write to a pane");
+                match target.session.write(&bytes) {
+                    Ok(()) => {}
+                    // Said to the one client that sent it, which is the one
+                    // whose paste just went nowhere; the rest of the fleet
+                    // has no use for it.
+                    Err(dispatch_pty::PtyError::InputFull { waiting }) => {
+                        let dropped = bytes.len();
+                        self.send(
+                            id,
+                            ServerMessage::Error {
+                                error: ProtocolError::Other(format!(
+                                    "pane {pane} is not reading its input: {waiting} bytes are \
+                                     still waiting for it, so these {dropped} were dropped"
+                                )),
+                            },
+                        );
+                    }
+                    Err(error) => tracing::warn!(%error, "failed to write to a pane"),
                 }
             }
 

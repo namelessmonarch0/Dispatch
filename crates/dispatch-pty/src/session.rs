@@ -12,6 +12,8 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::Duration;
 
@@ -19,6 +21,16 @@ use dispatch_config::Launch;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::vt::{Size, VtError, VtTerminal};
+
+/// How much input may wait for a pane that is not reading it.
+///
+/// Past any paste a person makes, and far short of what an unread queue
+/// would otherwise grow to. A write that would take the waiting input past
+/// this is refused whole -- half a paste arriving later would be worse than
+/// none -- so a pane that has stopped reading costs this much memory and no
+/// more. A write into an empty queue is always taken, whatever its size: a
+/// paste bigger than the budget still reaches a pane that reads it.
+pub const INPUT_BUDGET: usize = 8 * 1024 * 1024;
 
 /// Failures while running a pseudoterminal.
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +52,13 @@ pub enum PtyError {
     /// Writing to the pseudoterminal failed.
     #[error("failed to write to the pseudoterminal: {0}")]
     Write(#[source] std::io::Error),
+
+    /// The pane has not read the input already sent to it.
+    #[error("the pane is not reading its input; {waiting} bytes are still waiting for it")]
+    InputFull {
+        /// How much was already queued.
+        waiting: usize,
+    },
 
     /// The terminal emulator reported a failure.
     #[error(transparent)]
@@ -73,7 +92,14 @@ pub struct Pty {
     /// Held only on Windows, where dropping the slave closes the ConPTY
     /// pseudoconsole and leaves the child writing into a dead console.
     _slave: Option<Box<dyn portable_pty::SlavePty + Send>>,
-    writer: Box<dyn Write + Send>,
+    /// Input waiting for the pane, written by a thread of its own.
+    ///
+    /// A write to a pseudoterminal blocks once its buffer is full, and it
+    /// stays full for as long as the program behind it is not reading. Done
+    /// on the caller's thread, that wait is the daemon's whole loop.
+    input: Sender<Vec<u8>>,
+    /// How many bytes are queued and not yet written.
+    waiting: Arc<AtomicUsize>,
     events: Receiver<PtyEvent>,
     size: Size,
     /// Process id of the child, used to terminate its whole tree.
@@ -149,6 +175,10 @@ impl Pty {
         let mut writer = writer;
         answer_inherit_cursor_handshake(&mut writer);
 
+        let (input, queued) = channel();
+        let waiting = Arc::new(AtomicUsize::new(0));
+        spawn_writer(writer, queued, Arc::clone(&waiting));
+
         let (tx, events) = channel();
         spawn_reader(reader, tx.clone());
         spawn_waiter(child, tx);
@@ -156,7 +186,8 @@ impl Pty {
         Ok(Self {
             master: pair.master,
             _slave: slave,
-            writer,
+            input,
+            waiting,
             events,
             size,
             pid,
@@ -228,10 +259,29 @@ impl Pty {
         (self.state, output)
     }
 
-    /// Sends bytes to the child, as if typed.
+    /// Queues bytes for the child, as if typed.
+    ///
+    /// Never blocks. Refused with [`PtyError::InputFull`] when input is
+    /// already waiting and this would take it past [`INPUT_BUDGET`].
     pub fn write(&mut self, bytes: &[u8]) -> Result<(), PtyError> {
-        self.writer.write_all(bytes).map_err(PtyError::Write)?;
-        self.writer.flush().map_err(PtyError::Write)
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
+        let waiting = self.waiting.load(Ordering::Acquire);
+        if waiting > 0 && waiting.saturating_add(bytes.len()) > INPUT_BUDGET {
+            return Err(PtyError::InputFull { waiting });
+        }
+
+        self.waiting.fetch_add(bytes.len(), Ordering::AcqRel);
+        if self.input.send(bytes.to_vec()).is_err() {
+            self.waiting.fetch_sub(bytes.len(), Ordering::AcqRel);
+            return Err(PtyError::Write(std::io::Error::from(
+                std::io::ErrorKind::BrokenPipe,
+            )));
+        }
+
+        Ok(())
     }
 
     /// Resizes the pseudoterminal.
@@ -440,6 +490,29 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, tx: Sender<PtyEvent>) {
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
+        }
+    });
+}
+
+/// Writes queued input to the pseudoterminal, in order, until the pane goes.
+///
+/// Keeps taking from the queue after a write fails -- a child that has
+/// exited stops accepting input -- so the count of what is waiting stays
+/// true and nothing sent later blocks on a thread that has stopped.
+fn spawn_writer(
+    mut writer: Box<dyn Write + Send>,
+    queued: Receiver<Vec<u8>>,
+    waiting: Arc<AtomicUsize>,
+) {
+    std::thread::spawn(move || {
+        let mut broken = false;
+
+        while let Ok(bytes) = queued.recv() {
+            if !broken && let Err(error) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
+                tracing::debug!(%error, "a pane stopped accepting input");
+                broken = true;
+            }
+            waiting.fetch_sub(bytes.len(), Ordering::AcqRel);
         }
     });
 }

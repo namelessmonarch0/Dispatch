@@ -35,6 +35,16 @@ fn harnesses(dir: &std::path::Path) -> HarnessRegistry {
     };
     std::fs::write(dir.join("no-task-args.toml"), no_task_args).expect("temp dir is writable");
 
+    // Puts its terminal in raw mode so input is buffered rather than
+    // processed, says so, and never reads: an agent busy elsewhere when a
+    // paste arrives.
+    let stall = if cfg!(windows) {
+        "id = \"stall\"\ndisplay_name = \"Stall\"\ncommand = \"cmd.exe\"\nargs = [\"/c\", \"echo READY & ping -n 30 127.0.0.1 >nul\"]\n"
+    } else {
+        "id = \"stall\"\ndisplay_name = \"Stall\"\ncommand = \"sh\"\nargs = [\"-c\", \"stty raw -echo; echo READY; sleep 30\"]\n"
+    };
+    std::fs::write(dir.join("stall.toml"), stall).expect("temp dir is writable");
+
     HarnessRegistry::load_from_dir(dir).expect("loading succeeds")
 }
 
@@ -2234,4 +2244,124 @@ fn a_detached_client_cannot_act() {
     daemon.request_for_test(1, spawn_request(project));
 
     assert_eq!(daemon.pane_count(), 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_stalled_pane_does_not_stall_the_daemon() {
+    let (mut daemon, project, _dir) = daemon_with_limits(
+        "stalled",
+        DelegationLimits {
+            request_timeout_secs: 1,
+            ..DelegationLimits::default()
+        },
+    );
+    let ui = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+
+    // A shell whose output must keep flowing, and a request whose deadline
+    // must keep counting, while another pane is stalled.
+    let shell = spawn_pane_for_test(&mut daemon, &ui, project);
+    let caller = ask(&mut daemon, shell, "echo never");
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::SpawnPane {
+            project,
+            harness: "stall".into(),
+            size: (80, 24),
+        },
+    );
+    let seen = wait_for(&mut daemon, &ui, |m| {
+        m.iter()
+            .any(|m| matches!(m, ServerMessage::PaneSpawned { harness, .. } if harness == "stall"))
+    });
+    let stalled = seen
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::PaneSpawned { pane, harness, .. } if harness == "stall" => Some(*pane),
+            _ => None,
+        })
+        .expect("the stalled pane was spawned");
+    wait_for(&mut daemon, &ui, |m| {
+        output_of(m, stalled).contains("READY")
+    });
+
+    // The audit's probe: this one request held the loop for as long as the
+    // pane went on not reading.
+    let started = Instant::now();
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane: stalled,
+            bytes: vec![b'x'; 2 * 1024 * 1024],
+        },
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "one write held the daemon for {:?}",
+        started.elapsed()
+    );
+
+    // Another client is still answered.
+    let other = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    let _ = drain(&other);
+    daemon.request_for_test(2, ClientMessage::Ping { token: 5 });
+    assert_eq!(drain(&other), vec![ServerMessage::Pong { token: 5 }]);
+
+    // Another pane's output still flows.
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane: shell,
+            bytes: b"echo still-flowing\n".to_vec(),
+        },
+    );
+    wait_for(&mut daemon, &ui, |m| {
+        output_of(m, shell).contains("still-flowing")
+    });
+
+    // The pending request still runs out of time.
+    wait_for(&mut daemon, &caller, |m| {
+        m.iter().any(|m| {
+            matches!(
+                m,
+                ServerMessage::DelegateResolved {
+                    outcome: DelegateOutcome::Expired { .. },
+                    ..
+                }
+            )
+        })
+    });
+
+    // More than the budget is refused out loud rather than queued.
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane: stalled,
+            bytes: vec![b'y'; dispatch_pty::INPUT_BUDGET],
+        },
+    );
+    let told = drain(&ui);
+    assert!(
+        told.iter().any(|m| matches!(
+            m,
+            ServerMessage::Error { error: ProtocolError::Other(text) } if text.contains("not reading")
+        )),
+        "the writer is told its input was dropped, got {told:#?}"
+    );
+
+    // Closing the stalled pane takes effect at once.
+    let started = Instant::now();
+    daemon.request_for_test(1, ClientMessage::ClosePane { pane: stalled });
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(daemon.pane_count(), 1, "only the shell is left");
+
+    // And the daemon still stops when asked.
+    daemon.shutdown_handle().request();
+    let started = Instant::now();
+    daemon.run();
+    assert!(started.elapsed() < Duration::from_secs(5));
 }

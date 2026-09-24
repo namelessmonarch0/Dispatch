@@ -364,6 +364,57 @@ fn a_pty_delivers_what_a_child_printed_after_reporting_its_exit() {
     );
 }
 
+/// Drains until `needle` has been printed, or panics.
+#[cfg(unix)]
+fn drain_until(pty: &mut Pty, needle: &str) -> Vec<u8> {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains(needle) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never saw {needle:?}; saw {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        seen.extend(pty.drain());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    seen
+}
+
+#[test]
+#[cfg(unix)]
+fn a_pane_that_stops_reading_does_not_block_its_writer() {
+    // Raw mode so the terminal buffers what it is sent rather than
+    // processing lines, then never read: the shape of an agent busy with
+    // something else when a paste arrives.
+    let mut pty = Pty::spawn(
+        &shell("stty raw -echo; echo READY; sleep 30"),
+        &cwd(),
+        Size::new(80, 24),
+    )
+    .expect("the shell starts");
+    drain_until(&mut pty, "READY");
+
+    // Larger than the budget, into an empty queue: accepted, and at once.
+    let started = std::time::Instant::now();
+    pty.write(&vec![b'x'; INPUT_BUDGET + 1])
+        .expect("a paste into an empty queue is accepted whatever its size");
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "the write waited {:?} for a pane that is not reading",
+        started.elapsed()
+    );
+
+    // Anything more is refused whole, and says why.
+    let refused = pty.write(b"y");
+    assert!(
+        matches!(refused, Err(PtyError::InputFull { .. })),
+        "expected the input to be full, got {refused:?}"
+    );
+
+    pty.terminate();
+}
+
 #[test]
 #[cfg_attr(
     windows,
