@@ -71,11 +71,11 @@ pub fn spawn_detached_with_env(
 /// Terminates `pid` and every process in its group or job.
 ///
 /// On Unix it asks politely first, waits up to `grace`, then kills what is
-/// left. On Windows a tree [`spawn_contained`] started is ended at once,
-/// because no polite request reaches a tree of console programs reliably;
-/// `grace` bounds only the wait for a process that was never contained. A
-/// tree that has already exited is treated as success: the caller wants it
-/// gone, and it is gone.
+/// left. On Windows it is ended at once, because no polite request reaches a
+/// tree of console programs reliably; there `grace` can only lengthen the
+/// wait for a process [`spawn_contained`] did not start to be gone. A tree
+/// that has already exited is treated as success: the caller wants it gone,
+/// and it is gone.
 pub fn terminate_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
     imp::terminate_tree(pid, grace)
 }
