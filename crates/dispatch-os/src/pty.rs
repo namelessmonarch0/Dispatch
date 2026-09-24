@@ -85,8 +85,47 @@ impl Child {
 }
 
 /// Starts `command` in a new pseudoterminal of `rows` by `cols`.
+///
+/// A command with a NUL anywhere in it is refused with
+/// [`std::io::ErrorKind::InvalidInput`] before anything starts.
 pub fn spawn(command: &PtyCommand<'_>, rows: u16, cols: u16) -> std::io::Result<PtyProcess> {
+    refuse_nul(command)?;
     imp::spawn(command, rows, cols)
+}
+
+/// Refuses a command with a NUL anywhere in it.
+///
+/// Everything reaches the system as NUL-terminated strings, so a NUL inside
+/// one ends it early: on Windows, an argument would lose its tail and every
+/// argument after it, and an environment variable every one after it,
+/// without a word. `std::process::Command` refuses such a command, and
+/// `portable-pty` refused a NUL in an argument; this is that refusal, made on
+/// every platform before anything is started, saying which part held it.
+fn refuse_nul(command: &PtyCommand<'_>) -> std::io::Result<()> {
+    let refuse = |part: String| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("the {part} holds a NUL, which would cut it short"),
+        ))
+    };
+
+    if command.program.contains('\0') {
+        return refuse("program".into());
+    }
+    if let Some(n) = command.args.iter().position(|arg| arg.contains('\0')) {
+        return refuse(format!("argument {}", n + 1));
+    }
+    if let Some((key, _)) = command
+        .env
+        .iter()
+        .find(|(key, value)| key.contains('\0') || value.contains('\0'))
+    {
+        return refuse(format!("environment variable {key:?}"));
+    }
+    if command.cwd.as_os_str().as_encoded_bytes().contains(&0) {
+        return refuse("working directory".into());
+    }
+    Ok(())
 }
 
 /// `arg` quoted so the C runtime's command-line parser splits it back out
@@ -222,7 +261,90 @@ use self::windows as imp;
 
 #[cfg(test)]
 mod tests {
-    use super::quote_for_crt;
+    use std::collections::BTreeMap;
+    use std::io::ErrorKind;
+
+    use super::{PtyCommand, quote_for_crt, refuse_nul, spawn};
+
+    #[test]
+    fn a_nul_anywhere_in_a_command_is_refused() {
+        let args = vec!["-c".to_string(), "echo hi".to_string()];
+        let env = BTreeMap::from([("KEY".to_string(), "value".to_string())]);
+        let cwd = std::env::temp_dir();
+        let clean = PtyCommand {
+            program: "sh",
+            args: &args,
+            env: &env,
+            cwd: &cwd,
+        };
+        refuse_nul(&clean).expect("a command with no NUL in it is let through");
+
+        let refused = |command: PtyCommand<'_>, part: &str| {
+            let error = refuse_nul(&command).expect_err(part);
+            assert_eq!(error.kind(), ErrorKind::InvalidInput, "{part}: {error}");
+            assert!(
+                error.to_string().contains(part),
+                "{error:?} names no {part}"
+            );
+        };
+
+        refused(
+            PtyCommand {
+                program: "s\0h",
+                ..clean
+            },
+            "program",
+        );
+        let cut = vec!["-c".to_string(), "echo hi\0; echo more".to_string()];
+        refused(
+            PtyCommand {
+                args: &cut,
+                ..clean
+            },
+            "argument",
+        );
+        let key = BTreeMap::from([("K\0EY".to_string(), "value".to_string())]);
+        refused(PtyCommand { env: &key, ..clean }, "environment");
+        let value = BTreeMap::from([("KEY".to_string(), "val\0ue".to_string())]);
+        refused(
+            PtyCommand {
+                env: &value,
+                ..clean
+            },
+            "environment",
+        );
+        let dir = cwd.join("a\0b");
+        refused(PtyCommand { cwd: &dir, ..clean }, "directory");
+    }
+
+    #[test]
+    fn a_command_with_a_nul_in_an_argument_is_not_started() {
+        // Cut at the NUL, this would have run `exit 0` on Windows and said
+        // nothing of what was lost.
+        let (program, args) = if cfg!(windows) {
+            (
+                "cmd.exe",
+                vec!["/c".to_string(), "exit 0\0& exit 1".to_string()],
+            )
+        } else {
+            ("sh", vec!["-c".to_string(), "exit 0\0; exit 1".to_string()])
+        };
+        let env = BTreeMap::new();
+        let cwd = std::env::temp_dir();
+
+        let error = spawn(
+            &PtyCommand {
+                program,
+                args: &args,
+                env: &env,
+                cwd: &cwd,
+            },
+            24,
+            80,
+        )
+        .expect_err("a command cut short by a NUL is not started");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput, "{error}");
+    }
 
     #[test]
     fn a_plain_argument_is_left_alone() {
