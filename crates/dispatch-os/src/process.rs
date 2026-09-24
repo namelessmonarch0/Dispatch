@@ -70,9 +70,12 @@ pub fn spawn_detached_with_env(
 
 /// Terminates `pid` and every process in its group or job.
 ///
-/// Asks politely first, waits up to `grace`, then kills what is left. A tree
-/// that has already exited is treated as success: the caller wants it gone,
-/// and it is gone.
+/// On Unix it asks politely first, waits up to `grace`, then kills what is
+/// left. On Windows a tree [`spawn_contained`] started is ended at once,
+/// because no polite request reaches a tree of console programs reliably;
+/// `grace` bounds only the wait for a process that was never contained. A
+/// tree that has already exited is treated as success: the caller wants it
+/// gone, and it is gone.
 pub fn terminate_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
     imp::terminate_tree(pid, grace)
 }
@@ -90,6 +93,70 @@ pub fn terminate_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
 /// lets the reaper finish the job.
 pub(crate) fn signal_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
     imp::signal_tree(pid, grace)
+}
+
+/// Starts `command` so that [`terminate_tree`] reaches everything it starts.
+///
+/// On Unix the child leads a session of its own, so its pid names a process
+/// group every descendant stays in unless it leaves on purpose. On Windows it
+/// is created suspended, put in a Job Object of its own, and only then
+/// resumed: it cannot start anything outside the job, because it starts
+/// nothing before it is in it. Any creation flags already set on `command`
+/// are replaced on Windows.
+pub fn spawn_contained(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    imp::spawn_contained(command)
+}
+
+/// Whether `pid` names a process that has not exited. For tests.
+///
+/// On Unix a process that has exited but not been reaped still answers, so
+/// a test polls rather than asking once.
+#[doc(hidden)]
+#[must_use]
+pub fn is_running(pid: u32) -> bool {
+    imp::is_running(pid)
+}
+
+/// Every process descended from `pid` now, nearest first. For tests.
+#[doc(hidden)]
+#[must_use]
+pub fn descendants(pid: u32) -> Vec<u32> {
+    imp::descendants(pid)
+}
+
+/// Puts a process that has been created suspended in a job of its own, and
+/// records it for [`terminate_tree`]. The caller resumes it.
+///
+/// For a process something other than [`spawn_contained`] creates: a pane's,
+/// started with `CreateProcessW` to attach a pseudoconsole, which a `Command`
+/// cannot do.
+#[cfg(windows)]
+#[expect(
+    unused_imports,
+    reason = "made for the pane backend, which creates its processes itself and does not call this yet"
+)]
+pub(crate) use imp::contain;
+
+/// The pids reachable downward from `root` through `(pid, parent)` pairs,
+/// breadth first.
+fn below(root: u32, pairs: &[(u32, u32)]) -> Vec<u32> {
+    let mut found: Vec<u32> = Vec::new();
+    let mut parent = root;
+    let mut next = 0;
+    loop {
+        for &(pid, of) in pairs {
+            if of == parent && pid != root && !found.contains(&pid) {
+                found.push(pid);
+            }
+        }
+        let Some(&deeper) = found.get(next) else {
+            return found;
+        };
+        parent = deeper;
+        next += 1;
+    }
 }
 
 #[cfg(unix)]
@@ -216,13 +283,85 @@ mod imp {
         signal_group(pid, libc::SIGKILL).map_err(map)?;
         Ok(())
     }
+
+    pub(super) fn spawn_contained(
+        command: &mut std::process::Command,
+    ) -> std::io::Result<std::process::Child> {
+        use std::os::unix::process::CommandExt;
+
+        // SAFETY: setsid is async-signal-safe and is the documented way to
+        // leave the parent's session and become a process group leader,
+        // which is what lets `killpg` reach every descendant later. The
+        // closure allocates nothing and touches no shared state.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        command.spawn()
+    }
+
+    pub(super) fn is_running(pid: u32) -> bool {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 sends nothing and only asks whether the pid exists.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    pub(super) fn descendants(pid: u32) -> Vec<u32> {
+        // `ps` rather than /proc, so macOS and Linux answer the same way.
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-A", "-o", "pid=,ppid="])
+            .output()
+        else {
+            return Vec::new();
+        };
+
+        let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+            })
+            .collect();
+
+        super::below(pid, &pairs)
+    }
 }
 
 #[cfg(windows)]
 mod imp {
+    use std::collections::HashMap;
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
     use super::{Duration, ProcessError};
 
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, OpenProcess, OpenThread, PROCESS_SYNCHRONIZE,
+        PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME, TerminateProcess,
+        WaitForSingleObject,
+    };
 
     /// Starts the child in its own process group, with no console of its own.
     ///
@@ -230,6 +369,12 @@ mod imp {
     /// from reaching it, and `DETACHED_PROCESS` stops it inheriting that console
     /// at all — a daemon has no business writing to the interface's screen.
     const DETACHED: u32 = 0x0000_0008 | 0x0000_0200;
+
+    /// How long to wait for a tree to be gone once it has been ended.
+    ///
+    /// Only bounds the wait: a process that outlives `TerminateJobObject` is
+    /// stuck in the kernel, and no amount of waiting will change that.
+    const KILL_TIMEOUT: Duration = Duration::from_secs(2);
 
     pub(super) fn spawn_detached(
         program: &std::path::Path,
@@ -252,64 +397,331 @@ mod imp {
                 source,
             })
     }
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
-        WaitForSingleObject,
-    };
 
-    /// Owns a process handle so it is closed on every exit path.
-    struct ProcessHandle(HANDLE);
+    /// Owns a handle so it is closed on every exit path.
+    struct Owned(HANDLE);
 
-    impl Drop for ProcessHandle {
+    impl Drop for Owned {
         fn drop(&mut self) {
-            // SAFETY: self.0 came from OpenProcess and is closed exactly once.
+            // SAFETY: the handle is owned here and closed exactly once.
             unsafe { CloseHandle(self.0) };
         }
     }
 
-    pub(super) fn terminate_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
-        // SAFETY: OpenProcess takes access flags and a pid by value.
-        let raw = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION, 0, pid) };
-        if raw.is_null() {
-            // The process is already gone, which is what the caller wanted.
-            return Ok(());
-        }
-        let handle = ProcessHandle(raw);
+    /// A Job Object whose processes are ended when it is closed.
+    ///
+    /// Closing is how a daemon that dies takes its panes with it -- as a
+    /// clean shutdown would -- instead of leaving agents nobody can reach.
+    struct Job(Owned);
 
-        // The child is assigned to a job object at spawn time, so terminating
-        // it tears down everything it started. See `spawn` in this crate.
-        //
-        // SAFETY: handle.0 is a live process handle opened with
-        // PROCESS_TERMINATE.
-        let terminated = unsafe { TerminateProcess(handle.0, 1) };
-        if terminated == 0 {
-            return Err(ProcessError::Terminate {
-                pid,
-                source: std::io::Error::last_os_error(),
-            });
+    // SAFETY: a job handle may be used from any thread; this one is only
+    // closed on drop.
+    unsafe impl Send for Job {}
+
+    impl Job {
+        fn new() -> std::io::Result<Self> {
+            // SAFETY: both arguments may be null: default security, no name.
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            let job = Self(Owned(handle));
+
+            // SAFETY: an all-zero JOBOBJECT_EXTENDED_LIMIT_INFORMATION means
+            // no limits; one flag is then set.
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `limits` is the structure this class names, and lives
+            // across the call.
+            let set = unsafe {
+                SetInformationJobObject(
+                    job.0.0,
+                    JobObjectExtendedLimitInformation,
+                    (&raw const limits).cast(),
+                    u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                        .expect("a small struct"),
+                )
+            };
+            if set == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            Ok(job)
         }
 
-        let millis = u32::try_from(grace.as_millis()).unwrap_or(u32::MAX);
-        // SAFETY: handle.0 is a live process handle; waiting on it is always
-        // defined and the timeout is passed by value.
-        let waited = unsafe { WaitForSingleObject(handle.0, millis) };
-        if waited != WAIT_OBJECT_0 {
-            // Windows has no second, harder kill to escalate to; report what
-            // the wait saw so the caller can log it.
-            return Err(ProcessError::Terminate {
-                pid,
-                source: std::io::Error::last_os_error(),
-            });
+        fn assign(&self, process: HANDLE) -> std::io::Result<()> {
+            // SAFETY: both handles are live for the call.
+            if unsafe { AssignProcessToJobObject(self.0.0, process) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
         }
 
-        Ok(())
+        fn terminate(&self) -> std::io::Result<()> {
+            // SAFETY: a live job handle.
+            if unsafe { TerminateJobObject(self.0.0, 1) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        /// How many processes in the job have not exited.
+        fn active(&self) -> std::io::Result<u32> {
+            // SAFETY: an all-zero accounting structure is valid to fill.
+            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: `info` is the structure this class names.
+            let queried = unsafe {
+                QueryInformationJobObject(
+                    self.0.0,
+                    JobObjectBasicAccountingInformation,
+                    (&raw mut info).cast(),
+                    u32::try_from(std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+                        .expect("a small struct"),
+                    std::ptr::null_mut(),
+                )
+            };
+            if queried == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(info.ActiveProcesses)
+        }
+
+        /// Polls until every process in the job has exited, or
+        /// [`KILL_TIMEOUT`] passes.
+        fn wait_until_empty(&self) -> std::io::Result<()> {
+            let deadline = Instant::now() + KILL_TIMEOUT;
+            loop {
+                match self.active()? {
+                    0 => return Ok(()),
+                    _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                    left => {
+                        return Err(std::io::Error::other(format!(
+                            "{left} processes outlived their job"
+                        )));
+                    }
+                }
+            }
+        }
     }
 
-    /// The same as [`terminate_tree`] here: a terminated process signals its
-    /// handle whether or not anyone has waited for it, so there is no reaper
-    /// for the wait to hold up.
+    /// The job each contained process was put in, by pid.
+    ///
+    /// Keyed by pid because that is what every caller of `terminate_tree`
+    /// holds. A pid the system reuses for a later contained process replaces
+    /// the old entry, and closing the old job ends whatever was left in it.
+    fn jobs() -> &'static Mutex<HashMap<u32, Job>> {
+        static JOBS: OnceLock<Mutex<HashMap<u32, Job>>> = OnceLock::new();
+        JOBS.get_or_init(Mutex::default)
+    }
+
+    pub(crate) fn contain(process: HANDLE, pid: u32) {
+        match Job::new().and_then(|job| job.assign(process).map(|()| job)) {
+            Ok(job) => {
+                jobs()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(pid, job);
+            }
+            // Already in a job that forbids another. It still runs, but
+            // ending it ends only it; said here rather than discovered when
+            // its children outlive it.
+            Err(error) => tracing::warn!(
+                %error,
+                pid,
+                "could not put a process in a job of its own; its children will outlive it"
+            ),
+        }
+    }
+
+    pub(super) fn spawn_contained(
+        command: &mut std::process::Command,
+    ) -> std::io::Result<std::process::Child> {
+        use std::os::windows::process::CommandExt;
+
+        // Suspended, so it runs nothing before it is in its job; in a group
+        // of its own, as a command transport always was, so a Ctrl-C meant
+        // for this process does not reach it.
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
+        let child = command.spawn()?;
+
+        contain(child.as_raw_handle() as HANDLE, child.id());
+
+        if let Err(error) = resume(child.id()) {
+            // Never resumed, it would never run: end it rather than hand back
+            // a process that hangs whoever waits on it.
+            let _ = terminate_tree(child.id(), Duration::ZERO);
+            return Err(error);
+        }
+
+        Ok(child)
+    }
+
+    /// Resumes the one thread of a process created suspended.
+    ///
+    /// `std::process::Child` keeps no handle to the thread, so it is found
+    /// by its owner's pid.
+    fn resume(pid: u32) -> std::io::Result<()> {
+        // SAFETY: a snapshot of every thread; owned below.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let snapshot = Owned(snapshot);
+
+        // SAFETY: an all-zero entry with its size set is what the walk expects.
+        let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+        entry.dwSize = u32::try_from(std::mem::size_of::<THREADENTRY32>()).expect("small");
+
+        let mut resumed = false;
+        // SAFETY: a live snapshot and a correctly sized entry.
+        let mut more = unsafe { Thread32First(snapshot.0, &mut entry) } != 0;
+        while more {
+            if entry.th32OwnerProcessID == pid {
+                // SAFETY: a thread id the snapshot just reported.
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if thread.is_null() {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let thread = Owned(thread);
+                // SAFETY: a live thread handle with THREAD_SUSPEND_RESUME.
+                if unsafe { ResumeThread(thread.0) } == u32::MAX {
+                    return Err(std::io::Error::last_os_error());
+                }
+                resumed = true;
+            }
+            // SAFETY: as for Thread32First.
+            more = unsafe { Thread32Next(snapshot.0, &mut entry) } != 0;
+        }
+
+        if resumed {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the suspended process has no thread to resume",
+            ))
+        }
+    }
+
+    pub(super) fn terminate_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
+        let map = |source| ProcessError::Terminate { pid, source };
+
+        let job = jobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&pid);
+        let Some(job) = job else {
+            return terminate_one(pid, grace);
+        };
+
+        // Ended at once: Windows has no polite request a tree of console
+        // programs reliably honours, so the wait is for the tree to be gone
+        // rather than for it to leave on its own.
+        job.terminate().map_err(map)?;
+        job.wait_until_empty().map_err(map)
+    }
+
+    /// Ends a contained pid's job as [`terminate_tree`] does, without waiting
+    /// for it to empty; the job stays recorded, so a later `terminate_tree`
+    /// can do that waiting.
+    ///
+    /// Nothing here needs a reaper -- a terminated process signals its
+    /// handle whether or not anyone has waited for it -- so a process that
+    /// was never contained is ended as `terminate_tree` ends it.
     pub(super) fn signal_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
-        terminate_tree(pid, grace)
+        let map = |source| ProcessError::Terminate { pid, source };
+
+        let jobs = jobs().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(job) = jobs.get(&pid) {
+            return job.terminate().map_err(map);
+        }
+        drop(jobs);
+
+        terminate_one(pid, grace)
+    }
+
+    /// Ends one process that was never contained -- a daemon started
+    /// detached, say.
+    fn terminate_one(pid: u32, grace: Duration) -> Result<(), ProcessError> {
+        let map = |source| ProcessError::Terminate { pid, source };
+
+        // SAFETY: OpenProcess takes access flags and a pid by value.
+        let raw = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
+        if raw.is_null() {
+            let error = std::io::Error::last_os_error();
+            // No such process: it has exited and been waited for, which is
+            // what the caller wanted. Anything else -- access denied above
+            // all -- says nothing about whether it is gone.
+            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                return Ok(());
+            }
+            return Err(map(error));
+        }
+        let process = Owned(raw);
+
+        // SAFETY: a live handle opened with PROCESS_TERMINATE.
+        if unsafe { TerminateProcess(process.0, 1) } == 0 {
+            let error = std::io::Error::last_os_error();
+            // Ending a process that has already exited fails; it is gone all
+            // the same.
+            if has_exited(&process) {
+                return Ok(());
+            }
+            return Err(map(error));
+        }
+
+        let millis = u32::try_from(grace.max(KILL_TIMEOUT).as_millis()).unwrap_or(u32::MAX);
+        // SAFETY: a live handle opened with SYNCHRONIZE -- without it, as
+        // before, this wait failed every time.
+        match unsafe { WaitForSingleObject(process.0, millis) } {
+            WAIT_OBJECT_0 => Ok(()),
+            WAIT_TIMEOUT => Err(map(std::io::Error::from(std::io::ErrorKind::TimedOut))),
+            _ => Err(map(std::io::Error::last_os_error())),
+        }
+    }
+
+    /// Whether the process behind `process` has exited.
+    ///
+    /// Its handle is signalled, rather than its exit code read: a process
+    /// may exit with `STILL_ACTIVE`'s own value, and would read as running.
+    fn has_exited(process: &Owned) -> bool {
+        // SAFETY: a live handle opened with SYNCHRONIZE; a zero wait only asks.
+        unsafe { WaitForSingleObject(process.0, 0) == WAIT_OBJECT_0 }
+    }
+
+    pub(super) fn is_running(pid: u32) -> bool {
+        // SAFETY: OpenProcess takes access flags and a pid by value.
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if raw.is_null() {
+            return false;
+        }
+        let process = Owned(raw);
+        // SAFETY: a live handle opened with SYNCHRONIZE; a zero wait only asks.
+        unsafe { WaitForSingleObject(process.0, 0) == WAIT_TIMEOUT }
+    }
+
+    pub(super) fn descendants(pid: u32) -> Vec<u32> {
+        // SAFETY: a snapshot of every process; owned below.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Vec::new();
+        }
+        let snapshot = Owned(snapshot);
+
+        // SAFETY: an all-zero entry with its size set is what the walk expects.
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = u32::try_from(std::mem::size_of::<PROCESSENTRY32W>()).expect("small");
+
+        let mut pairs = Vec::new();
+        // SAFETY: a live snapshot and a correctly sized entry.
+        let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0;
+        while more {
+            pairs.push((entry.th32ProcessID, entry.th32ParentProcessID));
+            // SAFETY: as for Process32FirstW.
+            more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
+        }
+
+        super::below(pid, &pairs)
     }
 }
 
@@ -521,5 +933,125 @@ mod tests {
         child.wait().expect("true can be reaped");
 
         terminate_tree(pid, DEFAULT_GRACE).expect("a tree that has already exited is not an error");
+    }
+
+    #[test]
+    fn a_contained_tree_is_found_and_ended_whole() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_contained(&mut command).expect("sh starts");
+        let pid = child.id();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while descendants(pid).len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sh never started both sleeps"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let everyone: Vec<u32> = std::iter::once(pid).chain(descendants(pid)).collect();
+
+        terminate_tree(pid, DEFAULT_GRACE).expect("the tree is ended");
+        child.wait().expect("sh can be reaped");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while everyone.iter().any(|p| is_running(*p)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(everyone.iter().all(|p| !is_running(*p)), "{everyone:?}");
+    }
+
+    #[test]
+    fn descendants_are_listed_nearest_first_and_a_cycle_ends_the_walk() {
+        // Windows records a parent's pid once and never updates it, so once
+        // pids are reused a descendant can appear as its own ancestor's
+        // parent.
+        let pairs = [(2, 1), (3, 1), (4, 2), (5, 4), (1, 5), (9, 8)];
+
+        assert_eq!(below(1, &pairs), vec![2, 3, 4, 5]);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// Waits for `condition`, returning whether it held in time.
+    fn eventually(patience: Duration, condition: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + patience;
+        while std::time::Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        condition()
+    }
+
+    /// `cmd.exe` running `ping` for thirty seconds: a child with a grandchild.
+    fn tree() -> std::process::Command {
+        let mut command = std::process::Command::new("cmd.exe");
+        command
+            .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
+    }
+
+    #[test]
+    fn a_contained_process_runs() {
+        // Created suspended: one never resumed would hang this forever.
+        let mut command = std::process::Command::new("cmd.exe");
+        command.args(["/d", "/c", "exit 3"]);
+        let mut child = spawn_contained(&mut command).expect("cmd.exe starts");
+
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(child.wait().map(|status| status.code()));
+        });
+        let status = finished
+            .recv_timeout(Duration::from_secs(10))
+            .expect("it ran to the end")
+            .expect("waiting succeeds");
+        assert_eq!(status, Some(3));
+    }
+
+    #[test]
+    fn terminating_a_contained_tree_ends_the_grandchild_too() {
+        let mut child = spawn_contained(&mut tree()).expect("cmd.exe starts");
+        let pid = child.id();
+        assert!(
+            eventually(Duration::from_secs(10), || !descendants(pid).is_empty()),
+            "cmd.exe never started ping"
+        );
+        let everyone: Vec<u32> = std::iter::once(pid).chain(descendants(pid)).collect();
+
+        terminate_tree(pid, DEFAULT_GRACE).expect("the tree is ended");
+        let _ = child.wait();
+
+        assert!(
+            eventually(Duration::from_secs(5), || everyone
+                .iter()
+                .all(|p| !is_running(*p))),
+            "a process in the tree outlived it: {everyone:?}"
+        );
+    }
+
+    #[test]
+    fn terminating_a_process_that_has_gone_is_not_an_error() {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "exit 0"])
+            .spawn()
+            .expect("cmd.exe starts");
+        let pid = child.id();
+        child.wait().expect("it exits");
+
+        terminate_tree(pid, DEFAULT_GRACE).expect("a process that has gone is what was asked for");
     }
 }

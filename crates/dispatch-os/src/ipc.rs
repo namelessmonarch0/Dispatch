@@ -314,12 +314,13 @@ impl Connection {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        put_in_its_own_group(&mut command);
-
-        let mut child = command.spawn().map_err(|source| IpcError::Spawn {
-            command: described.clone(),
-            source,
-        })?;
+        // In a group or job of its own, so ending it ends everything it
+        // forks: `ssh` and `sh -c` both fork.
+        let mut child =
+            crate::process::spawn_contained(&mut command).map_err(|source| IpcError::Spawn {
+                command: described.clone(),
+                source,
+            })?;
 
         let reader = child.stdout.take().expect("stdout was piped");
         let writer = child.stdin.take().expect("stdin was piped");
@@ -434,49 +435,12 @@ struct Spawned {
 ///
 /// `ssh` and `sh -c` both fork; killing only the process this crate spawned
 /// would leave those orphaned and holding the pipes this `Connection` reads
-/// and writes, which is what [`put_in_its_own_group`] and
-/// [`process::terminate_tree`](crate::process::terminate_tree) are for.
+/// and writes, which is what [`process::spawn_contained`](crate::process::spawn_contained)
+/// and [`process::terminate_tree`](crate::process::terminate_tree) are for.
 fn reap(spawned: &mut Spawned) {
     spawned.pid.lock().unwrap_or_else(|e| e.into_inner()).take();
     let _ = crate::process::terminate_tree(spawned.child.id(), TEARDOWN_GRACE);
     let _ = spawned.child.wait();
-}
-
-/// Puts `command`'s child in a process group or job of its own, so
-/// [`process::terminate_tree`](crate::process::terminate_tree) can reach
-/// everything it forks rather than only the child itself.
-///
-/// The same treatment [`process::spawn_detached`](crate::process::spawn_detached)
-/// gives the daemon it starts, for the same reason: a command transport's
-/// child is not necessarily a leaf either.
-#[cfg(unix)]
-fn put_in_its_own_group(command: &mut std::process::Command) {
-    use std::os::unix::process::CommandExt;
-
-    // SAFETY: setsid is async-signal-safe and is the documented way to leave
-    // the parent's session and become a process group leader, which is what
-    // lets `killpg` reach every descendant later. The closure allocates
-    // nothing and touches no shared state.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(windows)]
-fn put_in_its_own_group(command: &mut std::process::Command) {
-    use std::os::windows::process::CommandExt;
-
-    /// Starts the child as the root of its own process group, so a signal
-    /// meant for it does not also reach this process, and so it can be
-    /// addressed as a group later.
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
 }
 
 /// A reader that reaps its process when it is dropped.
@@ -2011,6 +1975,51 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn dropping_a_command_connection_ends_its_whole_tree() {
+        // `ssh.exe` forks too. The transport used to kill only the process it
+        // started, leaving its children holding the pipes.
+        let connection = Connection::over_command(
+            std::ffi::OsStr::new("cmd.exe"),
+            &[
+                std::ffi::OsString::from("/d"),
+                std::ffi::OsString::from("/c"),
+                std::ffi::OsString::from("ping -n 30 127.0.0.1 >nul"),
+            ],
+        )
+        .expect("cmd.exe exists");
+        let pid = connection
+            .child_id()
+            .expect("a command transport has a child");
+
+        let deadline = std::time::Instant::now() + PATIENCE;
+        let everyone = loop {
+            let below = crate::process::descendants(pid);
+            if !below.is_empty() {
+                break std::iter::once(pid).chain(below).collect::<Vec<_>>();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cmd.exe never started ping"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        drop(connection);
+
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while everyone.iter().any(|p| crate::process::is_running(*p))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            everyone.iter().all(|p| !crate::process::is_running(*p)),
+            "a process behind the transport outlived it: {everyone:?}"
+        );
     }
 
     #[test]
