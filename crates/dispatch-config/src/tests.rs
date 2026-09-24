@@ -548,6 +548,35 @@ fn a_task_form_that_puts_the_task_on_cmds_command_line_is_refused_on_windows() {
 }
 
 #[test]
+fn a_refusal_spells_out_the_lines_that_fix_it() {
+    // An edited file is the one that does not show how, and a harness of the
+    // user's own may have no Windows table at all: the message has to carry
+    // the fix itself.
+    let def: HarnessDef = toml::from_str(
+        "id = \"mine\"\ndisplay_name = \"Mine\"\ncommand = \"cmd.exe\"\n\n\
+         [task]\nargs = [\"/c\", \"agent\", \"{task}\"]\n",
+    )
+    .expect("the definition parses");
+
+    let reason = def
+        .task_refusal_for("windows")
+        .expect("the form is refused");
+
+    for line in [
+        "mine.toml",
+        "[task.platform.windows]",
+        "input = \"file\"",
+        "args = [..., \"<%DISPATCH_TASK_FILE%\"]",
+    ] {
+        assert!(reason.contains(line), "{line:?} is missing from: {reason}");
+    }
+    assert!(
+        !reason.contains("shows how"),
+        "the refusal points at a file that may not show anything: {reason}"
+    );
+}
+
+#[test]
 fn an_unedited_built_in_from_an_older_release_is_upgraded() {
     let dir = TempDir::new("upgrade-unedited");
     dir.write(

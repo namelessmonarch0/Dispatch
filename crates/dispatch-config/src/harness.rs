@@ -294,10 +294,11 @@ impl HarnessDef {
 
         Some(format!(
             "harness {id:?} would put the task on cmd.exe's command line, where characters \
-             like & and % run as commands. Change [task.platform.windows] in {id}.toml to \
-             redirect the task from %{TASK_FILE_ENV}% with input = \"file\" (the built-in \
-             claude.toml shows how), or delete {id}.toml if it is a built-in you never meant \
-             to edit, and restart the daemon",
+             like & and % run as commands. In {id}.toml, under [task.platform.windows] (add \
+             that table if there is none), set input = \"file\" and put \
+             \"<%{TASK_FILE_ENV}%\" where \"{{task}}\" was: args = [..., \
+             \"<%{TASK_FILE_ENV}%\"]. For a harness Dispatch ships, deleting {id}.toml \
+             brings back the current one instead. Then restart the daemon",
             id = self.id
         ))
     }
