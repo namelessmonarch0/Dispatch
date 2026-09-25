@@ -108,10 +108,7 @@ impl Theme {
     /// Mixes a theme from `palette`, at the depth the terminal can show.
     #[must_use]
     pub fn new(palette: Palette, depth: Depth) -> Theme {
-        let colour = |rgb: Rgb| match depth {
-            Depth::TrueColor => Color::Rgb(rgb.0, rgb.1, rgb.2),
-            Depth::Indexed => Color::Indexed(nearest_indexed(rgb)),
-        };
+        let colour = |rgb: Rgb| at_depth(rgb, depth);
 
         // The accent is palette slot 5, so in 256 colours it is named by its
         // slot rather than approximated: the terminal draws its own colour
@@ -187,11 +184,61 @@ impl Theme {
     /// being sent colours it would misread.
     #[must_use]
     pub fn blend(&self, from: Rgb, to: Rgb, t: f32) -> Color {
-        let mixed = from.mix(to, t.clamp(0.0, 1.0));
-        match self.depth {
-            Depth::TrueColor => Color::Rgb(mixed.0, mixed.1, mixed.2),
-            Depth::Indexed => Color::Indexed(nearest_indexed(mixed)),
+        at_depth(from.mix(to, t.clamp(0.0, 1.0)), self.depth)
+    }
+
+    /// What `role` is drawn in when nothing is moving.
+    ///
+    /// The theme's own colour for the roles that have one, which in 256
+    /// colours is not always the nearest entry to its RGB: the accent is
+    /// palette slot 5 itself. The background and the pulse's peak are never
+    /// drawn at rest, so they are only their RGB at this depth.
+    #[must_use]
+    pub fn colour(&self, role: Role) -> Color {
+        match role {
+            Role::Faded => self.faded,
+            Role::Tint => self.tint,
+            Role::Tab => self.tab,
+            Role::Accent => self.accent,
+            Role::Background | Role::Pulse => at_depth(self.rgb(role), self.depth),
         }
+    }
+
+    /// `t` of the way from `from` to `to`, as [`Theme::blend`] draws it, and
+    /// exactly [`Theme::colour`] of the role at either end, so an animation
+    /// ends on the colour the still frame after it draws instead of jumping
+    /// to it.
+    #[must_use]
+    pub fn tween(&self, from: Role, to: Role, t: f32) -> Color {
+        if t <= 0.0 {
+            self.colour(from)
+        } else if t >= 1.0 {
+            self.colour(to)
+        } else {
+            self.blend(self.rgb(from), self.rgb(to), t)
+        }
+    }
+
+    /// A fill `t` of the way from the background toward `to`, or `None`
+    /// while it has not yet visibly left the background.
+    ///
+    /// At rest the background is not painted at all: it is the terminal's
+    /// own, and the palette's is only a guess at it — the fallback's dark
+    /// one when the terminal did not say. Painted at nothing, that guess
+    /// shows as a box on any other background.
+    #[must_use]
+    pub fn from_background(&self, to: Role, t: f32) -> Option<Color> {
+        let background = self.rgb(Role::Background);
+        (background.mix(self.rgb(to), t.clamp(0.0, 1.0)) != background)
+            .then(|| self.tween(Role::Background, to, t))
+    }
+}
+
+/// `rgb` as a terminal of `depth` is sent it.
+fn at_depth(rgb: Rgb, depth: Depth) -> Color {
+    match depth {
+        Depth::TrueColor => Color::Rgb(rgb.0, rgb.1, rgb.2),
+        Depth::Indexed => Color::Indexed(nearest_indexed(rgb)),
     }
 }
 

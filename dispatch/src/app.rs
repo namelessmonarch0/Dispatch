@@ -3733,11 +3733,9 @@ impl App {
             let colour = if self.animations.value(Target::Focus(*id), now).is_some()
                 || self.animations.value(Target::Blur(*id), now).is_some()
             {
-                self.theme.blend(
-                    self.theme.rgb(Role::Faded),
-                    self.theme.rgb(Role::Accent),
-                    level,
-                )
+                // A tween rather than a bare blend: at either end it is the
+                // colour at rest, which in 256 colours no blend reaches.
+                self.theme.tween(Role::Faded, Role::Accent, level)
             } else if is_focused {
                 self.theme.accent
             } else {
@@ -5995,6 +5993,40 @@ mod tests {
             assert_ne!(colour, theme.faded, "mid-ease");
             assert_ne!(colour, theme.accent, "mid-ease");
         }
+
+        advance(&clock, Duration::from_millis(200));
+        drawn(&mut app, &mut terminal);
+        assert_eq!(corner(&app, &terminal, panes[0]), theme.accent);
+        assert_eq!(corner(&app, &terminal, panes[1]), theme.faded);
+    }
+
+    #[test]
+    fn in_256_colours_an_ease_starts_and_ends_on_the_colours_at_rest() {
+        // The accent at rest is palette slot 5 itself, which no blend reaches;
+        // an ease ending on the nearest cube entry instead jumps the frame
+        // after it, and one starting there jumps the frame it starts.
+        use dispatch_tui::theme::{Depth, Palette};
+
+        let (mut app, project, daemon, _sent) = attached_app();
+        let theme = Theme::new(Palette::FALLBACK, Depth::Indexed);
+        app.set_theme(theme);
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        assert_eq!(corner(&app, &terminal, panes[1]), theme.accent, "at rest");
+
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+        assert_eq!(
+            corner(&app, &terminal, panes[1]),
+            theme.accent,
+            "the ease away starts where the border was"
+        );
+        assert_eq!(corner(&app, &terminal, panes[0]), theme.faded);
 
         advance(&clock, Duration::from_millis(200));
         drawn(&mut app, &mut terminal);

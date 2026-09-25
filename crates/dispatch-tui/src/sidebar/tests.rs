@@ -1653,6 +1653,30 @@ fn a_pulsing_row_is_drawn_toward_the_pulse_colour() {
 }
 
 #[test]
+fn a_pulse_at_nothing_leaves_the_row_unpainted() {
+    // At its start and once it has settled a pulse is the background, and
+    // the background is the terminal's own: painted, the palette's guess at
+    // it shows as a box.
+    let (mut state, alpha, _) = state();
+    let pane = spawn(&mut state, alpha, "claude");
+    spawn(&mut state, alpha, "codex"); // focus moves off the first
+
+    for strength in [0.0, pulse_strength(1.0)] {
+        let motion = SidebarMotion {
+            pulses: vec![(pane, strength)],
+            glide: None,
+        };
+        let buf = render_moving(&state, &motion, 6);
+
+        assert_eq!(
+            buf.cell((LEFT + 8, TOP + 1)).expect("cell exists").bg,
+            Color::Reset,
+            "at strength {strength}"
+        );
+    }
+}
+
+#[test]
 fn the_focus_tint_glides_through_the_rows_between() {
     let (mut state, alpha, _) = state();
     let first = spawn(&mut state, alpha, "claude");
@@ -1722,4 +1746,48 @@ fn a_glide_between_sections_fades_instead() {
         buf.cell((LEFT + 8, row_of("codex"))).expect("cell").bg,
         halfway
     );
+}
+
+#[test]
+fn a_fade_between_sections_paints_nothing_on_the_row_it_has_left() {
+    let (mut state, laptop, tower) = fleet();
+    let on_laptop = state
+        .projects()
+        .iter()
+        .find(|p| p.device == laptop)
+        .expect("one")
+        .id;
+    let on_tower = state
+        .projects()
+        .iter()
+        .find(|p| p.device == tower)
+        .expect("one")
+        .id;
+    let from = spawn(&mut state, on_laptop, "claude");
+    let _ = state.select_project(on_tower);
+    spawn(&mut state, on_tower, "codex"); // focused
+    let tint = Theme::fallback().tint;
+    let bg_at = |t: f32, text: &str| {
+        let motion = SidebarMotion {
+            pulses: Vec::new(),
+            glide: Some(Glide {
+                from: Anchor::Pane(from),
+                t,
+            }),
+        };
+        let buf = render_moving(&state, &motion, 14);
+        let y = (0..buf.area.height)
+            .find(|y| row_text(&buf, *y).contains(text))
+            .unwrap_or_else(|| panic!("{text:?} is drawn"));
+        buf.cell((LEFT + 8, y)).expect("cell").bg
+    };
+
+    assert_eq!(bg_at(0.0, "claude"), tint, "it starts on the old row");
+    assert_eq!(bg_at(0.0, "codex"), Color::Reset, "and not yet on the new");
+    assert_eq!(
+        bg_at(1.0, "claude"),
+        Color::Reset,
+        "it ends gone from the old"
+    );
+    assert_eq!(bg_at(1.0, "codex"), tint, "and on the new");
 }

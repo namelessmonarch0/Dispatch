@@ -312,7 +312,12 @@ impl Tween {
 `blend(&self, from: Rgb, to: Rgb, t: f32) -> Color`, mixing then converting
 at the theme's depth (so 256-colour terminals step through the nearest
 entries). It also exposes the RGB behind each role so animations can mix
-between roles.
+between roles, and `tween(&self, from: Role, to: Role, t: f32) -> Color`,
+which at either end is exactly the colour the role is drawn in at rest —
+in 256 colours the accent at rest is palette slot 5 itself, which no blend
+reaches. A fill rising out of the background (a pulse, a cross-fading
+tint) paints nothing until it has visibly left it: the background at rest
+is the terminal's own, and the palette's is only a guess at it.
 
 The app keeps its tweens in one place (`App::motion`), keyed by what they
 animate; starting a tween on something already animating replaces the old
@@ -393,7 +398,7 @@ the warning glyph and the done mark remain.
 | A pane resized — a sibling opened or closed, the terminal resized | Its repaint within 500 ms is not activity |
 | Reattaching to a daemon | Replayed output flashes working briefly; no done marks within 3 s |
 | Scrolled back in a pane | Detection holds its last state |
-| Terminal without 24-bit colour | Animated colours step through the 256-colour palette |
+| Terminal without 24-bit colour | Animated colours step through the 256-colour palette, and start and end on the colours drawn at rest |
 | `motion = false` | Everything static, all state still shown |
 
 ## Testing

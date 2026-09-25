@@ -943,14 +943,15 @@ impl Sidebar<'_> {
                 fill(buf, body, body.x, y, self.tinted());
             }
             (from, to) => {
-                let (background, tint) =
-                    (self.theme.rgb(Role::Background), self.theme.rgb(Role::Tint));
-                if let Some((_, y, body)) = from {
-                    let colour = self.theme.blend(background, tint, 1.0 - glide.t);
+                // A row the tint has wholly left, or not yet reached, is left
+                // unpainted rather than painted the palette's background.
+                let row = |at: Option<(usize, u16, Rect)>, t: f32| {
+                    at.zip(self.theme.from_background(Role::Tint, t))
+                };
+                if let Some(((_, y, body), colour)) = row(from, 1.0 - glide.t) {
                     fill(buf, body, body.x, y, Style::default().bg(colour).fg(text));
                 }
-                if let Some((_, y, body)) = to {
-                    let colour = self.theme.blend(background, tint, glide.t);
+                if let Some(((_, y, body), colour)) = row(to, glide.t) {
                     fill(buf, body, body.x, y, Style::default().bg(colour).fg(text));
                 }
             }
@@ -1145,17 +1146,13 @@ impl Sidebar<'_> {
         }
 
         // Under the text rather than over it: the row pulses, and what it
-        // says — the glyph above all — stays as it was.
-        if let Some(strength) = self
+        // says — the glyph above all — stays as it was. Between pulses, and
+        // at either end, it is the background, which is left unpainted.
+        if let Some(colour) = self
             .motion
             .and_then(|motion| motion.pulses.iter().find(|(id, _)| *id == pane.id))
-            .map(|(_, strength)| *strength)
+            .and_then(|(_, strength)| self.theme.from_background(Role::Pulse, *strength))
         {
-            let colour = self.theme.blend(
-                self.theme.rgb(Role::Background),
-                self.theme.rgb(Role::Pulse),
-                strength,
-            );
             fill(
                 buf,
                 area,
