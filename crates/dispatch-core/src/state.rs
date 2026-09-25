@@ -636,6 +636,49 @@ impl AppState {
         pane.title = title.into();
         Ok(())
     }
+
+    /// Records which branch a pane is working on.
+    ///
+    /// Returns whether that changed anything: the caller looks every few
+    /// seconds, and should redraw only when a row actually moved.
+    pub fn set_pane_branch(
+        &mut self,
+        id: PaneId,
+        branch: Option<String>,
+    ) -> Result<bool, StateError> {
+        let pane = self
+            .panes
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or(StateError::NoSuchPane(id))?;
+
+        if pane.branch == branch {
+            return Ok(false);
+        }
+        pane.branch = branch;
+        Ok(true)
+    }
+
+    /// Records which branch a project's root has checked out.
+    ///
+    /// Returns whether that changed anything.
+    pub fn set_project_branch(
+        &mut self,
+        id: ProjectId,
+        branch: Option<String>,
+    ) -> Result<bool, StateError> {
+        let project = self
+            .projects
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or(StateError::NoSuchProject(id))?;
+
+        if project.branch == branch {
+            return Ok(false);
+        }
+        project.branch = branch;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -1663,5 +1706,72 @@ mod tests {
         let project = Project::new("/tmp/one", ProjectSource::LocalDir).with_device(device);
 
         assert_eq!(project.device, device);
+    }
+
+    #[test]
+    fn a_panes_branch_is_recorded_and_says_whether_it_moved() {
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let pane = state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+
+        assert_eq!(
+            state.pane(pane).and_then(|pane| pane.branch.clone()),
+            None,
+            "a new pane has not been looked at yet"
+        );
+        assert_eq!(state.set_pane_branch(pane, Some("main".into())), Ok(true));
+        assert_eq!(
+            state.set_pane_branch(pane, Some("main".into())),
+            Ok(false),
+            "the same branch again is no change, so nothing to redraw"
+        );
+        assert_eq!(
+            state.pane(pane).and_then(|pane| pane.branch.as_deref()),
+            Some("main")
+        );
+    }
+
+    #[test]
+    fn a_branch_for_an_unknown_pane_is_refused() {
+        let mut state = AppState::new();
+        let missing = PaneId::new();
+
+        assert_eq!(
+            state.set_pane_branch(missing, None),
+            Err(StateError::NoSuchPane(missing))
+        );
+    }
+
+    #[test]
+    fn a_projects_branch_is_recorded_and_says_whether_it_moved() {
+        let mut state = AppState::new();
+        let project = state.add_project(
+            Project::new("/tmp/one", ProjectSource::GitRepo { remote: None })
+                .with_branch(Some("main".into())),
+        );
+
+        assert_eq!(state.projects()[0].branch.as_deref(), Some("main"));
+        assert_eq!(
+            state.set_project_branch(project, Some("feat/tabs".into())),
+            Ok(true)
+        );
+        assert_eq!(
+            state.set_project_branch(project, Some("feat/tabs".into())),
+            Ok(false)
+        );
+        assert_eq!(state.projects()[0].branch.as_deref(), Some("feat/tabs"));
+    }
+
+    #[test]
+    fn a_branch_for_an_unknown_project_is_refused() {
+        let mut state = AppState::new();
+        let missing = ProjectId::new();
+
+        assert_eq!(
+            state.set_project_branch(missing, None),
+            Err(StateError::NoSuchProject(missing))
+        );
     }
 }

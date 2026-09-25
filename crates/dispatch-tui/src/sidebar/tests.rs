@@ -2,6 +2,7 @@
 
 use super::*;
 
+use crate::theme::Theme;
 use dispatch_core::{Device, DeviceId, HarnessId, Pane, PaneId, Project, ProjectSource};
 
 /// State with two projects; the first is selected.
@@ -58,14 +59,19 @@ const LEFT: u16 = 1;
 /// Which column `text` starts in.
 ///
 /// Measured by the text itself rather than by counting leading spaces: a
-/// pane's focus marker and its twisty are both blanks when they have nothing
-/// to say, so leading-whitespace counting cannot tell "no marker" apart from
-/// "less indented".
+/// pane's twisty is a blank when it has nothing to fold, so
+/// leading-whitespace counting cannot tell "no twisty" apart from "less
+/// indented".
 fn column_of(line: &str, text: &str) -> usize {
     let byte = line
         .find(text)
         .unwrap_or_else(|| panic!("expected {text:?} in {line:?}"));
     line[..byte].chars().count()
+}
+
+/// What a click at `(x, y)` finds, with nothing scrolled.
+fn hit(state: &AppState, area: Rect, x: u16, y: u16) -> Option<Hit> {
+    hit_test(state, area, &Scroll::new(), x, y)
 }
 
 #[test]
@@ -115,19 +121,68 @@ fn the_selected_project_is_emphasised() {
 }
 
 #[test]
-fn the_focused_pane_is_marked() {
+fn the_focused_pane_is_tinted() {
     let (mut state, alpha, _) = state();
     spawn(&mut state, alpha, "claude");
     spawn(&mut state, alpha, "codex");
 
     // Spawning focuses the new pane, so codex is focused.
     let buf = render(&state, WIDTH, 10);
+    let tint = Theme::fallback().tint;
 
-    assert!(
-        !row_text(&buf, TOP + 1).contains('▌'),
+    assert_ne!(
+        buf.cell((LEFT + 8, TOP + 1)).expect("cell exists").bg,
+        tint,
         "claude is not focused"
     );
-    assert!(row_text(&buf, TOP + 2).contains('▌'), "codex is focused");
+    for x in LEFT + 4..WIDTH - 1 {
+        assert_eq!(
+            buf.cell((x, TOP + 2)).expect("cell exists").bg,
+            tint,
+            "column {x} of the focused row is tinted"
+        );
+    }
+    assert!(
+        !row_text(&buf, TOP + 2).contains('▌'),
+        "and not marked with a bar"
+    );
+}
+
+#[test]
+fn a_focused_panes_text_is_the_palettes_foreground() {
+    // The tint is mixed from the palette, which is the fallback's when the
+    // terminal did not say what its own is. Text left in the terminal's
+    // colour could then be a light theme's dark text on a dark tint.
+    let (mut state, alpha, _) = state();
+    spawn(&mut state, alpha, "claude");
+
+    let buf = render(&state, WIDTH, 10);
+    let theme = Theme::fallback();
+
+    assert_eq!(
+        buf.cell((LEFT + PANE + NAME, TOP + 1))
+            .expect("cell exists")
+            .fg,
+        theme.text,
+        "the title"
+    );
+    assert_eq!(
+        buf.cell((WIDTH - 3, TOP + 1)).expect("cell exists").fg,
+        Color::Yellow,
+        "the state glyph keeps its own colour"
+    );
+}
+
+#[test]
+fn a_selected_projects_text_is_the_palettes_foreground() {
+    let (state, _, _) = state();
+
+    let buf = render(&state, WIDTH, 10);
+
+    assert_eq!(
+        buf.cell((LEFT + NAME, TOP)).expect("cell exists").fg,
+        Theme::fallback().text
+    );
 }
 
 #[test]
@@ -143,6 +198,25 @@ fn a_long_name_is_truncated_rather_than_overflowing() {
 
     assert!(line.chars().count() <= 20, "line overflowed: {line:?}");
     assert!(line.contains('…'), "truncation should be visible: {line:?}");
+}
+
+#[test]
+fn a_wide_name_is_cut_by_the_columns_it_takes() {
+    // Four CJK characters take eight columns; counting them as four would
+    // let the row run past the frame.
+    let mut state = AppState::new();
+    state.add_project(
+        Project::new("/tmp/x", ProjectSource::LocalDir).with_name("日本語のプロジェクト名前"),
+    );
+
+    let buf = render(&state, 20, 5);
+    let line = row_text(&buf, TOP);
+
+    assert!(
+        line.ends_with('│'),
+        "the frame is not overwritten: {line:?}"
+    );
+    assert!(line.contains('…'), "the cut is visible: {line:?}");
 }
 
 #[test]
@@ -257,10 +331,7 @@ fn a_click_on_a_pane_row_finds_that_pane() {
     let pane = spawn(&mut state, alpha, "claude");
 
     let area = Rect::new(0, 0, WIDTH, 10);
-    assert_eq!(
-        hit_test(&state, area, LEFT + 4, TOP + 1),
-        Some(Hit::Pane(pane))
-    );
+    assert_eq!(hit(&state, area, LEFT + 4, TOP + 1), Some(Hit::Pane(pane)));
 }
 
 #[test]
@@ -274,13 +345,10 @@ fn a_click_on_a_child_row_finds_the_child_rather_than_its_parent() {
     let area = Rect::new(0, 0, WIDTH, 10);
 
     assert_eq!(
-        hit_test(&state, area, LEFT + 6, TOP + 1),
+        hit(&state, area, LEFT + 6, TOP + 1),
         Some(Hit::Pane(parent))
     );
-    assert_eq!(
-        hit_test(&state, area, LEFT + 6, TOP + 2),
-        Some(Hit::Pane(child))
-    );
+    assert_eq!(hit(&state, area, LEFT + 6, TOP + 2), Some(Hit::Pane(child)));
 }
 
 #[test]
@@ -292,11 +360,8 @@ fn a_click_anywhere_on_a_project_heading_finds_the_project() {
 
     let area = Rect::new(0, 0, WIDTH, 10);
 
-    assert_eq!(hit_test(&state, area, LEFT, TOP), Some(Hit::Project(alpha)));
-    assert_eq!(
-        hit_test(&state, area, WIDTH - 2, TOP),
-        Some(Hit::Project(alpha))
-    );
+    assert_eq!(hit(&state, area, LEFT, TOP), Some(Hit::Project(alpha)));
+    assert_eq!(hit(&state, area, WIDTH - 2, TOP), Some(Hit::Project(alpha)));
 }
 
 #[test]
@@ -312,7 +377,7 @@ fn a_click_on_a_closed_panes_tombstone_finds_nothing() {
     state.close_pane(pane).expect("the pane exists");
 
     let area = Rect::new(0, 0, WIDTH, 10);
-    assert_eq!(hit_test(&state, area, LEFT + 4, TOP + 1), None);
+    assert_eq!(hit(&state, area, LEFT + 8, TOP + 1), None);
 }
 
 #[test]
@@ -321,8 +386,8 @@ fn a_click_outside_the_sidebars_area_finds_nothing() {
     spawn(&mut state, alpha, "claude");
 
     let area = Rect::new(0, 0, WIDTH, 10);
-    assert_eq!(hit_test(&state, area, WIDTH + 5, TOP + 1), None);
-    assert_eq!(hit_test(&state, area, LEFT + 4, 20), None);
+    assert_eq!(hit(&state, area, WIDTH + 5, TOP + 1), None);
+    assert_eq!(hit(&state, area, LEFT + 4, 20), None);
 }
 
 #[test]
@@ -360,29 +425,27 @@ fn rows_are_drawn_inside_the_frame() {
 }
 
 #[test]
-fn the_selected_projects_whole_row_is_highlighted() {
+fn the_selected_projects_whole_row_is_tinted() {
     // Emphasis on the name alone is easy to miss in a list of directory names
-    // that already look alike. The bar runs the width of the list so the eye
+    // that already look alike. The tint runs the width of the list so the eye
     // finds it without reading.
     let (state, _, _) = state();
     let buf = render(&state, WIDTH, 6);
+    let tint = Theme::fallback().tint;
 
     for x in LEFT..WIDTH - 1 {
+        let cell = buf.cell((x, TOP)).expect("cell exists");
+        assert_eq!(cell.bg, tint, "column {x} of the selected row is tinted");
         assert!(
-            buf.cell((x, TOP))
-                .expect("cell exists")
-                .modifier
-                .contains(Modifier::REVERSED),
-            "column {x} of the selected row is part of the bar"
+            !cell.modifier.contains(Modifier::REVERSED),
+            "and not inverted"
         );
     }
 
-    assert!(
-        !buf.cell((LEFT, TOP + 1))
-            .expect("cell exists")
-            .modifier
-            .contains(Modifier::REVERSED),
-        "an unselected project carries no bar"
+    assert_ne!(
+        buf.cell((LEFT, TOP + 1)).expect("cell exists").bg,
+        tint,
+        "an unselected project carries no tint"
     );
 }
 
@@ -391,12 +454,47 @@ fn the_frame_is_not_painted_by_the_highlight() {
     let (state, _, _) = state();
     let buf = render(&state, WIDTH, 6);
 
-    assert!(
-        !buf.cell((0, TOP))
+    assert_ne!(
+        buf.cell((0, TOP)).expect("cell exists").bg,
+        Theme::fallback().tint,
+        "the tint stops at the frame"
+    );
+}
+
+#[test]
+fn every_icon_has_a_blank_column_after_it() {
+    // A Nerd Font glyph is routinely drawn wider than its cell; with nothing
+    // after it, it runs into the next glyph or the first letter of the name.
+    let (mut state, alpha, _) = state();
+    spawn(&mut state, alpha, "claude");
+
+    let buf = render(&state, WIDTH, 6);
+    let blank = |x: u16, y: u16| buf.cell((x, y)).expect("cell exists").symbol() == " ";
+
+    // The project: twisty, blank, folder, blank, name.
+    assert!(blank(LEFT + 1, TOP) && blank(LEFT + 3, TOP));
+    // The pane: twisty, blank, harness icon, blank, title.
+    assert!(blank(LEFT + 5, TOP + 1) && blank(LEFT + 7, TOP + 1));
+}
+
+#[test]
+fn the_state_glyph_keeps_a_blank_between_it_and_the_frame() {
+    let (mut state, alpha, _) = state();
+    spawn(&mut state, alpha, "claude");
+
+    let buf = render(&state, WIDTH, 6);
+
+    assert_eq!(
+        buf.cell((WIDTH - 2, TOP + 1))
             .expect("cell exists")
-            .modifier
-            .contains(Modifier::REVERSED),
-        "the bar stops at the frame"
+            .symbol(),
+        " "
+    );
+    assert_eq!(
+        buf.cell((WIDTH - 1, TOP + 1))
+            .expect("cell exists")
+            .symbol(),
+        "│"
     );
 }
 
@@ -444,24 +542,11 @@ fn a_pane_with_children_carries_a_twisty_and_one_without_does_not() {
     state.toggle_pane_collapsed(parent);
     let buf = render(&state, WIDTH, 8);
     assert_eq!(
-        buf.cell((LEFT + 2, TOP + 1)).expect("cell exists").symbol(),
+        buf.cell((LEFT + 4, TOP + 1)).expect("cell exists").symbol(),
         SHUT,
         "and it flips when collapsed"
     );
     let _ = lonely;
-}
-
-#[test]
-fn the_focus_marker_is_not_a_twisty() {
-    // Two different `▸` in one row read as one control.
-    let (mut state, alpha, _) = state();
-    spawn(&mut state, alpha, "claude");
-
-    let buf = render(&state, WIDTH, 6);
-    let row = row_text(&buf, TOP + 1);
-
-    assert!(row.contains('▌'), "the focused pane is marked: {row:?}");
-    assert!(!row.contains(SHUT), "and not with a twisty: {row:?}");
 }
 
 #[test]
@@ -533,10 +618,7 @@ fn a_click_lands_on_the_row_below_a_collapsed_project() {
     let area = Rect::new(0, 0, WIDTH, 10);
 
     // alpha, then beta's heading, then codex.
-    assert_eq!(
-        hit_test(&state, area, LEFT + 4, TOP + 2),
-        Some(Hit::Pane(codex))
-    );
+    assert_eq!(hit(&state, area, LEFT + 4, TOP + 2), Some(Hit::Pane(codex)));
 }
 
 #[test]
@@ -549,13 +631,13 @@ fn a_click_on_a_panes_twisty_toggles_it_rather_than_focusing_it() {
 
     let area = Rect::new(0, 0, WIDTH, 10);
 
-    // The twisty sits in the row's first column, two in from the list's edge.
+    // The twisty sits in the row's first column, four in from the list's edge.
     assert_eq!(
-        hit_test(&state, area, LEFT + 2, TOP + 1),
+        hit(&state, area, LEFT + 4, TOP + 1),
         Some(Hit::Twisty(parent))
     );
     assert_eq!(
-        hit_test(&state, area, LEFT + 3, TOP + 1),
+        hit(&state, area, LEFT + 5, TOP + 1),
         Some(Hit::Pane(parent)),
         "the rest of the row still focuses the pane"
     );
@@ -568,10 +650,7 @@ fn a_click_on_a_childless_panes_twisty_column_focuses_it() {
     let pane = spawn(&mut state, alpha, "claude");
 
     let area = Rect::new(0, 0, WIDTH, 10);
-    assert_eq!(
-        hit_test(&state, area, LEFT + 2, TOP + 1),
-        Some(Hit::Pane(pane))
-    );
+    assert_eq!(hit(&state, area, LEFT + 4, TOP + 1), Some(Hit::Pane(pane)));
 }
 
 #[test]
@@ -588,7 +667,7 @@ fn a_tombstones_twisty_still_toggles() {
 
     let area = Rect::new(0, 0, WIDTH, 10);
     assert_eq!(
-        hit_test(&state, area, LEFT + 2, TOP + 1),
+        hit(&state, area, LEFT + 4, TOP + 1),
         Some(Hit::Twisty(parent))
     );
 }
@@ -602,10 +681,10 @@ fn the_twisty_is_a_nerd_font_caret() {
     assert_eq!(SHUT, "\u{f0da}");
 }
 
-/// The last column inside the frame, where a pane's state is drawn.
+/// Two columns in from the frame, where a pane's state is drawn.
 fn state_cell(buf: &Buffer, y: u16) -> (String, Color) {
     let cell = buf
-        .cell((buf.area.width - 2, y))
+        .cell((buf.area.width - 3, y))
         .expect("the row has a last column");
     (cell.symbol().to_string(), cell.fg)
 }
@@ -671,7 +750,7 @@ fn a_tombstone_says_it_is_closed() {
 
     assert_eq!(
         state_cell(&buf, TOP + 1),
-        (CLOSED.to_string(), Color::DarkGray)
+        (CLOSED.to_string(), Theme::fallback().faded)
     );
 }
 
@@ -711,10 +790,9 @@ fn a_pane_is_marked_with_the_icon_of_its_harness() {
         .with_harnesses(&harnesses)
         .render(area, &mut buf);
 
-    // Two columns in from the row's own edge: past its twisty and its focus
-    // marker.
+    // Two columns in from the row's own start, past its twisty and a blank.
     assert_eq!(
-        buf.cell((LEFT + 2 + 2, TOP + 1))
+        buf.cell((LEFT + 4 + 2, TOP + 1))
             .expect("cell exists")
             .symbol(),
         "C"
@@ -736,7 +814,7 @@ fn a_pane_whose_harness_is_unregistered_is_marked_generically() {
         .render(area, &mut buf);
 
     assert_eq!(
-        buf.cell((LEFT + 2 + 2, TOP + 1))
+        buf.cell((LEFT + 4 + 2, TOP + 1))
             .expect("cell exists")
             .symbol(),
         dispatch_config::harness::DEFAULT_ICON
@@ -744,38 +822,7 @@ fn a_pane_whose_harness_is_unregistered_is_marked_generically() {
 }
 
 #[test]
-fn a_project_folder_is_open_while_its_panes_are_shown() {
-    let (mut state, alpha, _) = state();
-    spawn(&mut state, alpha, "claude");
-
-    let buf = render(&state, WIDTH, 6);
-    assert_eq!(
-        buf.cell((LEFT + 2, TOP)).expect("cell exists").symbol(),
-        OPEN_FOLDER
-    );
-
-    state.toggle_project_collapsed(alpha);
-    let buf = render(&state, WIDTH, 6);
-    assert_eq!(
-        buf.cell((LEFT + 2, TOP)).expect("cell exists").symbol(),
-        SHUT_FOLDER
-    );
-}
-
-#[test]
-fn a_project_with_nothing_in_it_is_a_shut_folder() {
-    // There is nothing inside it to be looking at.
-    let (state, _, _) = state();
-    let buf = render(&state, WIDTH, 6);
-
-    assert_eq!(
-        buf.cell((LEFT + 2, TOP)).expect("cell exists").symbol(),
-        SHUT_FOLDER
-    );
-}
-
-#[test]
-fn a_repository_carries_a_git_mark_beside_its_folder() {
+fn a_plain_directory_is_a_folder_and_a_repository_is_marked_as_one() {
     let mut state = AppState::new();
     state.add_project(Project::new("/tmp/plain", ProjectSource::LocalDir));
     state.add_project(Project::new(
@@ -786,14 +833,36 @@ fn a_repository_carries_a_git_mark_beside_its_folder() {
     let buf = render(&state, WIDTH, 6);
 
     assert_eq!(
-        buf.cell((LEFT + 1, TOP)).expect("cell exists").symbol(),
-        " ",
-        "a plain directory has no git mark"
+        buf.cell((LEFT + 2, TOP)).expect("cell exists").symbol(),
+        SHUT_FOLDER
     );
     assert_eq!(
-        buf.cell((LEFT + 1, TOP + 1)).expect("cell exists").symbol(),
-        REPOSITORY,
-        "and a repository does"
+        buf.cell((LEFT + 2, TOP + 1)).expect("cell exists").symbol(),
+        REPOSITORY
+    );
+}
+
+#[test]
+fn a_directory_whose_branch_is_known_is_marked_as_a_repository() {
+    // Opened below its repository's root — a directory in a monorepo, or
+    // one `git init` reached later — a project is recorded as a plain
+    // directory, but its branch is found by walking up. The mark follows
+    // the branch, so it never sits above a branch line as a folder.
+    let mut state = AppState::new();
+    state.add_project(
+        Project::new("/tmp/repo/sub", ProjectSource::LocalDir).with_branch(Some("main".into())),
+    );
+
+    let buf = render(&state, WIDTH, 6);
+
+    assert_eq!(
+        buf.cell((LEFT + 2, TOP)).expect("cell exists").symbol(),
+        REPOSITORY
+    );
+    assert_eq!(
+        column_of(&row_text(&buf, TOP + 1), "main"),
+        usize::from(LEFT + NAME),
+        "with its branch beneath"
     );
 }
 
@@ -810,9 +879,9 @@ fn fleet() -> (AppState, DeviceId, DeviceId) {
 }
 
 #[test]
-fn one_machine_draws_no_device_row() {
-    // The ordinary case. A lone row naming this machine costs a line and
-    // indents everything under it to say what the user already knows.
+fn one_machine_draws_no_name_line() {
+    // The ordinary case. A line naming this machine would cost a row to say
+    // what the user already knows.
     let mut state = AppState::new();
     let laptop = state.add_device(Device::new("laptop"));
     state.add_project(Project::new("/tmp/alpha", ProjectSource::LocalDir).with_device(laptop));
@@ -830,43 +899,136 @@ fn one_machine_draws_no_device_row() {
 }
 
 #[test]
-fn several_machines_each_get_a_row_above_their_projects() {
+fn several_machines_each_get_a_section_named_on_the_line_above_it() {
+    // Ten rows: frame 0 and 9, one divider, seven shared between two equal
+    // weights — two each, then three split 2/1 by largest remainder.
     let (state, _, _) = fleet();
     let lines = render_lines(&state, WIDTH, 10);
 
-    let laptop = lines
-        .iter()
-        .position(|line| line.contains("laptop"))
-        .expect("the first machine has a row");
-    let alpha = lines
-        .iter()
-        .position(|line| line.contains("alpha"))
-        .expect("its project is listed");
-    let tower = lines
-        .iter()
-        .position(|line| line.contains("tower"))
-        .expect("the second machine has a row");
-
-    assert!(laptop < alpha && alpha < tower, "{lines:#?}");
     assert!(
-        column_of(&lines[alpha], "alpha") > column_of(&lines[laptop], "laptop"),
-        "a project is indented under its machine: {lines:#?}"
+        lines[0].starts_with('┌') && lines[0].contains("laptop"),
+        "{lines:#?}"
     );
+    assert!(lines[1].contains("alpha"), "{lines:#?}");
+    assert!(
+        lines[5].starts_with('├') && lines[5].contains("tower") && lines[5].ends_with('┤'),
+        "{lines:#?}"
+    );
+    assert!(lines[6].contains("beta"), "{lines:#?}");
+    assert!(lines[9].starts_with('└'), "{lines:#?}");
 }
 
 #[test]
-fn a_collapsed_device_hides_its_projects() {
+fn a_machine_with_more_open_panes_gets_more_of_the_height() {
+    let (mut state, laptop, _) = fleet();
+    let alpha = state
+        .projects()
+        .iter()
+        .find(|project| project.device == laptop)
+        .expect("the laptop has a project")
+        .id;
+    for _ in 0..3 {
+        spawn(&mut state, alpha, "claude");
+    }
+
+    // Twenty rows: eighteen inside, one divider, seventeen shared by weights
+    // four and one — two each, then thirteen split 10.4/2.6, the spare row
+    // going to the larger remainder: twelve and five.
+    let lines = render_lines(&state, WIDTH, 20);
+    let divider = lines
+        .iter()
+        .position(|line| line.contains("tower"))
+        .expect("the second machine is named");
+
+    assert_eq!(divider, 13, "{lines:#?}");
+}
+
+#[test]
+fn a_folded_machine_keeps_only_the_line_naming_it() {
     let (mut state, laptop, _) = fleet();
 
     state.toggle_device_collapsed(laptop);
-    let text = render_lines(&state, WIDTH, 10).join("\n");
+    let lines = render_lines(&state, WIDTH, 10);
+    let text = lines.join("\n");
 
     assert!(!text.contains("alpha"), "{text}");
-    assert!(text.contains("laptop"), "the machine stays: {text}");
+    assert!(lines[0].contains("laptop"), "the machine stays: {text}");
+    assert!(
+        lines[1].contains("tower"),
+        "its section is only that line: {text}"
+    );
     assert!(
         text.contains("beta"),
         "the other machine is unaffected: {text}"
     );
+}
+
+#[test]
+fn a_click_on_a_machines_name_finds_the_machine() {
+    let (state, laptop, tower) = fleet();
+    let area = Rect::new(0, 0, WIDTH, 10);
+
+    assert_eq!(hit(&state, area, 3, 0), Some(Hit::Device(laptop)));
+    assert_eq!(hit(&state, area, 3, 5), Some(Hit::Device(tower)));
+}
+
+#[test]
+fn one_machines_top_border_is_not_a_control() {
+    let (state, _, _) = state();
+    let area = Rect::new(0, 0, WIDTH, 10);
+
+    assert_eq!(hit(&state, area, 3, 0), None);
+}
+
+#[test]
+fn a_click_in_the_second_section_finds_its_rows() {
+    let (state, _, _) = fleet();
+    let beta = state
+        .projects()
+        .iter()
+        .find(|project| project.name == "beta")
+        .expect("beta is registered")
+        .id;
+    let area = Rect::new(0, 0, WIDTH, 10);
+
+    assert_eq!(hit(&state, area, LEFT + 4, 6), Some(Hit::Project(beta)));
+}
+
+#[test]
+fn several_machines_in_a_very_short_sidebar_still_draw_the_frame() {
+    let mut state = AppState::new();
+    for name in ["one", "two", "three"] {
+        let device = state.add_device(Device::new(name));
+        state.add_project(
+            Project::new(format!("/tmp/{name}"), ProjectSource::LocalDir).with_device(device),
+        );
+    }
+
+    for height in 2..6 {
+        let lines = render_lines(&state, WIDTH, height);
+        let last = &lines[usize::from(height) - 1];
+        assert!(last.starts_with('└'), "height {height}: {lines:#?}");
+    }
+}
+
+#[test]
+fn heights_are_shared_by_weight_after_two_rows_each() {
+    assert_eq!(section_heights(&[1, 1], &[false, false], 10), vec![5, 5]);
+    assert_eq!(section_heights(&[3, 1], &[false, false], 12), vec![8, 4]);
+    assert_eq!(section_heights(&[1, 1, 1], &[false; 3], 10), vec![4, 3, 3]);
+}
+
+#[test]
+fn a_folded_section_gets_no_height() {
+    assert_eq!(section_heights(&[1, 1], &[false, true], 10), vec![10, 0]);
+    assert_eq!(section_heights(&[1, 1], &[true, true], 10), vec![0, 0]);
+}
+
+#[test]
+fn too_little_height_is_handed_out_a_row_at_a_time_in_order() {
+    assert_eq!(section_heights(&[1, 1], &[false, false], 3), vec![2, 1]);
+    assert_eq!(section_heights(&[1, 1], &[false, false], 1), vec![1, 0]);
+    assert_eq!(section_heights(&[1, 1], &[false, false], 0), vec![0, 0]);
 }
 
 #[test]
@@ -875,20 +1037,20 @@ fn an_unreachable_device_says_so() {
 
     state.set_device_reachable(tower, false);
     let lines = render_lines(&state, WIDTH, 10);
-    let row = lines
+    let name = lines
         .iter()
         .find(|line| line.contains("tower"))
-        .expect("the machine has a row");
+        .expect("the machine has a name line");
 
-    assert!(row.contains("unreachable"), "{row:?}");
+    assert!(name.contains("unreachable"), "{name:?}");
 }
 
 #[test]
 fn an_unreachable_device_with_a_long_name_still_says_so() {
     // `dispatchd --device` now defaults to the real hostname, which routinely
     // runs long enough that truncating "name — unreachable" as one string
-    // keeps the name and cuts the word this row exists to show. The name has
-    // to give way instead.
+    // keeps the name and cuts the word this line exists to show. The name
+    // has to give way instead.
     let mut state = AppState::new();
     let long = state.add_device(Device::new(
         "Kudays-MacBook-Pro-With-A-Very-Long-Real-Hostname",
@@ -899,45 +1061,64 @@ fn an_unreachable_device_with_a_long_name_still_says_so() {
 
     state.set_device_reachable(long, false);
     let lines = render_lines(&state, WIDTH, 10);
-    let row = lines
+    let name = lines
         .iter()
         .find(|line| line.contains("Kudays"))
-        .expect("the machine has a row");
+        .expect("the machine has a name line");
 
-    assert!(row.contains("unreachable"), "{row:?}");
+    assert!(name.contains("unreachable"), "{name:?}");
 }
 
 #[test]
-fn a_pending_device_with_no_projects_still_draws_a_row() {
+fn a_pending_device_with_no_projects_still_gets_a_section() {
     // The startup case: a registered machine is drawn before it has answered,
     // and before it has answered it has no projects either -- `roots` only
-    // arrive on first connect. The row must not wait for either.
+    // arrive on first connect. Its section must not wait for either.
     let mut state = AppState::new();
     let laptop = state.add_device(Device::new("laptop"));
     state.add_project(Project::new("/tmp/alpha", ProjectSource::LocalDir).with_device(laptop));
     state.add_device(Device::pending("tower"));
 
     let lines = render_lines(&state, WIDTH, 8);
-    let row = lines
+    let name = lines
         .iter()
         .find(|line| line.contains("tower"))
-        .expect("the machine has a row despite having no projects");
+        .expect("the machine is named despite having no projects");
 
-    assert!(row.contains("unreachable"), "{row:?}");
+    assert!(name.contains("unreachable"), "{name:?}");
 }
 
 #[test]
-fn a_click_on_a_device_row_finds_the_device() {
-    let (state, laptop, _) = fleet();
-    let area = Rect::new(0, 0, WIDTH, 10);
+fn a_reachable_machines_name_is_drawn_at_full_strength() {
+    // The name is written onto the frame, which is faded; a live machine's
+    // must not take that colour, or it looks as dead as an unreachable one.
+    let (mut state, _, tower) = fleet();
+    state.set_device_reachable(tower, false);
 
-    assert_eq!(hit_test(&state, area, LEFT, TOP), Some(Hit::Device(laptop)));
+    let buf = render(&state, WIDTH, 10);
+    let lines = render_lines(&state, WIDTH, 10);
+    let divider = lines
+        .iter()
+        .position(|line| line.contains("tower"))
+        .expect("the second machine is named");
+    let first_letter = |y: usize, name: &str| {
+        let x = u16::try_from(column_of(&lines[y], name)).expect("inside the sidebar");
+        let y = u16::try_from(y).expect("inside the sidebar");
+        buf.cell((x, y)).expect("cell exists").clone()
+    };
+
+    let laptop = first_letter(0, "laptop");
+    assert_eq!(laptop.fg, Color::Reset, "{lines:#?}");
+    assert!(laptop.modifier.contains(Modifier::BOLD), "{lines:#?}");
+
+    let tower = first_letter(divider, "tower");
+    assert_eq!(tower.fg, Theme::fallback().faded, "{lines:#?}");
 }
 
 #[test]
-fn the_git_mark_column_is_reserved_on_every_project_row() {
-    // Reserved rather than inserted, so a repository and a plain directory
-    // line their names up with each other.
+fn every_project_row_draws_its_mark_in_one_shared_column() {
+    // A repository's mark and a plain directory's take the same column, so
+    // their names line up with each other.
     let mut state = AppState::new();
     state.add_project(Project::new("/tmp/plain", ProjectSource::LocalDir));
     state.add_project(Project::new(
@@ -951,4 +1132,354 @@ fn the_git_mark_column_is_reserved_on_every_project_row() {
         column_of(&lines[TOP as usize], "plain"),
         column_of(&lines[TOP as usize + 1], "repo")
     );
+}
+
+/// A repository on `main`, selected, with nothing in it yet.
+fn repository() -> (AppState, ProjectId) {
+    let mut state = AppState::new();
+    let project = state.add_project(
+        Project::new("/tmp/repo", ProjectSource::GitRepo { remote: None })
+            .with_branch(Some("main".into())),
+    );
+    (state, project)
+}
+
+/// A pane of `harness` in `project`, on `branch`, titled `title`.
+fn pane_on(state: &mut AppState, project: ProjectId, title: &str, branch: Option<&str>) -> PaneId {
+    let pane = spawn(state, project, "claude");
+    state.set_pane_title(pane, title).expect("the pane exists");
+    state
+        .set_pane_branch(pane, branch.map(str::to_string))
+        .expect("the pane exists");
+    pane
+}
+
+#[test]
+fn a_projects_branch_is_drawn_faded_beneath_its_name() {
+    let (state, _) = repository();
+    let buf = render(&state, WIDTH, 6);
+
+    let line = row_text(&buf, TOP + 1);
+    assert_eq!(
+        column_of(&line, "main"),
+        usize::from(LEFT + NAME),
+        "{line:?}"
+    );
+    assert_eq!(
+        buf.cell((LEFT + NAME, TOP + 1)).expect("cell exists").fg,
+        Theme::fallback().faded
+    );
+}
+
+#[test]
+fn panes_on_the_projects_branch_or_none_sit_beneath_it() {
+    let (mut state, project) = repository();
+    pane_on(&mut state, project, "on-main", Some("main"));
+    pane_on(&mut state, project, "unknown", None);
+
+    let lines = render_lines(&state, WIDTH, 8);
+
+    assert!(lines[TOP as usize + 1].contains("main"), "{lines:#?}");
+    assert!(lines[TOP as usize + 2].contains("on-main"), "{lines:#?}");
+    assert!(lines[TOP as usize + 3].contains("unknown"), "{lines:#?}");
+}
+
+#[test]
+fn panes_on_another_branch_are_gathered_under_it() {
+    let (mut state, project) = repository();
+    pane_on(&mut state, project, "tabs-one", Some("feat/tabs"));
+    pane_on(&mut state, project, "on-main", Some("main"));
+    pane_on(&mut state, project, "tabs-two", Some("feat/tabs"));
+
+    let lines = render_lines(&state, WIDTH, 10);
+    let at = |text: &str| {
+        lines
+            .iter()
+            .position(|line| line.contains(text))
+            .unwrap_or_else(|| panic!("{text:?} is drawn: {lines:#?}"))
+    };
+
+    assert!(at("main") < at("on-main"));
+    assert!(at("on-main") < at("feat/tabs"), "{lines:#?}");
+    assert_eq!(at("tabs-one"), at("feat/tabs") + 1, "{lines:#?}");
+    assert_eq!(at("tabs-two"), at("feat/tabs") + 2, "{lines:#?}");
+    assert_eq!(
+        column_of(&lines[at("feat/tabs")], "feat/tabs"),
+        usize::from(LEFT + NAME),
+        "every branch line sits where the project's does"
+    );
+}
+
+#[test]
+fn a_subagent_stays_under_its_parent_whatever_its_branch() {
+    let (mut state, project) = repository();
+    let parent = pane_on(&mut state, project, "parent", Some("main"));
+    let mut child = Pane::new(project, HarnessId::new("claude"));
+    child.parent = Some(parent);
+    child.title = "child".into();
+    child.branch = Some("feat/elsewhere".into());
+    state.adopt_pane(child).expect("the project exists");
+
+    let lines = render_lines(&state, WIDTH, 8);
+    let parent_row = lines
+        .iter()
+        .position(|l| l.contains("parent"))
+        .expect("drawn");
+
+    assert!(lines[parent_row + 1].contains("child"), "{lines:#?}");
+    assert!(
+        !lines.iter().any(|line| line.contains("feat/elsewhere")),
+        "no group is opened for a subagent: {lines:#?}"
+    );
+}
+
+#[test]
+fn a_project_without_a_branch_draws_no_branch_row() {
+    let (mut state, alpha, _) = state();
+    spawn(&mut state, alpha, "claude");
+
+    let lines = render_lines(&state, WIDTH, 6);
+
+    assert!(lines[TOP as usize + 1].contains("claude"), "{lines:#?}");
+}
+
+#[test]
+fn a_folded_project_keeps_its_own_branch_and_hides_the_rest() {
+    let (mut state, project) = repository();
+    pane_on(&mut state, project, "on-main", Some("main"));
+    pane_on(&mut state, project, "tabs", Some("feat/tabs"));
+
+    state.toggle_project_collapsed(project);
+    let text = render_lines(&state, WIDTH, 8).join("\n");
+
+    assert!(text.contains("main"), "{text}");
+    assert!(
+        !text.contains("on-main") && !text.contains("feat/tabs"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_click_on_a_branch_row_is_a_click_on_its_project() {
+    let (state, project) = repository();
+    let area = Rect::new(0, 0, WIDTH, 6);
+
+    assert_eq!(
+        hit(&state, area, LEFT + NAME, TOP + 1),
+        Some(Hit::Project(project))
+    );
+}
+
+#[test]
+fn a_long_branch_name_is_cut_short_inside_the_frame() {
+    let mut state = AppState::new();
+    state.add_project(
+        Project::new("/tmp/repo", ProjectSource::GitRepo { remote: None }).with_branch(Some(
+            "feature/an-extremely-long-branch-name-for-testing".into(),
+        )),
+    );
+
+    let buf = render(&state, WIDTH, 5);
+    let line = row_text(&buf, TOP + 1);
+
+    assert!(
+        line.ends_with('│'),
+        "the frame is not overwritten: {line:?}"
+    );
+    assert!(line.contains('…'), "the cut is visible: {line:?}");
+}
+
+/// One machine with `count` projects named p0, p1, ….
+fn many(count: usize) -> AppState {
+    let mut state = AppState::new();
+    for index in 0..count {
+        state.add_project(Project::new(
+            format!("/tmp/p{index}"),
+            ProjectSource::LocalDir,
+        ));
+    }
+    state
+}
+
+fn render_scrolled(state: &AppState, scroll: &Scroll, width: u16, height: u16) -> Vec<String> {
+    let area = Rect::new(0, 0, width, height);
+    let mut buf = Buffer::empty(area);
+    Sidebar::new(state)
+        .with_scroll(scroll)
+        .render(area, &mut buf);
+    (0..height).map(|y| row_text(&buf, y)).collect()
+}
+
+#[test]
+fn a_scrolled_section_starts_at_its_offset() {
+    let state = many(20);
+    let scroll = Scroll::from([(DeviceId::nil(), 5)]);
+
+    let lines = render_scrolled(&state, &scroll, WIDTH, 8);
+
+    assert!(lines[TOP as usize].contains(" p5 "), "{lines:#?}");
+}
+
+#[test]
+fn an_offset_past_the_end_is_brought_back() {
+    let state = many(20);
+    let mut scroll = Scroll::from([(DeviceId::nil(), 99)]);
+
+    settle(&state, Rect::new(0, 0, WIDTH, 8), &mut scroll, None);
+
+    // Six rows inside the frame show the last six of twenty.
+    assert_eq!(scroll[&DeviceId::nil()], 14);
+}
+
+#[test]
+fn settling_on_a_pane_scrolls_just_far_enough_to_show_it() {
+    let mut state = many(20);
+    let p15 = state.projects()[15].id;
+    let pane = spawn(&mut state, p15, "claude");
+    let mut scroll = Scroll::new();
+
+    settle(
+        &state,
+        Rect::new(0, 0, WIDTH, 8),
+        &mut scroll,
+        Some(Anchor::Pane(pane)),
+    );
+
+    // The pane is row 16; showing it as the last of six rows starts at 11.
+    assert_eq!(scroll[&DeviceId::nil()], 11);
+    let lines = render_scrolled(&state, &scroll, WIDTH, 8);
+    assert!(lines[TOP as usize + 5].contains("claude"), "{lines:#?}");
+}
+
+#[test]
+fn settling_without_an_anchor_leaves_the_wheels_scroll_alone() {
+    let state = many(20);
+    let mut scroll = Scroll::from([(DeviceId::nil(), 3)]);
+
+    settle(&state, Rect::new(0, 0, WIDTH, 8), &mut scroll, None);
+
+    assert_eq!(scroll[&DeviceId::nil()], 3);
+}
+
+#[test]
+fn rows_hidden_below_are_counted_on_the_line_after_the_section() {
+    let state = many(20);
+    let lines = render_scrolled(&state, &Scroll::new(), WIDTH, 8);
+
+    assert!(lines[7].contains("↓ 14"), "{lines:#?}");
+}
+
+#[test]
+fn rows_hidden_above_are_counted_beside_the_sections_name() {
+    let state = many(20);
+    let scroll = Scroll::from([(DeviceId::nil(), 5)]);
+
+    let lines = render_scrolled(&state, &scroll, WIDTH, 8);
+
+    assert!(lines[0].contains("Projects ↑ 5"), "{lines:#?}");
+}
+
+#[test]
+fn a_divider_carries_a_count_for_each_section_it_separates() {
+    let mut state = AppState::new();
+    let laptop = state.add_device(Device::new("laptop"));
+    let tower = state.add_device(Device::new("a-tower-with-a-very-long-hostname"));
+    for index in 0..10 {
+        state.add_project(
+            Project::new(format!("/tmp/l{index}"), ProjectSource::LocalDir).with_device(laptop),
+        );
+        state.add_project(
+            Project::new(format!("/tmp/t{index}"), ProjectSource::LocalDir).with_device(tower),
+        );
+    }
+    let scroll = Scroll::from([(tower, 2)]);
+
+    // Twelve rows: ten inside, one divider, nine shared five and four.
+    let lines = render_scrolled(&state, &scroll, WIDTH, 12);
+    let divider = &lines[6];
+
+    assert!(
+        divider.contains("↑ 2"),
+        "the tower's own count: {divider:?}"
+    );
+    assert!(divider.contains("↓ 5"), "the laptop's count: {divider:?}");
+    assert!(divider.ends_with('┤'), "{divider:?}");
+}
+
+#[test]
+fn a_click_in_a_scrolled_section_finds_the_row_drawn_there() {
+    let state = many(20);
+    let p5 = state.projects()[5].id;
+    let scroll = Scroll::from([(DeviceId::nil(), 5)]);
+
+    assert_eq!(
+        hit_test(&state, Rect::new(0, 0, WIDTH, 8), &scroll, LEFT + 4, TOP),
+        Some(Hit::Project(p5))
+    );
+}
+
+#[test]
+fn the_wheel_finds_the_section_under_it() {
+    let (state, laptop, tower) = fleet();
+    let area = Rect::new(0, 0, WIDTH, 10);
+    let scroll = Scroll::new();
+
+    assert_eq!(section_at(&state, area, &scroll, 5, 1), Some(laptop));
+    assert_eq!(section_at(&state, area, &scroll, 5, 6), Some(tower));
+    assert_eq!(section_at(&state, area, &scroll, 5, 5), None, "a divider");
+    assert_eq!(section_at(&state, area, &scroll, 0, 1), None, "the frame");
+}
+
+#[test]
+fn the_hidden_above_count_is_drawn_faded() {
+    // The spec draws every hidden-row count in `faded`, above a section's
+    // name and below it alike; only the name itself takes the label's own
+    // style.
+    let state = many(20);
+    let scroll = Scroll::from([(DeviceId::nil(), 5)]);
+
+    let area = Rect::new(0, 0, WIDTH, 8);
+    let mut buf = Buffer::empty(area);
+    Sidebar::new(&state)
+        .with_scroll(&scroll)
+        .render(area, &mut buf);
+    let line = row_text(&buf, 0);
+
+    let x = u16::try_from(column_of(&line, "↑")).expect("inside the sidebar");
+    let cell = buf.cell((x, 0)).expect("cell exists");
+
+    assert_eq!(cell.fg, Theme::fallback().faded, "{line:?}");
+}
+
+#[test]
+fn a_machines_name_stays_full_strength_while_its_hidden_above_count_is_faded() {
+    let (mut state, _, tower) = fleet();
+    // Enough rows under the tower that an offset of 2 is not clamped away.
+    for index in 0..9 {
+        state.add_project(
+            Project::new(format!("/tmp/t{index}"), ProjectSource::LocalDir).with_device(tower),
+        );
+    }
+    let scroll = Scroll::from([(tower, 2)]);
+
+    let area = Rect::new(0, 0, WIDTH, 10);
+    let mut buf = Buffer::empty(area);
+    Sidebar::new(&state)
+        .with_scroll(&scroll)
+        .render(area, &mut buf);
+    let lines: Vec<String> = (0..10).map(|y| row_text(&buf, y)).collect();
+    let divider = lines
+        .iter()
+        .position(|line| line.contains("tower"))
+        .expect("the second machine is named");
+    let y = u16::try_from(divider).expect("inside the sidebar");
+
+    let name_x = u16::try_from(column_of(&lines[divider], "tower")).expect("inside the sidebar");
+    let name = buf.cell((name_x, y)).expect("cell exists");
+    assert_eq!(name.fg, Color::Reset, "{lines:#?}");
+    assert!(name.modifier.contains(Modifier::BOLD), "{lines:#?}");
+
+    let up_x = u16::try_from(column_of(&lines[divider], "↑")).expect("inside the sidebar");
+    let up = buf.cell((up_x, y)).expect("cell exists");
+    assert_eq!(up.fg, Theme::fallback().faded, "{lines:#?}");
 }

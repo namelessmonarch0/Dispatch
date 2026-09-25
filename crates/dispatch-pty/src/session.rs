@@ -262,7 +262,11 @@ impl Pty {
         self.state
     }
 
-    /// The child's process id, while it is alive.
+    /// The child's process id, as it was when the child was spawned.
+    ///
+    /// `None` only where the platform did not report one. Still returned
+    /// after the child has exited, when the number may already belong to
+    /// some other process: check [`Pty::state`] before looking it up.
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
         self.pid
@@ -383,7 +387,11 @@ impl PtySession {
         self.pty.state()
     }
 
-    /// The child's process id, while it is alive.
+    /// The child's process id, as it was when the child was spawned.
+    ///
+    /// `None` only where the platform did not report one. Still returned
+    /// after the child has exited, when the number may already belong to
+    /// some other process: check [`PtySession::state`] before looking it up.
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
         self.pty.pid()

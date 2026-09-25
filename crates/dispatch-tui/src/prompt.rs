@@ -27,6 +27,9 @@ pub struct Prompt {
     hint: String,
     input: String,
     note: Option<Note>,
+    /// The frame's colour, set by whoever draws the overlay so it matches
+    /// the rest of the interface.
+    border: Style,
 }
 
 /// The narrowest a prompt is drawn, so a short title still leaves room to
@@ -42,7 +45,13 @@ impl Prompt {
             hint: hint.into(),
             input: String::new(),
             note: None,
+            border: Style::default().fg(Color::Cyan),
         }
+    }
+
+    /// Draws the frame in `style`.
+    pub fn set_border(&mut self, style: Style) {
+        self.border = style;
     }
 
     /// The same prompt with something already typed, for a default the user
@@ -153,7 +162,7 @@ impl Widget for &Prompt {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" {} ", self.title))
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.border);
         let inner = block.inner(rect);
         block.render(rect, buf);
 

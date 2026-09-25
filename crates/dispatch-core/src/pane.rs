@@ -94,6 +94,13 @@ pub struct Pane {
     /// Whether this pane is closed but kept as a row for live children.
     #[serde(default)]
     pub closed: bool,
+    /// The git branch the pane's foreground program is working on, while it
+    /// is inside a repository.
+    ///
+    /// Reported by whichever machine runs the pane; `None` from a daemon too
+    /// old to say.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 impl Pane {
@@ -111,6 +118,7 @@ impl Pane {
             parent: None,
             durable: false,
             closed: false,
+            branch: None,
         }
     }
 }

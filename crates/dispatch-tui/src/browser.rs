@@ -59,6 +59,9 @@ pub struct Browser {
     /// Whether the listing is a scan's findings rather than one directory's
     /// own children.
     scanning: bool,
+    /// The frame's colour, set by whoever draws the overlay so it matches
+    /// the rest of the interface.
+    border: Style,
 }
 
 impl Browser {
@@ -75,7 +78,13 @@ impl Browser {
             input: String::new(),
             selected: 0,
             scanning: false,
+            border: Style::default().fg(Color::Cyan),
         }
+    }
+
+    /// Draws the frame in `style`.
+    pub fn set_border(&mut self, style: Style) {
+        self.border = style;
     }
 
     /// Whether the listing is a scan's findings.
@@ -429,7 +438,7 @@ impl Widget for &Browser {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(TITLE)
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.border);
         let inner = block.inner(rect);
         block.render(rect, buf);
 

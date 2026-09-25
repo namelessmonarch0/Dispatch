@@ -12,7 +12,7 @@ use dispatch_core::{
     ProjectId, ProjectSource, RequestId,
 };
 use dispatch_layout::{tile, tile_zoomed};
-use dispatch_proto::{ClientMessage, DelegateOutcome, PaneUpdate, ServerMessage};
+use dispatch_proto::{ClientMessage, DelegateOutcome, PaneUpdate, ProjectUpdate, ServerMessage};
 use dispatch_pty::{
     KeyEncoder, MouseEncoder, MouseInput, PtySession, RunState, Screen, ScreenReader, ScrollTo,
     Size, TitleScanner,
@@ -27,11 +27,12 @@ use dispatch_tui::input::{
     Action, Direction, Event, InputRouter, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseEventKind,
 };
-use dispatch_tui::{Item, PaneWidget, Picker, Prompt, Sidebar, sidebar};
+use dispatch_tui::{Item, PaneWidget, Picker, Prompt, Sidebar, Theme, sidebar, truncate};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Widget};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 
 /// How many panes are tiled at once.
 ///
@@ -41,21 +42,27 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Widget};
 /// and all of them are always listed in the sidebar.
 const PANES_PER_TAB: usize = 4;
 
+/// The program's name as the top-left corner spells it, letter-spaced the
+/// way a label rather than a heading is.
+const APP_NAME: &str = "D I S P A T C H";
+
+/// How many columns of a pane's title a tab shows.
+const TAB_TITLE: usize = 16;
+
 /// The border drawn around one pane.
 ///
-/// A plain thin line, brighter on the focused pane. Rounded corners read as
-/// softer than the square ones the sidebar and status row use, which is enough
-/// to tell a pane's edge from the frame of the interface around it.
-fn pane_block(focused: bool) -> Block<'static> {
-    let colour = if focused {
-        Color::White
+/// Square, like every other edge in the interface: faded when unfocused, and
+/// in the accent on the pane that has the keyboard, with its title in bold.
+fn pane_block(focused: bool, theme: &Theme) -> Block<'static> {
+    let (colour, title) = if focused {
+        (theme.accent, Style::default().add_modifier(Modifier::BOLD))
     } else {
-        Color::DarkGray
+        (theme.faded, Style::default())
     };
 
     Block::bordered()
-        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(colour))
+        .title_style(title)
 }
 
 /// What to write on a pane's border.
@@ -127,10 +134,12 @@ const FRAME: Duration = Duration::from_millis(16);
 
 /// How much of a task's opening words becomes a subagent's first title.
 ///
-/// The sidebar is [`sidebar::WIDTH`] columns wide and a child row is indented
-/// four into it, so anything much longer than this could not be read there in
-/// full anyway.
-const TITLE_BUDGET: usize = 22;
+/// All a subagent's row has room for: in a [`sidebar::WIDTH`]-column sidebar,
+/// its title starts ten columns inside the frame, after the indent, the
+/// twisty, the icon and the blank after each, and stops a blank short of the
+/// state glyph two in from the far side. Any longer and the sidebar would cut
+/// again, mid-word, what was cut here between words.
+const TITLE_BUDGET: usize = 19;
 
 /// The opening words of a task, for the row of the subagent running it.
 ///
@@ -271,6 +280,21 @@ impl Overlay {
             | Overlay::Approval { .. } => None,
         }
     }
+
+    /// Draws the overlay's frame in `style`.
+    fn set_border(&mut self, style: Style) {
+        match self {
+            Overlay::Harness(picker)
+            | Overlay::Project(picker)
+            | Overlay::Register(picker)
+            | Overlay::Machine(picker) => picker.set_border(style),
+            Overlay::Browse(browser) => browser.set_border(style),
+            Overlay::OpenOn { prompt, .. } => prompt.set_border(style),
+            Overlay::AddMachine(add) => add.prompt_mut().set_border(style),
+            // Built fresh each frame, with the theme's border already on it.
+            Overlay::Approval { .. } => {}
+        }
+    }
 }
 
 /// What to call the machine Dispatch is running on.
@@ -386,6 +410,17 @@ pub struct App {
     /// way to pick one of its rows out of the list — this is what a click is
     /// matched against.
     sidebar_area: Rect,
+    /// How far each machine's section of the sidebar is scrolled.
+    sidebar_scroll: sidebar::Scroll,
+    /// The row the sidebar was last scrolled to follow, and the area it was
+    /// drawn in then.
+    ///
+    /// Compared against the focus, the selection and the sidebar's area each
+    /// frame: only a change nudges the scroll, so a wheel scroll — which
+    /// changes none of them — is not undone by the very next frame drawn
+    /// after it, while a resize that would push the row out of view is not
+    /// left to.
+    anchored: (Option<sidebar::Anchor>, Rect),
     /// Subagents the user has opened, so they join the tiled grid.
     ///
     /// Which rows are open is a per-client choice, not a property of the
@@ -409,6 +444,11 @@ pub struct App {
     /// title is known one message before there is a row to put it on.
     child_titles: HashMap<PaneId, String>,
     status: String,
+    /// When this client last looked at its own panes' and projects' branches.
+    branches_checked: Option<Instant>,
+    /// How often it looks: [`dispatch_os::git::RECHECK`], or every poll in a
+    /// test that cannot wait two seconds per step.
+    branch_every: Duration,
     quit: bool,
     /// A project to reselect once its `ProjectOpened` comes back, keyed by
     /// the device it belongs to, because a reconnect forgot it out from
@@ -436,6 +476,8 @@ pub struct App {
     /// can tell `a` and `A` apart without a real daemon to send it to.
     #[cfg(test)]
     sent: Vec<ClientMessage>,
+    /// The colours Dispatch draws its own chrome in.
+    theme: Theme,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -474,15 +516,20 @@ impl App {
             frames: Vec::new(),
             layout: Vec::new(),
             sidebar_area: Rect::default(),
+            sidebar_scroll: sidebar::Scroll::new(),
+            anchored: (None, Rect::default()),
             expanded: HashSet::new(),
             pending: VecDeque::new(),
             answered: HashMap::new(),
             child_titles: HashMap::new(),
             status: String::new(),
+            branches_checked: None,
+            branch_every: dispatch_os::git::RECHECK,
             quit: false,
             reopening_selection: None,
             #[cfg(test)]
             sent: Vec::new(),
+            theme: Theme::fallback(),
         }
     }
 
@@ -499,8 +546,8 @@ impl App {
     /// Adds a daemon to the fleet, registering the machine it names itself as.
     ///
     /// The device is registered here, before the connection has said anything,
-    /// so every project this daemon announces has a machine's row to be drawn
-    /// under. A project stamped with a device the sidebar does not know is
+    /// so every project this daemon announces has a machine's section to be
+    /// drawn in. A project stamped with a device the sidebar does not know is
     /// drawn nowhere at all.
     pub fn attach(&mut self, client: Client) {
         let device = Device::new(client.device());
@@ -572,6 +619,11 @@ impl App {
     /// first draw with no sidebar row and no attachment to hang a warning on.
     pub fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
+    }
+
+    /// Draws the interface in `theme` from the next frame on.
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
     }
 
     /// The daemons this client is holding, or nothing when it holds none.
@@ -697,9 +749,9 @@ impl App {
     /// only ever proceeds project-then-machine and unfolding always drops
     /// both at once -- there is no third shape a press has to remember its
     /// way through. A remembered direction would be one more thing that has
-    /// to agree with what a click on the project or machine row just did
-    /// behind this key's back; reading the flags fresh each press means
-    /// there is nothing to fall out of sync.
+    /// to agree with what a click on the project row or the machine's name
+    /// line just did behind this key's back; reading the flags fresh each
+    /// press means there is nothing to fall out of sync.
     fn toggle_project_and_device_fold(&mut self, project: ProjectId) {
         let device = self
             .state
@@ -708,7 +760,7 @@ impl App {
             .find(|candidate| candidate.id == project)
             .map(|candidate| candidate.device);
 
-        // On one machine the sidebar draws no device row, so a folded device
+        // On one machine the sidebar draws no name line, so a folded device
         // is invisible: stepping that rung anyway would spend a press on
         // nothing, leaving the second press of `^a f` looking like a no-op
         // and a third one needed to unfold. Dropping the device out of the
@@ -825,7 +877,7 @@ impl App {
         };
 
         // Stamped with this machine, like any other project: the sidebar draws
-        // a project under its machine's row, so one naming a device that was
+        // a project in its machine's section, so one naming a device that was
         // never registered is drawn nowhere at all — open, invisible and
         // unreachable.
         //
@@ -838,8 +890,12 @@ impl App {
             .local
             .expect("a standalone client registers its own machine in `App::new`");
 
-        self.state
-            .add_project(Project::new(root, source).with_device(device));
+        let branch = dispatch_os::git::head(&root);
+        self.state.add_project(
+            Project::new(root, source)
+                .with_branch(branch)
+                .with_device(device),
+        );
     }
 
     /// Which kept list a root opened on `device` belongs on.
@@ -1300,6 +1356,16 @@ impl App {
                 self.state.remove_project(project).is_ok()
             }
 
+            ServerMessage::ProjectChanged { project, update } => match update {
+                ProjectUpdate::Branch { branch } => self
+                    .state
+                    .set_project_branch(project, branch)
+                    .unwrap_or(false),
+                // A newer daemon's change this build has no name for: ignored,
+                // as the protocol promises, rather than failing the frame.
+                ProjectUpdate::Unknown => false,
+            },
+
             ServerMessage::PaneSpawned {
                 pane,
                 project,
@@ -1346,6 +1412,9 @@ impl App {
                 PaneUpdate::Title { title } => {
                     self.rename(pane, &title);
                     true
+                }
+                PaneUpdate::Branch { branch } => {
+                    self.state.set_pane_branch(pane, branch).unwrap_or(false)
                 }
                 // A newer daemon's update this build has no name for. The
                 // protocol's promise is that it lands somewhere ignorable
@@ -1666,6 +1735,65 @@ impl App {
             let _ = self.state.set_pane_status(id, status);
         }
 
+        if self.refresh_local_branches() {
+            changed = true;
+        }
+
+        changed
+    }
+
+    /// Looks again at which branch this process's own panes and projects are
+    /// on, at most every `branch_every`. Returns whether any row moved.
+    ///
+    /// Standalone only: attached, every pane and project is a daemon's, and
+    /// the daemon looks from the machine they are on. A pane whose directory
+    /// cannot be read keeps the branch it had, as the daemon's do.
+    fn refresh_local_branches(&mut self) -> bool {
+        let Some(local) = self.local else {
+            return false;
+        };
+        if self
+            .branches_checked
+            .is_some_and(|checked| checked.elapsed() < self.branch_every)
+        {
+            return false;
+        }
+        self.branches_checked = Some(Instant::now());
+
+        let mut changed = false;
+
+        let dirs: Vec<(PaneId, PathBuf)> = self
+            .panes
+            .iter()
+            .filter_map(|(id, pane)| match &pane.backend {
+                // Live panes only, as the daemon's: an exited pane still holds
+                // the pid it was spawned with, and once that number is handed
+                // to some unrelated process, looking there would move the
+                // finished pane onto that process's branch.
+                Backend::Local(session) if session.state() == RunState::Running => session
+                    .pid()
+                    .and_then(dispatch_os::process::working_dir)
+                    .map(|dir| (*id, dir)),
+                Backend::Local(_) | Backend::Remote(_) => None,
+            })
+            .collect();
+        for (id, dir) in dirs {
+            let branch = dispatch_os::git::head(&dir);
+            changed |= self.state.set_pane_branch(id, branch).unwrap_or(false);
+        }
+
+        let roots: Vec<(ProjectId, PathBuf)> = self
+            .state
+            .projects()
+            .iter()
+            .filter(|project| project.device == local)
+            .map(|project| (project.id, project.root.clone()))
+            .collect();
+        for (id, root) in roots {
+            let branch = dispatch_os::git::head(&root);
+            changed |= self.state.set_project_branch(id, branch).unwrap_or(false);
+        }
+
         changed
     }
 
@@ -1682,8 +1810,13 @@ impl App {
         // resolved here rather than through the router.
         if let Event::Mouse(mouse) = event
             && matches!(mouse.kind, MouseEventKind::Down(_))
-            && let Some(hit) =
-                sidebar::hit_test(&self.state, self.sidebar_area, mouse.column, mouse.row)
+            && let Some(hit) = sidebar::hit_test(
+                &self.state,
+                self.sidebar_area,
+                &self.sidebar_scroll,
+                mouse.column,
+                mouse.row,
+            )
         {
             match hit {
                 sidebar::Hit::Device(id) => self.state.toggle_device_collapsed(id),
@@ -1697,6 +1830,30 @@ impl App {
                 sidebar::Hit::Twisty(id) => self.state.toggle_pane_collapsed(id),
                 sidebar::Hit::Pane(id) => self.focus_pane(id),
             }
+            return Ok(());
+        }
+
+        // The wheel over the sidebar scrolls the section under it; the grid
+        // never sees it, since no pane is under the pointer.
+        if let Event::Mouse(mouse) = event
+            && matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+            && let Some(device) = sidebar::section_at(
+                &self.state,
+                self.sidebar_area,
+                &self.sidebar_scroll,
+                mouse.column,
+                mouse.row,
+            )
+        {
+            let offset = self.sidebar_scroll.entry(device).or_insert(0);
+            *offset = if mouse.kind == MouseEventKind::ScrollUp {
+                offset.saturating_sub(1)
+            } else {
+                offset.saturating_add(1)
+            };
             return Ok(());
         }
 
@@ -2241,6 +2398,7 @@ impl App {
             task: &request.task,
             waiting: self.pending.len().saturating_sub(1),
             scroll,
+            border: Style::default().fg(self.theme.faded),
         })
     }
 
@@ -2806,39 +2964,57 @@ impl App {
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
 
-        let sidebar_width = sidebar::WIDTH.min(area.width);
-        let sidebar_area = Rect::new(area.x, area.y, sidebar_width, area.height);
-
-        // One row at the bottom for status.
-        let body_height = area.height.saturating_sub(1);
-        let panes_area = Rect::new(
-            area.x + sidebar_width,
-            area.y,
-            area.width.saturating_sub(sidebar_width),
-            body_height,
+        // One row across the top for the name and the tabs, one along the
+        // bottom for status, and everything between for the sidebar and the
+        // panes.
+        let top = Rect::new(area.x, area.y, area.width, area.height.min(1));
+        let body = Rect::new(
+            area.x,
+            area.y + top.height,
+            area.width,
+            area.height.saturating_sub(top.height + 1),
         );
 
+        let sidebar_width = sidebar::WIDTH.min(area.width);
+        let sidebar_area = Rect::new(body.x, body.y, sidebar_width, body.height);
+        let panes_area = Rect::new(
+            body.x + sidebar_width,
+            body.y,
+            body.width.saturating_sub(sidebar_width),
+            body.height,
+        );
+
+        // Scrolled to the focus only when the focus has moved or the sidebar
+        // has been resized, so the wheel's scroll survives every frame drawn
+        // in between.
+        let anchor = self
+            .state
+            .focused_pane()
+            .map(sidebar::Anchor::Pane)
+            .or_else(|| self.state.selected_project().map(sidebar::Anchor::Project));
+        let moved = (anchor, sidebar_area) != self.anchored;
+        sidebar::settle(
+            &self.state,
+            sidebar_area,
+            &mut self.sidebar_scroll,
+            if moved { anchor } else { None },
+        );
+        self.anchored = (anchor, sidebar_area);
+
         frame.render_widget(
-            Sidebar::new(&self.state).with_harnesses(&self.harnesses),
+            Sidebar::new(&self.state)
+                .with_harnesses(&self.harnesses)
+                .with_theme(self.theme)
+                .with_scroll(&self.sidebar_scroll),
             sidebar_area,
         );
         self.sidebar_area = sidebar_area;
 
-        // One row above the grid, and only once there is a second tab: a row
-        // saying "1" and nothing else is a row of output given away for no
-        // information.
-        let panes_area = if self.tab_count() > 1 {
-            let tabs_row = Rect::new(panes_area.x, panes_area.y, panes_area.width, 1);
-            self.draw_tabs(frame, tabs_row);
-            Rect::new(
-                panes_area.x,
-                panes_area.y + 1,
-                panes_area.width,
-                panes_area.height.saturating_sub(1),
-            )
-        } else {
-            panes_area
-        };
+        self.draw_name(frame, Rect::new(top.x, top.y, sidebar_width, top.height));
+        self.draw_tabs(
+            frame,
+            Rect::new(panes_area.x, top.y, panes_area.width, top.height),
+        );
 
         self.frames = self.compute_frames(panes_area);
         self.layout = self
@@ -2854,6 +3030,11 @@ impl App {
 
     /// Draws whichever overlay is open, if any.
     fn draw_overlay(&mut self, frame: &mut Frame<'_>, panes_area: Rect) {
+        let border = Style::default().fg(self.theme.faded);
+        if let Some(overlay) = &mut self.overlay {
+            overlay.set_border(border);
+        }
+
         let Some(overlay) = &self.overlay else {
             return;
         };
@@ -3028,7 +3209,7 @@ impl App {
 
     /// The area inside a tile's border, which is what the pane itself owns.
     fn interior(frame: Rect) -> Rect {
-        pane_block(false).inner(frame)
+        Block::bordered().inner(frame)
     }
 
     fn draw_panes(&mut self, frame: &mut Frame<'_>) {
@@ -3047,7 +3228,7 @@ impl App {
             // sidebar. Without it two panes of similarly-coloured text read as
             // one pane with a very confusing wrap.
             frame.render_widget(
-                pane_block(is_focused).title(pane_title(&self.state, *id)),
+                pane_block(is_focused, &self.theme).title(pane_title(&self.state, *id)),
                 *outer,
             );
 
@@ -3067,38 +3248,64 @@ impl App {
         }
     }
 
+    /// Writes the program's name in the top row, over the sidebar's column.
+    fn draw_name(&self, frame: &mut Frame<'_>, area: Rect) {
+        if area.height == 0 || area.width < 2 {
+            return;
+        }
+
+        // One column in, where the sidebar's own text starts below it.
+        let row = Rect::new(area.x + 1, area.y, area.width - 1, 1);
+        Paragraph::new(APP_NAME)
+            .style(Style::default().fg(self.theme.faded))
+            .render(row, frame.buffer_mut());
+    }
+
     /// Draws the row of tabs above the grid.
+    ///
+    /// Each is its number and its first pane's title. The one on screen sits
+    /// on a tint rather than being inverted: it should read as the one you
+    /// are in, not as a warning.
     fn draw_tabs(&self, frame: &mut Frame<'_>, area: Rect) {
         if area.height == 0 {
             return;
         }
 
         let current = self.current_tab();
+        let tileable = self.tileable();
         let mut spans = Vec::new();
 
         for index in 0..self.tab_count() {
-            let panes = self
-                .tileable()
+            let title = tileable
                 .chunks(PANES_PER_TAB)
                 .nth(index)
-                .map_or(0, <[PaneId]>::len);
+                .and_then(<[PaneId]>::first)
+                .and_then(|id| self.state.pane(*id))
+                .map(|pane| truncate(&pane.title, TAB_TITLE));
 
+            let label = match title {
+                Some(title) => format!(" {} {title} ", index + 1),
+                None => format!(" {} ", index + 1),
+            };
+            // `tab` is mixed from the palette, the fallback's dark one when
+            // the terminal did not answer, so the text on it comes from the
+            // palette too rather than being the terminal's own.
             let style = if index == current {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Gray)
+                    .bg(self.theme.tab)
+                    .fg(self.theme.text)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(self.theme.faded)
             };
 
-            spans.push(ratatui::text::Span::styled(
-                format!(" {} ({panes}) ", index + 1),
-                style,
-            ));
+            if index > 0 {
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(label, style));
         }
 
-        Paragraph::new(ratatui::text::Line::from(spans)).render(area, frame.buffer_mut());
+        Paragraph::new(Line::from(spans)).render(area, frame.buffer_mut());
     }
 
     fn draw_status(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -3182,13 +3389,15 @@ impl App {
             }
         };
 
+        // On `tab`, like the active tab, and in the same text colour for the
+        // same reason.
         let style = if self.router.is_armed() {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
+                .bg(self.theme.tab)
+                .fg(self.theme.text)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(self.theme.faded)
         };
 
         Paragraph::new(text)
@@ -3246,6 +3455,7 @@ mod tests {
     use std::sync::mpsc::{Receiver, Sender};
 
     use dispatch_core::{PaneRole, Project, ProjectSource};
+    use ratatui::style::Color;
 
     /// An `App` attached to a daemon that says only what a test tells it to,
     /// with one project already announced.
@@ -3293,12 +3503,6 @@ mod tests {
         }
     }
 
-    /// The column a row's title starts in, for comparing one row's indentation
-    /// against another's.
-    ///
-    /// Counted in characters rather than bytes: the status dot and the focus
-    /// marker are three bytes each, so a byte offset would make a focused row
-    /// look indented further than an unfocused one at the same depth.
     /// Just the sidebar's columns of one rendered row.
     ///
     /// A pane's border carries its title, so a whole row can name a harness
@@ -3308,6 +3512,12 @@ mod tests {
         line.chars().take(sidebar::WIDTH as usize).collect()
     }
 
+    /// The column `needle` starts in, for comparing one row's indentation
+    /// against another's.
+    ///
+    /// Counted in characters rather than bytes: a twisty is three bytes and
+    /// a leaf's blank is one, so a byte offset would make a pane with
+    /// children look indented further than one without at the same depth.
     fn column_of(line: &str, needle: &str) -> usize {
         let byte = line
             .find(needle)
@@ -3655,6 +3865,51 @@ mod tests {
         assert!(
             app.state.pane(pane).is_some(),
             "the pane is untouched by an update this build cannot read"
+        );
+    }
+
+    #[test]
+    fn a_daemon_saying_a_pane_moved_branch_is_recorded() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        daemon
+            .send(ServerMessage::PaneChanged {
+                pane,
+                update: PaneUpdate::Branch {
+                    branch: Some("feat/tabs".into()),
+                },
+            })
+            .expect("the app is listening");
+
+        assert!(app.poll_daemon(), "a branch change is worth a redraw");
+        assert_eq!(
+            app.state.pane(pane).and_then(|pane| pane.branch.as_deref()),
+            Some("feat/tabs")
+        );
+    }
+
+    #[test]
+    fn a_daemon_saying_a_project_moved_branch_is_recorded() {
+        let (mut app, project, daemon, _sent) = attached_app();
+
+        daemon
+            .send(ServerMessage::ProjectChanged {
+                project,
+                update: ProjectUpdate::Branch {
+                    branch: Some("main".into()),
+                },
+            })
+            .expect("the app is listening");
+
+        assert!(app.poll_daemon());
+        assert_eq!(
+            app.state
+                .projects()
+                .iter()
+                .find(|candidate| candidate.id == project)
+                .and_then(|project| project.branch.as_deref()),
+            Some("main")
         );
     }
 
@@ -4434,13 +4689,14 @@ mod tests {
     fn a_click_on_a_project_row_selects_it_and_folds_its_panes() {
         let (mut app, _terminal, first, _parent, _child) = app_with_a_drawn_sidebar();
 
-        // The first row inside the sidebar's frame is the first project.
-        click(&mut app, 1, 1);
+        // The first row inside the sidebar's frame — below the top row and
+        // the frame's own edge — is the first project.
+        click(&mut app, 1, 2);
 
         assert_eq!(app.state.selected_project(), Some(first));
         assert!(app.state.is_project_collapsed(first), "and it folds");
 
-        click(&mut app, 1, 1);
+        click(&mut app, 1, 2);
         assert!(!app.state.is_project_collapsed(first), "and unfolds again");
     }
 
@@ -4449,9 +4705,9 @@ mod tests {
         let (mut app, _terminal, _first, parent, child) = app_with_a_drawn_sidebar();
 
         let _ = app.state.focus(child);
-        // A pane row is indented two columns inside the frame, and its twisty
-        // is the first of them.
-        click(&mut app, 3, 2);
+        // A pane row starts four columns inside the frame, and its twisty is
+        // the first of them.
+        click(&mut app, 5, 3);
 
         assert!(app.state.is_pane_collapsed(parent));
         assert_eq!(
@@ -4466,7 +4722,8 @@ mod tests {
         let (mut app, _terminal, _first, parent, child) = app_with_a_drawn_sidebar();
 
         let _ = app.state.focus(child);
-        click(&mut app, 8, 2);
+        // One row lower than before the top row.
+        click(&mut app, 8, 3);
 
         assert_eq!(app.state.focused_pane(), Some(parent));
         assert!(!app.state.is_pane_collapsed(parent), "and folds nothing");
@@ -4485,6 +4742,231 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn the_top_row_carries_the_name_and_the_tabs() {
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let pane = app
+            .state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+        app.state
+            .set_pane_title(pane, "refactor")
+            .expect("the pane exists");
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+
+        let text = rendered_text(&terminal);
+        let top = text.lines().next().expect("the frame has rows");
+        let over_sidebar: String = top.chars().take(sidebar::WIDTH as usize).collect();
+        let over_panes: String = top.chars().skip(sidebar::WIDTH as usize).collect();
+
+        assert_eq!(over_sidebar.trim(), APP_NAME, "{top:?}");
+        assert!(
+            over_panes.contains("1 refactor"),
+            "a lone tab is still drawn, named for its pane: {top:?}"
+        );
+    }
+
+    #[test]
+    fn a_tab_title_is_cut_by_the_columns_it_takes() {
+        // Twelve wide characters are twenty-four columns: counted as twelve,
+        // they fit a sixteen-column title and ran half as far again past it.
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let pane = app
+            .state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+        app.state
+            .set_pane_title(pane, "日本語のプロジェクト名前")
+            .expect("the pane exists");
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+        let buf = terminal.backend().buffer();
+        let top: Vec<&ratatui::buffer::Cell> = (sidebar::WIDTH..buf.area.width)
+            .filter_map(|x| buf.cell((x, 0)))
+            .collect();
+
+        let number = top
+            .iter()
+            .position(|cell| cell.symbol() == "1")
+            .expect("the tab is drawn");
+        let cut = top
+            .iter()
+            .position(|cell| cell.symbol() == "…")
+            .expect("the title is cut, and says so");
+        // The title starts a blank after the tab's number.
+        let title = number + 2;
+        assert!(
+            cut + 1 - title <= TAB_TITLE,
+            "the title takes {} columns",
+            cut + 1 - title
+        );
+    }
+
+    #[test]
+    fn the_active_tab_is_tinted_rather_than_inverted() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 5);
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+        let buf = terminal.backend().buffer();
+        let theme = Theme::fallback();
+
+        let top: Vec<&ratatui::buffer::Cell> = (sidebar::WIDTH..buf.area.width)
+            .filter_map(|x| buf.cell((x, 0)))
+            .collect();
+        let active = top
+            .iter()
+            .find(|cell| cell.symbol() == "2")
+            .expect("the focused pane's tab is drawn");
+        let inactive = top
+            .iter()
+            .find(|cell| cell.symbol() == "1")
+            .expect("the other tab is drawn");
+
+        assert_eq!(active.bg, theme.tab, "the fifth pane is focused, on tab 2");
+        assert_eq!(
+            active.fg, theme.text,
+            "in the palette's text: the terminal's own may be a light \
+             theme's dark text on the fallback's dark tab"
+        );
+        assert!(!active.modifier.contains(Modifier::REVERSED));
+        assert_eq!(inactive.fg, theme.faded);
+        assert_eq!(inactive.bg, Color::Reset);
+    }
+
+    #[test]
+    fn the_armed_prefix_is_drawn_on_the_tab_colour_in_the_palettes_text() {
+        let mut app = App::new(HarnessRegistry::default());
+        app.handle(
+            &Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Size::new(100, 30),
+        )
+        .expect("a keystroke is handled");
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+        let badge = terminal
+            .backend()
+            .buffer()
+            .cell((0, 29))
+            .expect("the status row is drawn")
+            .clone();
+        let theme = Theme::fallback();
+
+        assert_eq!(badge.symbol(), "P", "the prefix is armed");
+        assert_eq!(badge.bg, theme.tab);
+        assert_eq!(badge.fg, theme.text);
+    }
+
+    #[test]
+    fn the_focused_pane_stays_in_view_when_the_sidebar_shrinks() {
+        // Nothing about the focus changes when the terminal does, so
+        // anchoring only on a new focus left a shorter sidebar showing its
+        // top while the focused row fell off the bottom.
+        let mut app = App::new(HarnessRegistry::default());
+        let mut last = None;
+        for index in 0..20 {
+            last = Some(app.state.add_project(Project::new(
+                format!("/tmp/p{index}"),
+                ProjectSource::LocalDir,
+            )));
+        }
+        let last = last.expect("projects were added");
+        app.state.select_project(last).expect("the project exists");
+        let pane = app
+            .state
+            .spawn_pane(last, HarnessId::new("claude"))
+            .expect("the project exists");
+        app.state
+            .set_pane_title(pane, "far-down")
+            .expect("the pane exists");
+        assert_eq!(app.state.focused_pane(), Some(pane));
+
+        let sidebar_at = |app: &mut App, height: u16| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, height))
+                    .expect("a test backend can be created");
+            terminal
+                .draw(|frame| app.draw(frame))
+                .expect("the frame is drawn");
+            rendered_text(&terminal)
+                .lines()
+                .map(sidebar_column)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let tall = sidebar_at(&mut app, 30);
+        assert!(tall.contains("far-down"), "{tall}");
+
+        let short = sidebar_at(&mut app, 12);
+        assert!(
+            short.contains("far-down"),
+            "the focused pane is still in view: {short}"
+        );
+    }
+
+    #[test]
+    fn pane_corners_are_square() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 2);
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+        let text = rendered_text(&terminal);
+
+        assert!(!text.contains('╭') && !text.contains('╯'), "{text}");
+        let panes: String = text
+            .lines()
+            .map(|line| {
+                line.chars()
+                    .skip(sidebar::WIDTH as usize)
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(panes.contains('┌') && panes.contains('┘'), "{text}");
+    }
+
+    #[test]
+    fn a_terminal_smaller_than_the_sidebar_still_draws() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 3);
+
+        for (width, height) in [(1, 1), (5, 2), (10, 3), (20, 4), (40, 2)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                    .expect("a test backend can be created");
+            terminal
+                .draw(|frame| app.draw(frame))
+                .expect("drawing into a tiny terminal does not fail");
+        }
     }
 
     /// A terminal sized so the approval prompt's own inner content area comes
@@ -5417,7 +5899,7 @@ mod tests {
     #[test]
     fn a_project_from_a_daemon_lands_on_a_machine_the_sidebar_knows() {
         // The invariant the whole slice rests on: the sidebar groups projects
-        // under their machine's row, so a project stamped with a device that
+        // into their machine's section, so a project stamped with a device that
         // was never registered is drawn nowhere at all — open, invisible and
         // unreachable. `attach` registers the machine before its connection
         // can announce anything, which is what makes that impossible.
@@ -5620,7 +6102,7 @@ mod tests {
     fn attaching_takes_down_the_agents_this_process_started() {
         // `attach` is public and a standalone client can have been running
         // agents of its own for an hour before it ever reaches a daemon.
-        // Dropping that machine's rows while keeping its panes would leave a
+        // Dropping that machine's section while keeping its panes would leave a
         // real child process running with nothing on screen pointing at it,
         // nothing reading it and nobody left to stop it.
         let def = dispatch_config::HarnessDef {
@@ -5662,6 +6144,156 @@ mod tests {
             1,
             "the daemon's machine is the only one left"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_standalone_client_watches_its_own_panes_and_projects_branches() {
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            launch: Launch {
+                command: "sh".to_string(),
+                args: Vec::new(),
+                env: Default::default(),
+            },
+            ..Default::default()
+        };
+
+        let dir = scratch("branch-local");
+        std::fs::create_dir_all(dir.join(".git")).expect("temp dir is writable");
+        std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/main\n")
+            .expect("temp dir is writable");
+
+        let mut app = App::new([def].into_iter().collect());
+        app.branch_every = Duration::ZERO;
+        app.add_project(dir.clone());
+        let project = app.state.projects()[0].id;
+        assert_eq!(
+            app.state.projects()[0].branch.as_deref(),
+            Some("main"),
+            "a project knows its branch as soon as it is opened"
+        );
+
+        let _ = app.state.select_project(project);
+        app.spawn_pane("shell", Size::new(80, 24))
+            .expect("a shell starts");
+        let pane = app.state.focused_pane().expect("the new pane is focused");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app
+            .state
+            .pane(pane)
+            .and_then(|pane| pane.branch.clone())
+            .is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the pane never learned its branch"
+            );
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            app.state.pane(pane).and_then(|pane| pane.branch.as_deref()),
+            Some("main")
+        );
+
+        std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/feat/x\n")
+            .expect("temp dir is writable");
+        while app.state.projects()[0].branch.as_deref() != Some("feat/x") {
+            assert!(Instant::now() < deadline, "the project never moved branch");
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        app.close_focused();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_standalone_clients_exited_pane_keeps_the_branch_it_last_had() {
+        // The standalone twin of the daemon's test of the same name. An
+        // exited pane still holds the pid it was spawned with, and once the
+        // system hands that number to some unrelated process, looking there
+        // would give the finished pane that process's branch and move it
+        // into another group.
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            launch: Launch {
+                command: "sh".to_string(),
+                args: Vec::new(),
+                env: Default::default(),
+            },
+            ..Default::default()
+        };
+
+        let dir = scratch("branch-local-exit");
+        std::fs::create_dir_all(dir.join(".git")).expect("temp dir is writable");
+        std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/main\n")
+            .expect("temp dir is writable");
+
+        let mut app = App::new([def].into_iter().collect());
+        app.branch_every = Duration::ZERO;
+        app.add_project(dir.clone());
+        let project = app.state.projects()[0].id;
+        let _ = app.state.select_project(project);
+        app.spawn_pane("shell", Size::new(80, 24))
+            .expect("a shell starts");
+        let pane = app.state.focused_pane().expect("the new pane is focused");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let branch = |app: &App| app.state.pane(pane).and_then(|pane| pane.branch.clone());
+        while branch(&app).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the pane never learned its branch"
+            );
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(branch(&app).as_deref(), Some("main"));
+
+        app.panes
+            .get_mut(&pane)
+            .expect("the client holds the pane")
+            .backend
+            .write(b"exit\n")
+            .expect("the shell is listening");
+        while !app
+            .state
+            .pane(pane)
+            .is_some_and(|pane| matches!(pane.status, PaneStatus::Exited(_)))
+        {
+            assert!(Instant::now() < deadline, "the shell never exited");
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // The project moving is what says the looking has run since the
+        // switch, so the pane's branch below is not merely a stale read.
+        std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/feat/x\n")
+            .expect("temp dir is writable");
+        while app.state.projects()[0].branch.as_deref() != Some("feat/x") {
+            assert!(Instant::now() < deadline, "the project never moved branch");
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for _ in 0..5 {
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            branch(&app).as_deref(),
+            Some("main"),
+            "a finished pane stays where it last was"
+        );
+
+        app.close_focused();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6288,5 +6920,41 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(app.state.devices().len(), devices, "no row was added");
+    }
+
+    #[test]
+    fn the_wheel_over_the_sidebar_scrolls_it_rather_than_a_pane() {
+        let mut app = App::new(HarnessRegistry::default());
+        for index in 0..40 {
+            app.state.add_project(Project::new(
+                format!("/tmp/p{index}"),
+                ProjectSource::LocalDir,
+            ));
+        }
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+
+        let wheel = Event::Mouse(dispatch_tui::input::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle(&wheel, Size::new(100, 20))
+            .expect("the wheel is handled");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+
+        // Row 0 is the top row and row 1 the sidebar's frame, so row 2 is the
+        // first project shown — p1 now, and not scrolled back to the
+        // selected p0 by the redraw.
+        let text = rendered_text(&terminal);
+        let first = sidebar_column(text.lines().nth(2).expect("the frame has rows"));
+        assert!(first.contains(" p1 "), "{text}");
     }
 }

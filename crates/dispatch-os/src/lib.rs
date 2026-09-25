@@ -4,11 +4,13 @@
 //! workspace carries a `#[cfg(windows)]`.
 
 pub mod dll;
+pub mod git;
 pub mod host;
 pub mod ipc;
 pub mod paths;
 pub mod process;
 pub mod signal;
+pub mod tty;
 
 /// Serialises the tests that move the process-wide configuration directory.
 ///

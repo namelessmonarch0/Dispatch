@@ -11,8 +11,8 @@ use dispatch_config::{DelegationLimits, HarnessRegistry};
 use dispatch_core::{PaneId, PaneStatus, Project, ProjectId, ProjectSource, RequestId};
 use dispatch_os::ipc::{Connection, Listener};
 use dispatch_proto::{
-    ClientMessage, DelegateOutcome, Frame, FrameError, PaneUpdate, ProtocolError, Role,
-    ServerMessage,
+    ClientMessage, DelegateOutcome, Frame, FrameError, PaneUpdate, ProjectUpdate, ProtocolError,
+    Role, ServerMessage,
 };
 use dispatch_pty::{Pty, RunState, Size};
 
@@ -117,6 +117,11 @@ pub struct Daemon {
     /// Panes the user has approved for every future request, for as long as
     /// this daemon runs.
     blanket: HashSet<PaneId>,
+    /// When branches were last looked at.
+    branches_checked: Option<Instant>,
+    /// How often they are looked at: [`dispatch_os::git::RECHECK`], or every
+    /// tick in a test that cannot wait two seconds per step.
+    branch_every: Duration,
 }
 
 impl Daemon {
@@ -148,6 +153,8 @@ impl Daemon {
             limits,
             pending: HashMap::new(),
             blanket: HashSet::new(),
+            branches_checked: None,
+            branch_every: dispatch_os::git::RECHECK,
         }
     }
 
@@ -180,7 +187,8 @@ impl Daemon {
             ProjectSource::LocalDir
         };
 
-        let project = Project::new(root, source);
+        let branch = dispatch_os::git::head(&root);
+        let project = Project::new(root, source).with_branch(branch);
         let id = project.id;
         self.projects.insert(id, project);
         id
@@ -359,6 +367,18 @@ impl Daemon {
                         parent: pane.parent,
                         durable: pane.durable,
                     });
+
+                    // Not part of `PaneSpawned`, so said straight after it:
+                    // a client attaching now should not have to wait for the
+                    // pane to move before it can be grouped.
+                    if let Some(branch) = &pane.branch {
+                        existing.push(ServerMessage::PaneChanged {
+                            pane: pane.id,
+                            update: PaneUpdate::Branch {
+                                branch: Some(branch.clone()),
+                            },
+                        });
+                    }
 
                     // What the pane has printed, so a client that reattaches
                     // sees the work rather than a blank rectangle.
@@ -654,6 +674,7 @@ impl Daemon {
             request: None,
             caller: None,
             exited_at: None,
+            branch: None,
         };
         // Announced from the pane's own field rather than repeated here: what a
         // client draws has to be what the daemon is holding.
@@ -912,6 +933,7 @@ impl Daemon {
                 request: Some(request),
                 caller: Some(caller),
                 exited_at: None,
+                branch: None,
             },
         );
 
@@ -1211,6 +1233,62 @@ impl Daemon {
         }
 
         self.expire_requests();
+        self.refresh_branches();
+    }
+
+    /// Looks again at which branch every live pane and every project is on,
+    /// at most every `branch_every`, and tells clients about what moved.
+    ///
+    /// A pane whose directory cannot be read keeps the branch it had: that is
+    /// a process between exiting and being reaped, or one this user may not
+    /// look into, and neither has moved anywhere.
+    fn refresh_branches(&mut self) {
+        if self
+            .branches_checked
+            .is_some_and(|checked| checked.elapsed() < self.branch_every)
+        {
+            return;
+        }
+        self.branches_checked = Some(Instant::now());
+
+        let mut messages = Vec::new();
+
+        for (id, pane) in &mut self.panes {
+            if !pane.status.is_live() {
+                continue;
+            }
+            let Some(dir) = pane
+                .session
+                .pid()
+                .and_then(dispatch_os::process::working_dir)
+            else {
+                continue;
+            };
+
+            let branch = dispatch_os::git::head(&dir);
+            if branch != pane.branch {
+                pane.branch.clone_from(&branch);
+                messages.push(ServerMessage::PaneChanged {
+                    pane: *id,
+                    update: PaneUpdate::Branch { branch },
+                });
+            }
+        }
+
+        for project in self.projects.values_mut() {
+            let branch = dispatch_os::git::head(&project.root);
+            if branch != project.branch {
+                project.branch.clone_from(&branch);
+                messages.push(ServerMessage::ProjectChanged {
+                    project: project.id,
+                    update: ProjectUpdate::Branch { branch },
+                });
+            }
+        }
+
+        for message in messages {
+            self.broadcast(message);
+        }
     }
 
     /// Sends to one client.

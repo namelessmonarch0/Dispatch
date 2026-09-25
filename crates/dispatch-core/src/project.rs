@@ -43,6 +43,12 @@ pub struct Project {
     pub root: PathBuf,
     /// Whether the root is a git repository.
     pub source: ProjectSource,
+    /// The branch the root has checked out, when it is a repository.
+    ///
+    /// Reported by the machine the project is on; `None` from a daemon too
+    /// old to say.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 impl Project {
@@ -64,6 +70,7 @@ impl Project {
             name,
             root,
             source,
+            branch: None,
         }
     }
 
@@ -78,6 +85,13 @@ impl Project {
     #[must_use]
     pub fn with_device(mut self, device: DeviceId) -> Self {
         self.device = device;
+        self
+    }
+
+    /// Records the branch the root has checked out.
+    #[must_use]
+    pub fn with_branch(mut self, branch: Option<String>) -> Self {
+        self.branch = branch;
         self
     }
 }

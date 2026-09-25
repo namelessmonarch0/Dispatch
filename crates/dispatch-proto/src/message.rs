@@ -303,6 +303,14 @@ pub enum ServerMessage {
         project: ProjectId,
     },
 
+    /// Something about a project changed after it was opened.
+    ProjectChanged {
+        /// Which project.
+        project: ProjectId,
+        /// What changed.
+        update: ProjectUpdate,
+    },
+
     /// A root asked for in [`ClientMessage::OpenProject`] could not be opened.
     ///
     /// Sent only to the client that asked. Its own message rather than an
@@ -436,6 +444,13 @@ pub enum PaneUpdate {
         /// The new title.
         title: String,
     },
+    /// The branch the pane is working on changed.
+    ///
+    /// `None` once the pane's program is outside any repository.
+    Branch {
+        /// The branch, or `@` and a short commit when the head is detached.
+        branch: Option<String>,
+    },
     /// A change this build does not know.
     ///
     /// This enum travels inside [`ServerMessage::PaneChanged`], so without
@@ -443,6 +458,23 @@ pub enum PaneUpdate {
     /// the whole frame rather than one update — and a client that drops its
     /// connection over a frame it cannot read reconnects and fails on the next
     /// one. That loop is what every `Unknown` in this module exists to prevent.
+    #[serde(other)]
+    Unknown,
+}
+
+/// A change to a project after it was opened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProjectUpdate {
+    /// The project root's checked-out branch changed.
+    Branch {
+        /// The branch, or `@` and a short commit when the head is detached.
+        branch: Option<String>,
+    },
+    /// A change this build does not know.
+    ///
+    /// Travels inside [`ServerMessage::ProjectChanged`], so it needs the same
+    /// landing place [`PaneUpdate::Unknown`] gives a pane's.
     #[serde(other)]
     Unknown,
 }
