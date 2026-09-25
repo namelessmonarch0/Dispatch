@@ -1771,11 +1771,15 @@ impl App {
             .panes
             .iter()
             .filter_map(|(id, pane)| match &pane.backend {
-                Backend::Local(session) => session
+                // Live panes only, as the daemon's: an exited pane still holds
+                // the pid it was spawned with, and once that number is handed
+                // to some unrelated process, looking there would move the
+                // finished pane onto that process's branch.
+                Backend::Local(session) if session.state() == RunState::Running => session
                     .pid()
                     .and_then(dispatch_os::process::working_dir)
                     .map(|dir| (*id, dir)),
-                Backend::Remote(_) => None,
+                Backend::Local(_) | Backend::Remote(_) => None,
             })
             .collect();
         for (id, dir) in dirs {
@@ -6076,6 +6080,91 @@ mod tests {
             app.poll_panes();
             std::thread::sleep(Duration::from_millis(20));
         }
+
+        app.close_focused();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_standalone_clients_exited_pane_keeps_the_branch_it_last_had() {
+        // The standalone twin of the daemon's test of the same name. An
+        // exited pane still holds the pid it was spawned with, and once the
+        // system hands that number to some unrelated process, looking there
+        // would give the finished pane that process's branch and move it
+        // into another group.
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            launch: Launch {
+                command: "sh".to_string(),
+                args: Vec::new(),
+                env: Default::default(),
+            },
+            ..Default::default()
+        };
+
+        let dir = scratch("branch-local-exit");
+        std::fs::create_dir_all(dir.join(".git")).expect("temp dir is writable");
+        std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/main\n")
+            .expect("temp dir is writable");
+
+        let mut app = App::new([def].into_iter().collect());
+        app.branch_every = Duration::ZERO;
+        app.add_project(dir.clone());
+        let project = app.state.projects()[0].id;
+        let _ = app.state.select_project(project);
+        app.spawn_pane("shell", Size::new(80, 24))
+            .expect("a shell starts");
+        let pane = app.state.focused_pane().expect("the new pane is focused");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let branch = |app: &App| app.state.pane(pane).and_then(|pane| pane.branch.clone());
+        while branch(&app).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the pane never learned its branch"
+            );
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(branch(&app).as_deref(), Some("main"));
+
+        app.panes
+            .get_mut(&pane)
+            .expect("the client holds the pane")
+            .backend
+            .write(b"exit\n")
+            .expect("the shell is listening");
+        while !app
+            .state
+            .pane(pane)
+            .is_some_and(|pane| matches!(pane.status, PaneStatus::Exited(_)))
+        {
+            assert!(Instant::now() < deadline, "the shell never exited");
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // The project moving is what says the looking has run since the
+        // switch, so the pane's branch below is not merely a stale read.
+        std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/feat/x\n")
+            .expect("temp dir is writable");
+        while app.state.projects()[0].branch.as_deref() != Some("feat/x") {
+            assert!(Instant::now() < deadline, "the project never moved branch");
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for _ in 0..5 {
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            branch(&app).as_deref(),
+            Some("main"),
+            "a finished pane stays where it last was"
+        );
 
         app.close_focused();
         let _ = std::fs::remove_dir_all(&dir);
