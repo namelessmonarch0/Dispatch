@@ -247,7 +247,9 @@ done. Its exit is shown as any pane's is.
   pane is marked unseen.
 - A bell from a pane that is not focused marks it unseen, whatever its state.
 - Focusing a pane clears its mark — on the activity poll that follows, not
-  the keystroke itself, since that poll is what touches the mark.
+  the keystroke itself, since that poll is what touches the mark. That poll
+  asks for a redraw, since focus can move with no input to draw one (the
+  focused pane closing hands it on).
 - **Grace**: for the first **3 s** after a pane is adopted nothing marks it
   unseen. A reattaching client is replayed every pane's recent output, and
   without the grace every pane would come back "done".

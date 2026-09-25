@@ -2102,13 +2102,20 @@ impl App {
     /// A pane is looked at soon after it prints, and every pane on a slower
     /// tick so a quiet one can settle to idle. A pane scrolled back is left
     /// alone: its screen is history, not the live one. Returns whether any
-    /// status changed.
+    /// status changed, or a done mark was cleared.
     fn refresh_activity(&mut self) -> bool {
         let now = self.now();
         let focused = self.state.focused_pane();
+        let mut changed = false;
 
-        if let Some(focused) = focused {
+        // Said as a change because focus can move with no input to draw the
+        // frame that shows it — the focused pane closing hands it on — and
+        // with motion off nothing else is drawing.
+        if let Some(focused) = focused
+            && self.state.is_unseen(focused)
+        {
             self.state.mark_seen(focused);
+            changed = true;
         }
 
         let mut verdicts = Vec::new();
@@ -2133,7 +2140,6 @@ impl App {
             }
         }
 
-        let mut changed = false;
         for (id, verdict, adopted) in verdicts {
             let Some((before, delegated)) = self
                 .state
@@ -4237,6 +4243,37 @@ mod tests {
         assert!(
             !app.state.is_unseen(background),
             "looking at it clears the mark"
+        );
+    }
+
+    #[test]
+    fn clearing_a_done_mark_asks_for_a_redraw() {
+        // Focus can move with no input to draw a frame: the focused pane
+        // closing hands it to another. With motion off nothing else is
+        // drawing, so unless clearing the mark says so, the done glyph stays
+        // on screen after the pane has been looked at.
+        let (mut app, project, daemon, _sent) = attached_app();
+        app.set_motion(false);
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let (background, foreground) = (panes[0], panes[1]);
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, background, b"working\r\n");
+        settle(&mut app, &clock);
+        assert!(app.state.is_unseen(background));
+
+        let _ = app.state.close_pane(foreground);
+        assert_eq!(app.state.focused_pane(), Some(background));
+
+        assert!(
+            app.poll_panes(),
+            "the mark went, and the frame must show it"
+        );
+        assert!(!app.state.is_unseen(background));
+        assert!(
+            !app.poll_panes(),
+            "and once it has gone, nothing is left to draw"
         );
     }
 
