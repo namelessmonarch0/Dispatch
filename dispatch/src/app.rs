@@ -33,6 +33,7 @@ use dispatch_tui::motion::{Animations, SPIN_FRAME, TWEEN_FRAME};
 use dispatch_tui::theme::Role;
 use dispatch_tui::{Item, PaneWidget, Picker, Prompt, Sidebar, Theme, sidebar, truncate};
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -69,6 +70,37 @@ fn pane_block(colour: Color, focused: bool) -> Block<'static> {
     Block::bordered()
         .border_style(Style::default().fg(colour))
         .title_style(title)
+}
+
+/// The cells around `rect`'s edge, clockwise from its top-left corner.
+fn perimeter(rect: Rect) -> Vec<(u16, u16)> {
+    if rect.width == 0 || rect.height == 0 {
+        return Vec::new();
+    }
+    let (left, top) = (rect.x, rect.y);
+    let (right, bottom) = (rect.x + rect.width - 1, rect.y + rect.height - 1);
+
+    let mut path: Vec<(u16, u16)> = (left..=right).map(|x| (x, top)).collect();
+    path.extend((top + 1..=bottom).map(|y| (right, y)));
+    if bottom > top {
+        path.extend((left..right).rev().map(|x| (x, bottom)));
+    }
+    if right > left {
+        path.extend((top + 1..bottom).rev().map(|y| (left, y)));
+    }
+    path
+}
+
+/// Blanks the part of `rect`'s border past `shown` (0.0–1.0) of the way
+/// round, so a border can be drawn in or retract.
+fn mask_border(buf: &mut Buffer, rect: Rect, shown: f32) {
+    let path = perimeter(rect);
+    let kept = (path.len() as f32 * shown.clamp(0.0, 1.0)).ceil() as usize;
+    for &(x, y) in path.iter().skip(kept) {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.reset();
+        }
+    }
 }
 
 /// What to write on a pane's border.
@@ -156,6 +188,13 @@ const EASE: Duration = Duration::from_millis(150);
 
 /// How long a row pulses for attention, all three times.
 const PULSE: Duration = Duration::from_millis(1200);
+
+/// How long a new pane's border takes to draw in.
+const OPEN: Duration = Duration::from_millis(200);
+/// How long a closed pane's tile takes to retract, holding the grid.
+const CLOSE: Duration = Duration::from_millis(150);
+/// How long the active tab's tint takes to slide.
+const SLIDE: Duration = Duration::from_millis(150);
 
 /// How much of a task's opening words becomes a subagent's first title.
 ///
@@ -398,10 +437,6 @@ enum Mode {
 
 /// What an animation animates, so a new one on the same thing replaces it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(
-    dead_code,
-    reason = "started by the focus, pulse and transition animations"
-)]
 enum Target {
     /// A pane's border easing toward the accent: it has just been focused.
     Focus(PaneId),
@@ -551,6 +586,16 @@ pub struct App {
     last_anchor: Option<sidebar::Anchor>,
     /// Where the sidebar's focus tint is gliding from, while it glides.
     glide_from: Option<sidebar::Anchor>,
+    /// The grid as it was when a pane began leaving it, and the area it was
+    /// laid out for, kept until every leaving tile has retracted.
+    held: Option<(Rect, Vec<(PaneId, Rect)>)>,
+    /// Tiles of panes that have left the grid, still retracting.
+    closing: Vec<(PaneId, Rect)>,
+    /// The tab on screen when the last frame was drawn, so the next one can
+    /// tell the tab has changed and slide its tint.
+    last_tab: usize,
+    /// Where the active tab's tint is sliding from, while it slides.
+    tab_from: usize,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -610,6 +655,10 @@ impl App {
             last_focus: None,
             last_anchor: None,
             glide_from: None,
+            held: None,
+            closing: Vec::new(),
+            last_tab: 0,
+            tab_from: 0,
         }
     }
 
@@ -1251,6 +1300,7 @@ impl App {
                 dirty: false,
             },
         );
+        self.animations.start(Target::Open(id), now, OPEN, 0.0);
 
         Ok(())
     }
@@ -3340,12 +3390,19 @@ impl App {
         self.sidebar_area = sidebar_area;
 
         self.draw_name(frame, Rect::new(top.x, top.y, sidebar_width, top.height));
+        let tab = self.current_tab();
+        if tab != self.last_tab {
+            self.tab_from = self.last_tab;
+            self.animations.start(Target::Tab, now, SLIDE, 0.0);
+            self.last_tab = tab;
+        }
         self.draw_tabs(
             frame,
             Rect::new(panes_area.x, top.y, panes_area.width, top.height),
+            now,
         );
 
-        self.frames = self.compute_frames(panes_area);
+        self.frames = self.lay_out(panes_area, now);
         self.layout = self
             .frames
             .iter()
@@ -3536,6 +3593,57 @@ impl App {
             .collect()
     }
 
+    /// Where each pane goes this frame.
+    ///
+    /// A pane leaving the grid — closed, exited, gone — leaves its tile in
+    /// place for a moment while its border retracts, and the rest of the grid
+    /// keeps its shape for drawing and input alike until the last such tile
+    /// is gone; then everything reflows once. A resize ends that at once:
+    /// held tiles belong to a screen that no longer exists.
+    fn lay_out(&mut self, area: Rect, now: Instant) -> Vec<(PaneId, Rect)> {
+        let tileable = self.tileable();
+
+        let finished = self
+            .closing
+            .iter()
+            .filter(|(id, _)| self.animations.value(Target::Close(*id), now).is_none())
+            .count();
+        if finished > 0 {
+            self.closing
+                .retain(|(id, _)| self.animations.value(Target::Close(*id), now).is_some());
+        }
+
+        let leaving: Vec<(PaneId, Rect)> = self
+            .frames
+            .iter()
+            .filter(|(id, _)| !tileable.contains(id))
+            .copied()
+            .collect();
+        if self.animations.enabled() {
+            for (id, rect) in leaving {
+                self.animations.start(Target::Close(id), now, CLOSE, 0.0);
+                self.closing.push((id, rect));
+                if self.held.is_none() {
+                    self.held = Some((area, self.frames.clone()));
+                }
+            }
+        }
+
+        if self.closing.is_empty() || self.held.as_ref().is_some_and(|(held, _)| *held != area) {
+            self.held = None;
+            self.closing.clear();
+        }
+
+        match &self.held {
+            Some((_, frames)) => frames
+                .iter()
+                .filter(|(id, _)| tileable.contains(id))
+                .copied()
+                .collect(),
+            None => self.compute_frames(area),
+        }
+    }
+
     /// The area inside a tile's border, which is what the pane itself owns.
     fn interior(frame: Rect) -> Rect {
         Block::bordered().inner(frame)
@@ -3574,6 +3682,9 @@ impl App {
                 pane_block(colour, is_focused).title(pane_title(&self.state, *id)),
                 *outer,
             );
+            if let Some(t) = self.animations.value(Target::Open(*id), now) {
+                mask_border(frame.buffer_mut(), *outer, t);
+            }
 
             let widget = PaneWidget::new(&pane.screen).focused(is_focused);
 
@@ -3582,6 +3693,16 @@ impl App {
             }
 
             frame.render_widget(widget, *inner);
+        }
+
+        for (id, rect) in &self.closing {
+            let t = self
+                .animations
+                .value(Target::Close(*id), now)
+                .unwrap_or(1.0);
+            Clear.render(*rect, frame.buffer_mut());
+            frame.render_widget(pane_block(self.theme.faded, false), *rect);
+            mask_border(frame.buffer_mut(), *rect, 1.0 - t);
         }
 
         // Placing the real cursor is what makes typing feel native rather
@@ -3609,14 +3730,18 @@ impl App {
     /// Each is its number and its first pane's title. The one on screen sits
     /// on a tint rather than being inverted: it should read as the one you
     /// are in, not as a warning.
-    fn draw_tabs(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn draw_tabs(&self, frame: &mut Frame<'_>, area: Rect, now: Instant) {
         if area.height == 0 {
             return;
         }
 
         let current = self.current_tab();
         let tileable = self.tileable();
+        let sliding = self.animations.value(Target::Tab, now).is_some();
         let mut spans = Vec::new();
+        // Where each tab sits in the row, for the sliding tint.
+        let mut extents: Vec<(u16, u16)> = Vec::new();
+        let mut column = area.x;
 
         for index in 0..self.tab_count() {
             let title = tileable
@@ -3632,12 +3757,18 @@ impl App {
             };
             // `tab` is mixed from the palette, the fallback's dark one when
             // the terminal did not answer, so the text on it comes from the
-            // palette too rather than being the terminal's own.
+            // palette too rather than being the terminal's own. While the
+            // tint slides it is laid on afterwards, across whichever columns
+            // it has reached, so the tab itself leaves it off.
             let style = if index == current {
-                Style::default()
-                    .bg(self.theme.tab)
+                let style = Style::default()
                     .fg(self.theme.text)
-                    .add_modifier(Modifier::BOLD)
+                    .add_modifier(Modifier::BOLD);
+                if sliding {
+                    style
+                } else {
+                    style.bg(self.theme.tab)
+                }
             } else {
                 Style::default().fg(self.theme.faded)
             };
@@ -3651,18 +3782,41 @@ impl App {
                 panes.iter().filter_map(|id| self.state.pane(*id)),
             );
 
+            // The gap between two tabs belongs to neither.
             if index > 0 {
                 spans.push(Span::raw(" "));
+                column = column.saturating_add(1);
             }
+            let first = spans.len();
             if let Some(rollup) = rollup {
                 let (glyph, glyph_style) = rollup.glyph(self.spinner_frame(), &self.theme);
                 spans.push(Span::styled(" ", style));
                 spans.push(Span::styled(glyph, style.patch(glyph_style)));
             }
             spans.push(Span::styled(label, style));
+
+            let width: u16 = spans[first..]
+                .iter()
+                .map(|span| u16::try_from(span.width()).unwrap_or(u16::MAX))
+                .sum();
+            extents.push((column, width));
+            column = column.saturating_add(width);
         }
 
         Paragraph::new(Line::from(spans)).render(area, frame.buffer_mut());
+
+        if let Some(t) = self.animations.value(Target::Tab, now) {
+            let (from_x, from_w) = extents.get(self.tab_from).copied().unwrap_or((area.x, 0));
+            let (to_x, to_w) = extents.get(current).copied().unwrap_or((area.x, 0));
+            let lerp =
+                |a: u16, b: u16| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u16;
+            let (x, width) = (lerp(from_x, to_x), lerp(from_w, to_w));
+            for column in x..x.saturating_add(width).min(area.x + area.width) {
+                if let Some(cell) = frame.buffer_mut().cell_mut((column, area.y)) {
+                    cell.set_bg(self.theme.tab);
+                }
+            }
+        }
     }
 
     fn draw_status(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -5653,6 +5807,250 @@ mod tests {
     }
 
     #[test]
+    fn the_perimeter_runs_clockwise_from_the_top_left() {
+        let path = perimeter(Rect::new(0, 0, 3, 3));
+
+        assert_eq!(
+            path,
+            vec![
+                (0, 0),
+                (1, 0),
+                (2, 0),
+                (2, 1),
+                (2, 2),
+                (1, 2),
+                (0, 2),
+                (0, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_panes_border_is_drawn_in() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+
+        // 40 ms of 200 is a fifth of the way; eased out, a little under half
+        // of the border is drawn — well short of the bottom-left corner,
+        // which is about five-sixths of the way round.
+        advance(&clock, Duration::from_millis(40));
+        drawn(&mut app, &mut terminal);
+        let (_, rect) = *app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .expect("tiled");
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            buf.cell((rect.x, rect.y)).expect("cell").symbol(),
+            "┌",
+            "the sweep starts at the corner"
+        );
+        assert_eq!(
+            buf.cell((rect.x, rect.y + rect.height - 1))
+                .expect("cell")
+                .symbol(),
+            " ",
+            "the bottom-left corner is the last to be drawn"
+        );
+
+        advance(&clock, Duration::from_millis(200));
+        drawn(&mut app, &mut terminal);
+        let buf = terminal.backend().buffer();
+        assert_eq!(
+            buf.cell((rect.x, rect.y + rect.height - 1))
+                .expect("cell")
+                .symbol(),
+            "└"
+        );
+    }
+
+    #[test]
+    fn a_closed_panes_tile_holds_the_grid_until_it_has_retracted() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        let before: Vec<(PaneId, Rect)> = app.frames.clone();
+
+        app.close_focused(); // panes[1]
+        drawn(&mut app, &mut terminal);
+        let kept = app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == panes[0])
+            .expect("tiled")
+            .1;
+        assert_eq!(
+            kept,
+            before
+                .iter()
+                .find(|(id, _)| *id == panes[0])
+                .expect("was tiled")
+                .1,
+            "the other pane keeps its tile while the closed one retracts"
+        );
+        assert!(
+            !app.frames.iter().any(|(id, _)| *id == panes[1]),
+            "the closed pane takes no input"
+        );
+
+        advance(&clock, Duration::from_millis(200));
+        drawn(&mut app, &mut terminal);
+        let reflowed = app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == panes[0])
+            .expect("tiled")
+            .1;
+        assert!(reflowed.width > kept.width, "then the grid reflows");
+    }
+
+    #[test]
+    fn closing_two_panes_in_quick_succession_reflows_once() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        let before = app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == panes[0])
+            .expect("tiled")
+            .1;
+
+        app.close_focused();
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_millis(50));
+        let _ = app.state.focus(panes[1]);
+        app.close_focused();
+        drawn(&mut app, &mut terminal);
+        assert_eq!(
+            app.frames
+                .iter()
+                .find(|(id, _)| *id == panes[0])
+                .expect("tiled")
+                .1,
+            before,
+            "still held while either tile retracts"
+        );
+
+        advance(&clock, Duration::from_millis(300));
+        drawn(&mut app, &mut terminal);
+        let _ = app.state.focus(panes[0]);
+        app.close_focused();
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_millis(300));
+        drawn(&mut app, &mut terminal);
+        assert!(app.frames.is_empty(), "an empty grid is fine");
+    }
+
+    #[test]
+    fn a_resize_while_a_tile_retracts_lays_out_for_the_new_size_at_once() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+
+        app.close_focused();
+        drawn(&mut app, &mut terminal);
+        let mut smaller = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut smaller);
+
+        for (_, rect) in &app.frames {
+            assert!(
+                rect.x + rect.width <= 60 && rect.y + rect.height <= 20,
+                "{rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_active_tab_tint_slides_to_the_new_tab() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 5); // tab 2 active
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        let tab = Theme::fallback().tab;
+        let tinted = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| -> Vec<u16> {
+            let buf = terminal.backend().buffer();
+            (sidebar::WIDTH..buf.area.width)
+                .filter(|x| buf.cell((*x, 0)).is_some_and(|cell| cell.bg == tab))
+                .collect()
+        };
+        let at_rest_on_two = tinted(&terminal);
+
+        let _ = app.state.focus(panes[0]); // tab 1
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_millis(40));
+        drawn(&mut app, &mut terminal);
+        let sliding = tinted(&terminal);
+
+        advance(&clock, Duration::from_millis(300));
+        drawn(&mut app, &mut terminal);
+        let at_rest_on_one = tinted(&terminal);
+
+        assert!(
+            sliding.first() > at_rest_on_one.first(),
+            "not arrived yet: {sliding:?}"
+        );
+        assert!(
+            sliding.first() < at_rest_on_two.first(),
+            "but on its way: {sliding:?}"
+        );
+    }
+
+    #[test]
+    fn with_motion_off_a_close_reflows_at_once() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        app.set_motion(false);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        let before = app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == panes[0])
+            .expect("tiled")
+            .1;
+
+        app.close_focused();
+        drawn(&mut app, &mut terminal);
+
+        assert!(
+            app.frames
+                .iter()
+                .find(|(id, _)| *id == panes[0])
+                .expect("tiled")
+                .1
+                .width
+                > before.width
+        );
+    }
+
+    #[test]
     fn the_top_row_carries_the_name_and_the_tabs() {
         let mut app = App::new(HarnessRegistry::default());
         let project = app
@@ -5730,6 +6128,9 @@ mod tests {
     #[test]
     fn the_active_tab_is_tinted_rather_than_inverted() {
         let (mut app, project, daemon, _sent) = attached_app();
+        // The tint at rest, rather than a first frame sliding it over from
+        // the first tab.
+        app.set_motion(false);
         spawn_several(&mut app, &daemon, project, 5);
 
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
@@ -5841,6 +6242,8 @@ mod tests {
     #[test]
     fn pane_corners_are_square() {
         let (mut app, project, daemon, _sent) = attached_app();
+        // The border at rest, rather than a first frame drawing it in.
+        app.set_motion(false);
         spawn_several(&mut app, &daemon, project, 2);
 
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
