@@ -259,10 +259,12 @@ allocation is a pure function, `section_heights(weights, folded, height)`.
 
 **Scrolling.** `App` keeps a scroll offset per machine,
 `sidebar_scroll: HashMap<DeviceId, u16>`, and the focus and selection it last
-anchored to. Each frame, before drawing, every offset is clamped to its
-section's content. Only when the focused pane or the selected project has
-changed since the last anchor is its section's offset nudged so that row is
-inside it — nudging every frame would undo the wheel as fast as it scrolled.
+anchored to, with the sidebar's area then. Each frame, before drawing, every
+offset is clamped to its section's content. Only when the focused pane, the
+selected project or the sidebar's area has changed since the last anchor is
+its section's offset nudged so that row is inside it — nudging every frame
+would undo the wheel as fast as it scrolled, and the wheel changes none of
+them.
 A mouse wheel over a section scrolls that section by one row per notch.
 
 Hidden rows are counted on the lines that bound a section, in `faded`:

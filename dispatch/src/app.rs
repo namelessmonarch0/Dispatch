@@ -420,12 +420,15 @@ pub struct App {
     sidebar_area: Rect,
     /// How far each machine's section of the sidebar is scrolled.
     sidebar_scroll: sidebar::Scroll,
-    /// The row the sidebar was last scrolled to follow.
+    /// The row the sidebar was last scrolled to follow, and the area it was
+    /// drawn in then.
     ///
-    /// Compared against the focus and the selection each frame: only a
-    /// change nudges the scroll, so a wheel scroll is not undone by the very
-    /// next frame drawn after it.
-    anchored: Option<sidebar::Anchor>,
+    /// Compared against the focus, the selection and the sidebar's area each
+    /// frame: only a change nudges the scroll, so a wheel scroll — which
+    /// changes none of them — is not undone by the very next frame drawn
+    /// after it, while a resize that would push the row out of view is not
+    /// left to.
+    anchored: (Option<sidebar::Anchor>, Rect),
     /// Subagents the user has opened, so they join the tiled grid.
     ///
     /// Which rows are open is a per-client choice, not a property of the
@@ -522,7 +525,7 @@ impl App {
             layout: Vec::new(),
             sidebar_area: Rect::default(),
             sidebar_scroll: sidebar::Scroll::new(),
-            anchored: None,
+            anchored: (None, Rect::default()),
             expanded: HashSet::new(),
             pending: VecDeque::new(),
             answered: HashMap::new(),
@@ -2989,21 +2992,22 @@ impl App {
             body.height,
         );
 
-        // Scrolled to the focus only when the focus has moved, so the wheel's
-        // scroll survives every frame drawn in between.
+        // Scrolled to the focus only when the focus has moved or the sidebar
+        // has been resized, so the wheel's scroll survives every frame drawn
+        // in between.
         let anchor = self
             .state
             .focused_pane()
             .map(sidebar::Anchor::Pane)
             .or_else(|| self.state.selected_project().map(sidebar::Anchor::Project));
-        let moved = anchor != self.anchored;
+        let moved = (anchor, sidebar_area) != self.anchored;
         sidebar::settle(
             &self.state,
             sidebar_area,
             &mut self.sidebar_scroll,
             if moved { anchor } else { None },
         );
-        self.anchored = anchor;
+        self.anchored = (anchor, sidebar_area);
 
         frame.render_widget(
             Sidebar::new(&self.state)
@@ -4841,6 +4845,54 @@ mod tests {
         assert_eq!(badge.symbol(), "P", "the prefix is armed");
         assert_eq!(badge.bg, theme.tab);
         assert_eq!(badge.fg, theme.text);
+    }
+
+    #[test]
+    fn the_focused_pane_stays_in_view_when_the_sidebar_shrinks() {
+        // Nothing about the focus changes when the terminal does, so
+        // anchoring only on a new focus left a shorter sidebar showing its
+        // top while the focused row fell off the bottom.
+        let mut app = App::new(HarnessRegistry::default());
+        let mut last = None;
+        for index in 0..20 {
+            last = Some(app.state.add_project(Project::new(
+                format!("/tmp/p{index}"),
+                ProjectSource::LocalDir,
+            )));
+        }
+        let last = last.expect("projects were added");
+        app.state.select_project(last).expect("the project exists");
+        let pane = app
+            .state
+            .spawn_pane(last, HarnessId::new("claude"))
+            .expect("the project exists");
+        app.state
+            .set_pane_title(pane, "far-down")
+            .expect("the pane exists");
+        assert_eq!(app.state.focused_pane(), Some(pane));
+
+        let sidebar_at = |app: &mut App, height: u16| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, height))
+                    .expect("a test backend can be created");
+            terminal
+                .draw(|frame| app.draw(frame))
+                .expect("the frame is drawn");
+            rendered_text(&terminal)
+                .lines()
+                .map(sidebar_column)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let tall = sidebar_at(&mut app, 30);
+        assert!(tall.contains("far-down"), "{tall}");
+
+        let short = sidebar_at(&mut app, 12);
+        assert!(
+            short.contains("far-down"),
+            "the focused pane is still in view: {short}"
+        );
     }
 
     #[test]
