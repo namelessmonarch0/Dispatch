@@ -100,11 +100,19 @@ impl Theme {
             Depth::Indexed => Color::Indexed(nearest_indexed(rgb)),
         };
 
+        // The accent is palette slot 5, so in 256 colours it is named by its
+        // slot rather than approximated: the terminal draws its own colour
+        // exactly, where the nearest cube entry is only close to it.
+        let accent = match depth {
+            Depth::TrueColor => colour(palette.accent),
+            Depth::Indexed => Color::Indexed(5),
+        };
+
         Theme {
             faded: colour(palette.foreground.mix(palette.background, 0.45)),
             tint: colour(palette.background.mix(palette.foreground, 0.10)),
             tab: colour(palette.background.mix(palette.accent, 0.30)),
-            accent: colour(palette.accent),
+            accent,
         }
     }
 

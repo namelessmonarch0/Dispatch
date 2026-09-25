@@ -34,9 +34,18 @@ fn every_role_is_mixed_from_the_palette() {
 fn a_terminal_without_24_bit_colour_gets_palette_indices() {
     let theme = Theme::new(Palette::FALLBACK, Depth::Indexed);
 
-    for colour in [theme.faded, theme.tint, theme.tab, theme.accent] {
+    for colour in [theme.faded, theme.tint, theme.tab] {
         assert!(matches!(colour, Color::Indexed(_)), "{colour:?}");
     }
+}
+
+#[test]
+fn the_accent_in_256_colours_is_palette_slot_5_itself() {
+    // It was read from slot 5, so slot 5 is exact where the nearest cube
+    // entry to its colour is only close.
+    let theme = Theme::new(Palette::FALLBACK, Depth::Indexed);
+
+    assert_eq!(theme.accent, Color::Indexed(5));
 }
 
 #[test]
