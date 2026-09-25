@@ -409,6 +409,11 @@ pub struct App {
     /// title is known one message before there is a row to put it on.
     child_titles: HashMap<PaneId, String>,
     status: String,
+    /// When this client last looked at its own panes' and projects' branches.
+    branches_checked: Option<Instant>,
+    /// How often it looks: [`dispatch_os::git::RECHECK`], or every poll in a
+    /// test that cannot wait two seconds per step.
+    branch_every: Duration,
     quit: bool,
     /// A project to reselect once its `ProjectOpened` comes back, keyed by
     /// the device it belongs to, because a reconnect forgot it out from
@@ -479,6 +484,8 @@ impl App {
             answered: HashMap::new(),
             child_titles: HashMap::new(),
             status: String::new(),
+            branches_checked: None,
+            branch_every: dispatch_os::git::RECHECK,
             quit: false,
             reopening_selection: None,
             #[cfg(test)]
@@ -838,8 +845,12 @@ impl App {
             .local
             .expect("a standalone client registers its own machine in `App::new`");
 
-        self.state
-            .add_project(Project::new(root, source).with_device(device));
+        let branch = dispatch_os::git::head(&root);
+        self.state.add_project(
+            Project::new(root, source)
+                .with_branch(branch)
+                .with_device(device),
+        );
     }
 
     /// Which kept list a root opened on `device` belongs on.
@@ -1677,6 +1688,61 @@ impl App {
             // An exited pane keeps its screen and stays selectable, so its
             // final output can be read before it is closed.
             let _ = self.state.set_pane_status(id, status);
+        }
+
+        if self.refresh_local_branches() {
+            changed = true;
+        }
+
+        changed
+    }
+
+    /// Looks again at which branch this process's own panes and projects are
+    /// on, at most every `branch_every`. Returns whether any row moved.
+    ///
+    /// Standalone only: attached, every pane and project is a daemon's, and
+    /// the daemon looks from the machine they are on. A pane whose directory
+    /// cannot be read keeps the branch it had, as the daemon's do.
+    fn refresh_local_branches(&mut self) -> bool {
+        let Some(local) = self.local else {
+            return false;
+        };
+        if self
+            .branches_checked
+            .is_some_and(|checked| checked.elapsed() < self.branch_every)
+        {
+            return false;
+        }
+        self.branches_checked = Some(Instant::now());
+
+        let mut changed = false;
+
+        let dirs: Vec<(PaneId, PathBuf)> = self
+            .panes
+            .iter()
+            .filter_map(|(id, pane)| match &pane.backend {
+                Backend::Local(session) => session
+                    .pid()
+                    .and_then(dispatch_os::process::working_dir)
+                    .map(|dir| (*id, dir)),
+                Backend::Remote(_) => None,
+            })
+            .collect();
+        for (id, dir) in dirs {
+            let branch = dispatch_os::git::head(&dir);
+            changed |= self.state.set_pane_branch(id, branch).unwrap_or(false);
+        }
+
+        let roots: Vec<(ProjectId, PathBuf)> = self
+            .state
+            .projects()
+            .iter()
+            .filter(|project| project.device == local)
+            .map(|project| (project.id, project.root.clone()))
+            .collect();
+        for (id, root) in roots {
+            let branch = dispatch_os::git::head(&root);
+            changed |= self.state.set_project_branch(id, branch).unwrap_or(false);
         }
 
         changed
@@ -5720,6 +5786,71 @@ mod tests {
             1,
             "the daemon's machine is the only one left"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_standalone_client_watches_its_own_panes_and_projects_branches() {
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            launch: Launch {
+                command: "sh".to_string(),
+                args: Vec::new(),
+                env: Default::default(),
+            },
+            ..Default::default()
+        };
+
+        let dir = scratch("branch-local");
+        std::fs::create_dir_all(dir.join(".git")).expect("temp dir is writable");
+        std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/main\n")
+            .expect("temp dir is writable");
+
+        let mut app = App::new([def].into_iter().collect());
+        app.branch_every = Duration::ZERO;
+        app.add_project(dir.clone());
+        let project = app.state.projects()[0].id;
+        assert_eq!(
+            app.state.projects()[0].branch.as_deref(),
+            Some("main"),
+            "a project knows its branch as soon as it is opened"
+        );
+
+        let _ = app.state.select_project(project);
+        app.spawn_pane("shell", Size::new(80, 24))
+            .expect("a shell starts");
+        let pane = app.state.focused_pane().expect("the new pane is focused");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app
+            .state
+            .pane(pane)
+            .and_then(|pane| pane.branch.clone())
+            .is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the pane never learned its branch"
+            );
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            app.state.pane(pane).and_then(|pane| pane.branch.as_deref()),
+            Some("main")
+        );
+
+        std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/feat/x\n")
+            .expect("temp dir is writable");
+        while app.state.projects()[0].branch.as_deref() != Some("feat/x") {
+            assert!(Instant::now() < deadline, "the project never moved branch");
+            app.poll_panes();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        app.close_focused();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
