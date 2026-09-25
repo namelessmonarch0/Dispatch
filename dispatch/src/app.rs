@@ -12,7 +12,7 @@ use dispatch_core::{
     ProjectId, ProjectSource, RequestId,
 };
 use dispatch_layout::{tile, tile_zoomed};
-use dispatch_proto::{ClientMessage, DelegateOutcome, PaneUpdate, ServerMessage};
+use dispatch_proto::{ClientMessage, DelegateOutcome, PaneUpdate, ProjectUpdate, ServerMessage};
 use dispatch_pty::{
     KeyEncoder, MouseEncoder, MouseInput, PtySession, RunState, Screen, ScreenReader, ScrollTo,
     Size, TitleScanner,
@@ -1300,6 +1300,16 @@ impl App {
                 self.state.remove_project(project).is_ok()
             }
 
+            ServerMessage::ProjectChanged { project, update } => match update {
+                ProjectUpdate::Branch { branch } => self
+                    .state
+                    .set_project_branch(project, branch)
+                    .unwrap_or(false),
+                // A newer daemon's change this build has no name for: ignored,
+                // as the protocol promises, rather than failing the frame.
+                ProjectUpdate::Unknown => false,
+            },
+
             ServerMessage::PaneSpawned {
                 pane,
                 project,
@@ -1346,6 +1356,9 @@ impl App {
                 PaneUpdate::Title { title } => {
                     self.rename(pane, &title);
                     true
+                }
+                PaneUpdate::Branch { branch } => {
+                    self.state.set_pane_branch(pane, branch).unwrap_or(false)
                 }
                 // A newer daemon's update this build has no name for. The
                 // protocol's promise is that it lands somewhere ignorable
@@ -3655,6 +3668,51 @@ mod tests {
         assert!(
             app.state.pane(pane).is_some(),
             "the pane is untouched by an update this build cannot read"
+        );
+    }
+
+    #[test]
+    fn a_daemon_saying_a_pane_moved_branch_is_recorded() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        daemon
+            .send(ServerMessage::PaneChanged {
+                pane,
+                update: PaneUpdate::Branch {
+                    branch: Some("feat/tabs".into()),
+                },
+            })
+            .expect("the app is listening");
+
+        assert!(app.poll_daemon(), "a branch change is worth a redraw");
+        assert_eq!(
+            app.state.pane(pane).and_then(|pane| pane.branch.as_deref()),
+            Some("feat/tabs")
+        );
+    }
+
+    #[test]
+    fn a_daemon_saying_a_project_moved_branch_is_recorded() {
+        let (mut app, project, daemon, _sent) = attached_app();
+
+        daemon
+            .send(ServerMessage::ProjectChanged {
+                project,
+                update: ProjectUpdate::Branch {
+                    branch: Some("main".into()),
+                },
+            })
+            .expect("the app is listening");
+
+        assert!(app.poll_daemon());
+        assert_eq!(
+            app.state
+                .projects()
+                .iter()
+                .find(|candidate| candidate.id == project)
+                .and_then(|project| project.branch.as_deref()),
+            Some("main")
         );
     }
 

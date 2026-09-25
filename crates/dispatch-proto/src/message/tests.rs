@@ -593,3 +593,107 @@ fn a_higher_minor_version_is_still_compatible() {
     assert!(crate::VERSION.is_compatible_with(older));
     assert!(older.is_compatible_with(crate::VERSION));
 }
+
+#[test]
+fn branch_changes_round_trip() {
+    for branch in [Some("feat/tabs".to_string()), None] {
+        let pane = ServerMessage::PaneChanged {
+            pane: PaneId::new(),
+            update: PaneUpdate::Branch {
+                branch: branch.clone(),
+            },
+        };
+        assert_eq!(round_trip(&pane), pane);
+
+        let project = ServerMessage::ProjectChanged {
+            project: ProjectId::new(),
+            update: ProjectUpdate::Branch { branch },
+        };
+        assert_eq!(round_trip(&project), project);
+    }
+}
+
+#[test]
+fn an_unknown_project_update_is_skipped_rather_than_fatal() {
+    // The same reason `PaneUpdate` has an `Unknown`: it travels inside a
+    // message, so a variant this build lacks would fail the whole frame.
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum FutureProjectUpdate {
+        Remote { url: String },
+    }
+
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum FutureServerMessage {
+        ProjectChanged {
+            project: ProjectId,
+            update: FutureProjectUpdate,
+        },
+    }
+
+    let project = ProjectId::new();
+    let mut buf = Vec::new();
+    Frame::write(
+        &mut buf,
+        &FutureServerMessage::ProjectChanged {
+            project,
+            update: FutureProjectUpdate::Remote {
+                url: "git@example.com:x.git".into(),
+            },
+        },
+    )
+    .expect("writing succeeds");
+
+    let read: ServerMessage =
+        Frame::read(&mut buf.as_slice()).expect("an unknown update must not fail the frame");
+
+    assert_eq!(
+        read,
+        ServerMessage::ProjectChanged {
+            project,
+            update: ProjectUpdate::Unknown,
+        }
+    );
+}
+
+#[test]
+fn a_project_from_an_older_daemon_has_no_branch() {
+    // An older daemon's `Project` has no `branch` field at all.
+    #[derive(serde::Serialize)]
+    struct OlderProject {
+        id: ProjectId,
+        name: &'static str,
+        root: &'static str,
+        source: dispatch_core::ProjectSource,
+    }
+
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum OlderServerMessage {
+        ProjectOpened { project: OlderProject },
+    }
+
+    let id = ProjectId::new();
+    let mut buf = Vec::new();
+    Frame::write(
+        &mut buf,
+        &OlderServerMessage::ProjectOpened {
+            project: OlderProject {
+                id,
+                name: "app",
+                root: "/home/me/app",
+                source: dispatch_core::ProjectSource::LocalDir,
+            },
+        },
+    )
+    .expect("writing succeeds");
+
+    let read: ServerMessage = Frame::read(&mut buf.as_slice()).expect("reading succeeds");
+    let ServerMessage::ProjectOpened { project } = read else {
+        panic!("expected a project, got {read:?}");
+    };
+
+    assert_eq!(project.id, id);
+    assert_eq!(project.branch, None);
+}
