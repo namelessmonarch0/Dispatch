@@ -82,3 +82,20 @@ fn a_broken_file_names_itself() {
         "the user has to be told which file to fix, got {error}"
     );
 }
+
+#[test]
+fn motion_is_on_unless_turned_off() {
+    assert!(Config::default().interface.motion);
+
+    let config: Config = toml::from_str("[interface]\nmotion = false\n").expect("parses");
+    assert!(!config.interface.motion);
+}
+
+#[test]
+fn the_interface_section_is_not_reported_unknown() {
+    let raw: toml::Table = toml::from_str("[interface]\nmotion = false\n").expect("parses");
+    assert!(unknown_keys(&raw).is_empty());
+
+    let raw: toml::Table = toml::from_str("[interface]\nsparkles = true\n").expect("parses");
+    assert_eq!(unknown_keys(&raw), vec!["interface.sparkles".to_string()]);
+}

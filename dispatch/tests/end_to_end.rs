@@ -750,6 +750,35 @@ fn the_project_picker_lists_the_open_project() {
 }
 
 #[test]
+fn a_malformed_config_fails_the_start_before_anything_is_attached_to() {
+    // Read late, a bad `config.toml` was only noticed once a daemon had been
+    // started and every registered machine dialled, and they were left
+    // running behind the error. `--no-start` stands in for that here: the
+    // attach it asks for fails differently, so which error comes out says
+    // which step ran first.
+    let fixture = Fixture::new("badcfg");
+    std::fs::write(
+        fixture.config.path().join("config.toml"),
+        "[interface\nmotion = true\n",
+    )
+    .expect("temp dir is writable");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dispatch"))
+        .args(["--attach", "--no-start"])
+        .arg(&fixture.project)
+        .envs(fixture.env())
+        .output()
+        .expect("the dispatch binary runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("config.toml"),
+        "the configuration is what is reported: {stderr}"
+    );
+}
+
+#[test]
 #[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
 fn the_harness_manager_reports_when_nothing_needs_adding() {
     // The temporary configuration has every built-in written already, so the

@@ -46,12 +46,29 @@ impl Default for DelegationLimits {
     }
 }
 
+/// How the interface draws itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InterfaceConfig {
+    /// Whether things move: spinners, pulses, easing, transitions. Off, every
+    /// change is shown at once and nothing animates.
+    pub motion: bool,
+}
+
+impl Default for InterfaceConfig {
+    fn default() -> Self {
+        Self { motion: true }
+    }
+}
+
 /// Everything `config.toml` can say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Limits on delegation.
     pub delegation: DelegationLimits,
+    /// How the interface draws itself. The daemon ignores it.
+    pub interface: InterfaceConfig,
 }
 
 /// A loaded configuration, plus the keys this build did not understand.
@@ -119,6 +136,13 @@ fn unknown_keys(raw: &toml::Table) -> Vec<String> {
                 for key in table.keys() {
                     if !DELEGATION.contains(&key.as_str()) {
                         unknown.push(format!("delegation.{key}"));
+                    }
+                }
+            }
+            ("interface", toml::Value::Table(table)) => {
+                for key in table.keys() {
+                    if key != "motion" {
+                        unknown.push(format!("interface.{key}"));
                     }
                 }
             }

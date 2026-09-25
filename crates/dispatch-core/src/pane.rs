@@ -40,6 +40,12 @@ pub enum PaneStatus {
     Running,
     /// The agent is waiting on the user.
     Idle,
+    /// The agent is waiting on a decision only the user can make — a
+    /// permission prompt, a question.
+    ///
+    /// Only a client sets this, from what it reads on the pane's screen; a
+    /// daemon never sends it, so no older client meets it on the wire.
+    Blocked,
     /// The process exited with this status code.
     Exited(i32),
 }
@@ -145,6 +151,7 @@ mod tests {
         assert!(PaneStatus::Starting.is_live());
         assert!(PaneStatus::Running.is_live());
         assert!(PaneStatus::Idle.is_live());
+        assert!(PaneStatus::Blocked.is_live());
         assert!(!PaneStatus::Exited(0).is_live());
         assert!(!PaneStatus::Exited(1).is_live());
     }

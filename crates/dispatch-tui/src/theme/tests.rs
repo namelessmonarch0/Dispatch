@@ -133,3 +133,66 @@ fn the_query_asks_for_all_three_colours_then_device_attributes() {
         b"\x1b]10;?\x07\x1b]11;?\x07\x1b]4;5;?\x07\x1b[c".as_slice()
     );
 }
+
+#[test]
+fn a_blend_runs_between_two_colours_at_the_themes_depth() {
+    let theme = Theme::fallback();
+    let (from, to) = (theme.rgb(Role::Faded), theme.rgb(Role::Accent));
+
+    assert_eq!(
+        theme.blend(from, to, 0.0),
+        Color::Rgb(from.0, from.1, from.2)
+    );
+    assert_eq!(theme.blend(from, to, 1.0), theme.accent);
+    assert!(matches!(
+        Theme::new(Palette::FALLBACK, Depth::Indexed).blend(from, to, 0.5),
+        Color::Indexed(_)
+    ));
+}
+
+#[test]
+fn a_tween_ends_on_exactly_what_is_drawn_at_rest() {
+    // In 256 colours the accent at rest is slot 5 itself, which no blend
+    // reaches: one ending on the nearest cube entry would jump the frame
+    // after it.
+    for depth in [Depth::TrueColor, Depth::Indexed] {
+        let theme = Theme::new(Palette::FALLBACK, depth);
+
+        assert_eq!(theme.tween(Role::Faded, Role::Accent, 1.0), theme.accent);
+        assert_eq!(theme.tween(Role::Faded, Role::Accent, 0.0), theme.faded);
+        assert_eq!(theme.tween(Role::Accent, Role::Faded, 0.0), theme.accent);
+        assert_eq!(theme.tween(Role::Background, Role::Tint, 1.0), theme.tint);
+        assert_eq!(
+            theme.tween(Role::Faded, Role::Accent, 0.5),
+            theme.blend(theme.rgb(Role::Faded), theme.rgb(Role::Accent), 0.5),
+            "and between the ends it is a blend"
+        );
+    }
+}
+
+#[test]
+fn a_fill_that_has_not_left_the_background_paints_nothing() {
+    // The palette's background is a guess at the terminal's — the fallback's
+    // dark one when it did not answer — so painted at nothing it is a box.
+    let theme = Theme::fallback();
+
+    assert_eq!(theme.from_background(Role::Pulse, 0.0), None);
+    assert_eq!(theme.from_background(Role::Pulse, 1e-6), None);
+    assert_eq!(
+        theme.from_background(Role::Pulse, 1.0),
+        Some(theme.blend(theme.rgb(Role::Background), theme.rgb(Role::Pulse), 1.0))
+    );
+    assert_eq!(theme.from_background(Role::Tint, 1.0), Some(theme.tint));
+}
+
+#[test]
+fn the_pulse_colour_is_the_background_most_of_the_way_to_the_accent() {
+    let theme = Theme::fallback();
+    let palette = Palette::FALLBACK;
+
+    assert_eq!(
+        theme.rgb(Role::Pulse),
+        palette.background.mix(palette.accent, 0.55)
+    );
+    assert_eq!(theme.rgb(Role::Background), palette.background);
+}

@@ -121,3 +121,71 @@ fn an_interrupted_sequence_does_not_leak_into_the_next() {
         Some("proper".to_string())
     );
 }
+
+fn signals(bytes: &[u8]) -> Signals {
+    TitleScanner::new().scan_signals(bytes)
+}
+
+#[test]
+fn a_bare_bell_is_reported() {
+    assert!(signals(b"done\x07").bell);
+}
+
+#[test]
+fn a_bell_that_ends_a_title_is_not_a_bell() {
+    let found = signals(b"\x1b]0;Claude Code\x07");
+
+    assert_eq!(found.title.as_deref(), Some("Claude Code"));
+    assert!(!found.bell, "BEL terminated the sequence, it did not ring");
+}
+
+#[test]
+fn a_progress_report_is_read_after_its_nine() {
+    assert_eq!(
+        signals(b"\x1b]9;4;1;40\x07").progress.as_deref(),
+        Some("4;1;40")
+    );
+    assert_eq!(
+        signals(b"\x1b]9;4;0\x1b\\").progress.as_deref(),
+        Some("4;0"),
+        "either terminator ends it"
+    );
+}
+
+#[test]
+fn a_notification_is_not_progress() {
+    // `OSC 9` alone is iTerm2's notification; only `9;4` is progress.
+    assert_eq!(signals(b"\x1b]9;build finished\x07").progress, None);
+}
+
+#[test]
+fn a_progress_report_split_across_writes_is_still_read() {
+    let mut scanner = TitleScanner::new();
+
+    assert_eq!(scanner.scan_signals(b"\x1b]9;4;").progress, None);
+    assert_eq!(
+        scanner.scan_signals(b"1;75\x07").progress.as_deref(),
+        Some("4;1;75")
+    );
+}
+
+#[test]
+fn a_title_a_progress_report_and_a_bell_arrive_together() {
+    let found = signals(b"\x1b]2;\xe2\xa0\x8b working\x07\x1b]9;4;3\x07ready\x07");
+
+    assert_eq!(found.title.as_deref(), Some("\u{280b} working"));
+    assert_eq!(found.progress.as_deref(), Some("4;3"));
+    assert!(found.bell);
+}
+
+#[test]
+fn scan_still_returns_only_the_title() {
+    let mut scanner = TitleScanner::new();
+
+    assert_eq!(
+        scanner
+            .scan(b"\x1b]9;4;1;10\x07\x1b]0;name\x07\x07")
+            .as_deref(),
+        Some("name")
+    );
+}

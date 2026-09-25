@@ -117,7 +117,10 @@ impl Screen {
 
     /// Each row's text, with trailing blanks trimmed.
     ///
-    /// For assertions and diagnostics.
+    /// What a harness's status rules read the live screen as, as well as for
+    /// assertions and diagnostics. One character per cell: a blank cell reads
+    /// as a space, and so does the second cell a wide character spans, which
+    /// has no text of its own — `日本` comes out as `日 本`.
     #[must_use]
     pub fn text_lines(&self) -> Vec<String> {
         self.rows

@@ -59,6 +59,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }
 png = "0.17"
+regex = "1"
 
 # Diagnostics
 anyhow = "1"

@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use crate::theme::Theme;
+use crate::theme::{Role, Theme};
 use dispatch_config::HarnessRegistry;
 use dispatch_config::harness::DEFAULT_ICON;
 use dispatch_core::{
@@ -42,6 +42,9 @@ pub const RUNNING: &str = "\u{f04b}";
 /// Waiting on its user.
 pub const IDLE: &str = "\u{f04c}";
 
+/// Waiting on a decision only the user can make.
+pub const BLOCKED: &str = "\u{f071}";
+
 /// Exited cleanly.
 pub const DONE: &str = "\u{f00c}";
 
@@ -50,6 +53,12 @@ pub const FAILED: &str = "\u{f00d}";
 
 /// Closed, and still listed only because something under it is not.
 pub const CLOSED: &str = "\u{f05e}";
+
+/// Finished while the user was looking elsewhere, until they look.
+pub const UNSEEN: &str = "\u{f058}";
+
+/// A working pane's glyph, one frame per tenth of a second.
+pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// The twisty of a node whose children are drawn.
 ///
@@ -85,6 +94,35 @@ fn inner(area: Rect) -> Rect {
     Block::bordered().inner(area)
 }
 
+/// What moves in the sidebar this frame.
+#[derive(Debug, Clone, Default)]
+pub struct SidebarMotion {
+    /// Rows pulsing for attention, with how strongly each shows now
+    /// (0.0–1.0) — the caller turns a pulse's progress into this with
+    /// [`pulse_strength`].
+    pub pulses: Vec<(PaneId, f32)>,
+    /// The focus tint on its way to the focused row.
+    pub glide: Option<Glide>,
+}
+
+/// The focus tint moving from one row to the focused one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Glide {
+    /// Where it started.
+    pub from: Anchor,
+    /// How far it has got, eased, 0.0–1.0.
+    pub t: f32,
+}
+
+/// How strongly a pulse shows `t` of the way through it: three rises and
+/// falls, from nothing and back to nothing.
+#[must_use]
+pub fn pulse_strength(t: f32) -> f32 {
+    (std::f32::consts::PI * 3.0 * t.clamp(0.0, 1.0))
+        .sin()
+        .powi(2)
+}
+
 /// Renders the project list.
 #[derive(Debug, Clone, Copy)]
 pub struct Sidebar<'a> {
@@ -92,6 +130,8 @@ pub struct Sidebar<'a> {
     harnesses: Option<&'a HarnessRegistry>,
     theme: Theme,
     scroll: Option<&'a Scroll>,
+    spinner: Option<usize>,
+    motion: Option<&'a SidebarMotion>,
 }
 
 impl<'a> Sidebar<'a> {
@@ -103,6 +143,8 @@ impl<'a> Sidebar<'a> {
             harnesses: None,
             theme: Theme::fallback(),
             scroll: None,
+            spinner: None,
+            motion: None,
         }
     }
 
@@ -127,6 +169,22 @@ impl<'a> Sidebar<'a> {
     #[must_use]
     pub fn with_scroll(mut self, scroll: &'a Scroll) -> Self {
         self.scroll = Some(scroll);
+        self
+    }
+
+    /// Draws working panes with spinner frame `frame`; `None` draws the still
+    /// play glyph, as with motion off.
+    #[must_use]
+    pub fn with_spinner(mut self, frame: Option<usize>) -> Self {
+        self.spinner = frame;
+        self
+    }
+
+    /// Draws what is moving this frame: rows pulsing, and the focus tint on
+    /// its way to its row.
+    #[must_use]
+    pub fn with_motion(mut self, motion: &'a SidebarMotion) -> Self {
+        self.motion = Some(motion);
         self
     }
 
@@ -236,19 +294,74 @@ fn twisty(has_children: bool, collapsed: bool) -> &'static str {
 /// A tombstone reports being closed whatever its process did: a closed row
 /// with live work beneath it has to look different from one that is merely
 /// finished.
-fn state_glyph(pane: &Pane, theme: &Theme) -> (&'static str, Style) {
+fn state_glyph(
+    pane: &Pane,
+    unseen: bool,
+    spinner: Option<usize>,
+    theme: &Theme,
+) -> (&'static str, Style) {
     if pane.closed {
         return (CLOSED, Style::default().fg(theme.faded));
     }
 
     match pane.status {
         PaneStatus::Starting => (STARTING, Style::default().fg(Color::Yellow)),
-        PaneStatus::Running => (RUNNING, Style::default().fg(Color::Green)),
-        PaneStatus::Idle => (IDLE, Style::default().fg(Color::Blue)),
+        PaneStatus::Running => Rollup::Working.glyph(spinner, theme),
+        PaneStatus::Blocked => Rollup::Blocked.glyph(spinner, theme),
+        PaneStatus::Idle if unseen => Rollup::Done.glyph(spinner, theme),
+        PaneStatus::Idle => (IDLE, Style::default().fg(theme.faded)),
         // A pane that exited stays listed until it is closed, so it has to be
         // visibly different from one that is still working.
         PaneStatus::Exited(0) => (DONE, Style::default().fg(theme.faded)),
         PaneStatus::Exited(_) => (FAILED, Style::default().fg(Color::Red)),
+    }
+}
+
+/// The most urgent thing a group of panes is doing, for a row or a tab that
+/// stands for them. Ordered by urgency, so the largest wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Rollup {
+    /// Something is working.
+    Working,
+    /// Something finished while the user was looking elsewhere.
+    Done,
+    /// Something is waiting on the user.
+    Blocked,
+}
+
+impl Rollup {
+    /// The most urgent state among `panes`; `None` when they are all idle,
+    /// starting, exited or closed — nothing worth drawing for the group.
+    #[must_use]
+    pub fn of<'p>(state: &AppState, panes: impl IntoIterator<Item = &'p Pane>) -> Option<Rollup> {
+        panes
+            .into_iter()
+            .filter(|pane| !pane.closed)
+            .filter_map(|pane| match pane.status {
+                PaneStatus::Blocked => Some(Rollup::Blocked),
+                PaneStatus::Idle if state.is_unseen(pane.id) => Some(Rollup::Done),
+                PaneStatus::Running => Some(Rollup::Working),
+                _ => None,
+            })
+            .max()
+    }
+
+    /// Its glyph and colour.
+    #[must_use]
+    pub fn glyph(self, spinner: Option<usize>, theme: &Theme) -> (&'static str, Style) {
+        match self {
+            Rollup::Working => (
+                spinner.map_or(RUNNING, |frame| SPINNER[frame % SPINNER.len()]),
+                Style::default().fg(Color::Green),
+            ),
+            Rollup::Done => (UNSEEN, Style::default().fg(theme.accent)),
+            Rollup::Blocked => (
+                BLOCKED,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        }
     }
 }
 
@@ -654,6 +767,14 @@ impl Widget for Sidebar<'_> {
         let selected = self.state.selected_project();
         let focused = self.state.focused_pane();
 
+        // The focus tint, while it moves, is drawn here rather than by the
+        // row it belongs to: gliding, it is on a row that is not the focused
+        // one; fading, it is on two at once.
+        let glide = self.motion.and_then(|motion| motion.glide);
+        if let Some(glide) = glide {
+            self.render_glide(buf, &sections, glide);
+        }
+
         for (index, section) in sections.iter().enumerate() {
             if index > 0 {
                 divider(buf, area, section.header, edge);
@@ -787,6 +908,56 @@ pub fn section_at(
 }
 
 impl Sidebar<'_> {
+    /// Whether the focus tint is moving this frame, and so is drawn by
+    /// [`Sidebar::render_glide`] rather than by the row it belongs to.
+    fn gliding(&self) -> bool {
+        self.motion.is_some_and(|motion| motion.glide.is_some())
+    }
+
+    /// Draws the moving focus tint: gliding row by row when both ends are in
+    /// one section's view, fading out of one and into the other otherwise.
+    fn render_glide(&self, buf: &mut Buffer, sections: &[Section<'_>], glide: Glide) {
+        let to = self
+            .state
+            .focused_pane()
+            .map(Anchor::Pane)
+            .or_else(|| self.state.selected_project().map(Anchor::Project));
+        let Some(to) = to else {
+            return;
+        };
+
+        let find = |anchor: Anchor| {
+            sections.iter().enumerate().find_map(|(index, section)| {
+                section
+                    .visible()
+                    .find(|(_, row)| row.is(anchor))
+                    .map(|(y, _)| (index, y, section.body))
+            })
+        };
+        let text = self.theme.text;
+
+        match (find(glide.from), find(to)) {
+            (Some((a, from_y, body)), Some((b, to_y, _))) if a == b => {
+                let span = f32::from(to_y) - f32::from(from_y);
+                let y = (f32::from(from_y) + span * glide.t).round() as u16;
+                fill(buf, body, body.x, y, self.tinted());
+            }
+            (from, to) => {
+                // A row the tint has wholly left, or not yet reached, is left
+                // unpainted rather than painted the palette's background.
+                let row = |at: Option<(usize, u16, Rect)>, t: f32| {
+                    at.zip(self.theme.from_background(Role::Tint, t))
+                };
+                if let Some(((_, y, body), colour)) = row(from, 1.0 - glide.t) {
+                    fill(buf, body, body.x, y, Style::default().bg(colour).fg(text));
+                }
+                if let Some(((_, y, body), colour)) = row(to, glide.t) {
+                    fill(buf, body, body.x, y, Style::default().bg(colour).fg(text));
+                }
+            }
+        }
+    }
+
     /// Draws one project row, at the left edge of its section.
     fn render_project(
         &self,
@@ -815,7 +986,10 @@ impl Sidebar<'_> {
         // the name: a highlight that stops where a short name does reads as
         // part of the name. It sets the text colour too, which everything
         // written on the row after it keeps.
-        if is_selected {
+        //
+        // A project row is what the focus tint stands on only when no pane
+        // is focused; then, while that tint moves, the glide draws it.
+        if is_selected && !(self.gliding() && self.state.focused_pane().is_none()) {
             fill(buf, area, x, y, self.tinted());
         }
 
@@ -829,9 +1003,28 @@ impl Sidebar<'_> {
         write(buf, area, x, y, twisty(has_panes, collapsed), style);
         write(buf, area, x + 2, y, source_icon(project), style);
 
+        // A folded project stands for its panes, so it carries the most
+        // urgent of their states where a pane row carries its own; an open
+        // one leaves that to the rows below.
+        let rollup = collapsed
+            .then(|| Rollup::of(self.state, self.state.panes_for(id)))
+            .flatten();
+        let state_x = (area.x + area.width).saturating_sub(2);
+
         let name_x = x + NAME;
-        let room = (area.x + area.width).saturating_sub(name_x) as usize;
+        let right = if rollup.is_some() {
+            // The name stops a blank short of the glyph, as a pane title does.
+            state_x.saturating_sub(1)
+        } else {
+            area.x + area.width
+        };
+        let room = right.saturating_sub(name_x) as usize;
         write(buf, area, name_x, y, &truncate(&project.name, room), style);
+
+        if let Some(rollup) = rollup {
+            let (glyph, glyph_style) = rollup.glyph(self.spinner, &self.theme);
+            write(buf, area, state_x, y, glyph, glyph_style);
+        }
     }
 
     /// Draws a branch line, faded, where its project's name starts.
@@ -947,8 +1140,26 @@ impl Sidebar<'_> {
         };
 
         let x = area.x + indent;
-        if is_focused {
+        // While the focus tint moves, the glide draws it.
+        if is_focused && !self.gliding() {
             fill(buf, area, x, y, self.tinted());
+        }
+
+        // Under the text rather than over it: the row pulses, and what it
+        // says — the glyph above all — stays as it was. Between pulses, and
+        // at either end, it is the background, which is left unpainted.
+        if let Some(colour) = self
+            .motion
+            .and_then(|motion| motion.pulses.iter().find(|(id, _)| *id == pane.id))
+            .and_then(|(_, strength)| self.theme.from_background(Role::Pulse, *strength))
+        {
+            fill(
+                buf,
+                area,
+                x,
+                y,
+                Style::default().bg(colour).fg(self.theme.text),
+            );
         }
 
         let has_children = !self.state.children_of(pane.id).is_empty();
@@ -960,7 +1171,12 @@ impl Sidebar<'_> {
         // Two columns in from the frame, so the blank beside it keeps a glyph
         // drawn wider than its cell off the border. The title stops a blank
         // short of it.
-        let (glyph, glyph_style) = state_glyph(pane, &self.theme);
+        let (glyph, glyph_style) = state_glyph(
+            pane,
+            self.state.is_unseen(pane.id),
+            self.spinner,
+            &self.theme,
+        );
         let state_x = (area.x + area.width).saturating_sub(2);
 
         let title_x = x + NAME;
