@@ -1368,3 +1368,57 @@ fn the_wheel_finds_the_section_under_it() {
     assert_eq!(section_at(&state, area, &scroll, 5, 5), None, "a divider");
     assert_eq!(section_at(&state, area, &scroll, 0, 1), None, "the frame");
 }
+
+#[test]
+fn the_hidden_above_count_is_drawn_faded() {
+    // The spec draws every hidden-row count in `faded`, above a section's
+    // name and below it alike; only the name itself takes the label's own
+    // style.
+    let state = many(20);
+    let scroll = Scroll::from([(DeviceId::nil(), 5)]);
+
+    let area = Rect::new(0, 0, WIDTH, 8);
+    let mut buf = Buffer::empty(area);
+    Sidebar::new(&state)
+        .with_scroll(&scroll)
+        .render(area, &mut buf);
+    let line = row_text(&buf, 0);
+
+    let x = u16::try_from(column_of(&line, "↑")).expect("inside the sidebar");
+    let cell = buf.cell((x, 0)).expect("cell exists");
+
+    assert_eq!(cell.fg, Theme::fallback().faded, "{line:?}");
+}
+
+#[test]
+fn a_machines_name_stays_full_strength_while_its_hidden_above_count_is_faded() {
+    let (mut state, _, tower) = fleet();
+    // Enough rows under the tower that an offset of 2 is not clamped away.
+    for index in 0..9 {
+        state.add_project(
+            Project::new(format!("/tmp/t{index}"), ProjectSource::LocalDir).with_device(tower),
+        );
+    }
+    let scroll = Scroll::from([(tower, 2)]);
+
+    let area = Rect::new(0, 0, WIDTH, 10);
+    let mut buf = Buffer::empty(area);
+    Sidebar::new(&state)
+        .with_scroll(&scroll)
+        .render(area, &mut buf);
+    let lines: Vec<String> = (0..10).map(|y| row_text(&buf, y)).collect();
+    let divider = lines
+        .iter()
+        .position(|line| line.contains("tower"))
+        .expect("the second machine is named");
+    let y = u16::try_from(divider).expect("inside the sidebar");
+
+    let name_x = u16::try_from(column_of(&lines[divider], "tower")).expect("inside the sidebar");
+    let name = buf.cell((name_x, y)).expect("cell exists");
+    assert_eq!(name.fg, Color::Reset, "{lines:#?}");
+    assert!(name.modifier.contains(Modifier::BOLD), "{lines:#?}");
+
+    let up_x = u16::try_from(column_of(&lines[divider], "↑")).expect("inside the sidebar");
+    let up = buf.cell((up_x, y)).expect("cell exists");
+    assert_eq!(up.fg, Theme::fallback().faded, "{lines:#?}");
+}

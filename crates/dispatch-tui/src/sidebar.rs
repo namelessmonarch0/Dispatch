@@ -843,13 +843,21 @@ impl Sidebar<'_> {
         let room = usize::from(line.width.saturating_sub(2)).saturating_sub(up.width() + reserve);
 
         let Some(id) = section.device else {
-            write(
+            let x = write(
                 buf,
                 line,
                 line.x,
                 line.y,
-                &format!(" {TITLE}{up} "),
+                &format!(" {TITLE}"),
                 Style::default(),
+            );
+            write(
+                buf,
+                line,
+                x,
+                line.y,
+                &format!("{up} "),
+                Style::default().fg(self.theme.faded),
             );
             return;
         };
@@ -875,7 +883,18 @@ impl Sidebar<'_> {
             )
         };
 
-        write(buf, line, line.x, line.y, &format!(" {name}{up} "), style);
+        // The `↑ n` count is always faded, whatever the name's own style is:
+        // the spec draws every hidden-row count the same, on both sides of a
+        // section.
+        let x = write(buf, line, line.x, line.y, &format!(" {name}"), style);
+        write(
+            buf,
+            line,
+            x,
+            line.y,
+            &format!("{up} "),
+            Style::default().fg(self.theme.faded),
+        );
     }
 
     /// Draws one pane row `indent` columns in from the sidebar's edge.
