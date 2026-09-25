@@ -709,7 +709,9 @@ fn a_panes_state_is_one_glyph_at_the_end_of_its_row() {
 fn every_state_has_a_glyph_of_its_own() {
     // The dot said only "something is happening" and the outcome column said
     // the rest. One glyph per state is one place to look.
-    let glyphs = [STARTING, RUNNING, IDLE, DONE, FAILED, CLOSED];
+    let glyphs = [
+        STARTING, RUNNING, IDLE, DONE, FAILED, CLOSED, BLOCKED, UNSEEN,
+    ];
 
     for (i, glyph) in glyphs.iter().enumerate() {
         for other in &glyphs[i + 1..] {
@@ -1498,4 +1500,118 @@ fn a_blocked_pane_says_so_in_yellow() {
     assert_eq!(cell.symbol(), BLOCKED);
     assert_eq!(cell.fg, Color::Yellow);
     assert!(cell.modifier.contains(Modifier::BOLD));
+}
+
+fn render_spinning(state: &AppState, frame: Option<usize>) -> Buffer {
+    let area = Rect::new(0, 0, WIDTH, 8);
+    let mut buf = Buffer::empty(area);
+    Sidebar::new(state)
+        .with_spinner(frame)
+        .render(area, &mut buf);
+    buf
+}
+
+#[test]
+fn a_working_pane_spins() {
+    let (mut state, alpha, _) = state();
+    let pane = spawn(&mut state, alpha, "claude");
+    state
+        .set_pane_status(pane, PaneStatus::Running)
+        .expect("pane exists");
+
+    assert_eq!(
+        state_cell(&render_spinning(&state, Some(0)), TOP + 1).0,
+        SPINNER[0]
+    );
+    assert_eq!(
+        state_cell(&render_spinning(&state, Some(3)), TOP + 1).0,
+        SPINNER[3]
+    );
+    assert_eq!(
+        state_cell(&render_spinning(&state, Some(13)), TOP + 1).0,
+        SPINNER[3],
+        "the frame wraps"
+    );
+    assert_eq!(
+        state_cell(&render_spinning(&state, None), TOP + 1),
+        (RUNNING.to_string(), Color::Green),
+        "with motion off, the still play glyph"
+    );
+}
+
+#[test]
+fn an_idle_pane_is_faded_and_one_finished_out_of_sight_is_marked() {
+    let (mut state, alpha, _) = state();
+    let pane = spawn(&mut state, alpha, "claude");
+    state
+        .set_pane_status(pane, PaneStatus::Idle)
+        .expect("pane exists");
+
+    assert_eq!(
+        state_cell(&render(&state, WIDTH, 6), TOP + 1),
+        (IDLE.to_string(), Theme::fallback().faded)
+    );
+
+    state.mark_unseen(pane);
+    assert_eq!(
+        state_cell(&render(&state, WIDTH, 6), TOP + 1),
+        (UNSEEN.to_string(), Theme::fallback().accent)
+    );
+}
+
+#[test]
+fn a_folded_project_shows_its_most_urgent_pane() {
+    let (mut state, alpha, _) = state();
+    let working = spawn(&mut state, alpha, "claude");
+    let done = spawn(&mut state, alpha, "codex");
+    let blocked = spawn(&mut state, alpha, "opencode");
+    state
+        .set_pane_status(working, PaneStatus::Running)
+        .expect("exists");
+    state
+        .set_pane_status(done, PaneStatus::Idle)
+        .expect("exists");
+    state.mark_unseen(done);
+    state
+        .set_pane_status(blocked, PaneStatus::Blocked)
+        .expect("exists");
+
+    state.toggle_project_collapsed(alpha);
+    assert_eq!(state_cell(&render(&state, WIDTH, 6), TOP).0, BLOCKED);
+
+    state
+        .set_pane_status(blocked, PaneStatus::Idle)
+        .expect("exists");
+    assert_eq!(state_cell(&render(&state, WIDTH, 6), TOP).0, UNSEEN);
+
+    state.mark_seen(done);
+    assert_eq!(
+        state_cell(&render_spinning(&state, Some(2)), TOP).0,
+        SPINNER[2]
+    );
+}
+
+#[test]
+fn an_open_project_and_an_idle_one_show_no_rollup() {
+    let (mut state, alpha, _) = state();
+    let pane = spawn(&mut state, alpha, "claude");
+    state
+        .set_pane_status(pane, PaneStatus::Blocked)
+        .expect("exists");
+
+    assert_eq!(
+        state_cell(&render(&state, WIDTH, 6), TOP).0,
+        " ",
+        "open: its panes say it"
+    );
+
+    state
+        .set_pane_status(pane, PaneStatus::Idle)
+        .expect("exists");
+    state.toggle_project_collapsed(alpha);
+    assert_eq!(
+        state_cell(&render(&state, WIDTH, 6), TOP).0,
+        " ",
+        "nothing to say"
+    );
 }

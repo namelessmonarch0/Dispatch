@@ -54,6 +54,12 @@ pub const FAILED: &str = "\u{f00d}";
 /// Closed, and still listed only because something under it is not.
 pub const CLOSED: &str = "\u{f05e}";
 
+/// Finished while the user was looking elsewhere, until they look.
+pub const UNSEEN: &str = "\u{f058}";
+
+/// A working pane's glyph, one frame per tenth of a second.
+pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 /// The twisty of a node whose children are drawn.
 ///
 /// Nerd Font carets rather than the geometric triangles: those are
@@ -95,6 +101,7 @@ pub struct Sidebar<'a> {
     harnesses: Option<&'a HarnessRegistry>,
     theme: Theme,
     scroll: Option<&'a Scroll>,
+    spinner: Option<usize>,
 }
 
 impl<'a> Sidebar<'a> {
@@ -106,6 +113,7 @@ impl<'a> Sidebar<'a> {
             harnesses: None,
             theme: Theme::fallback(),
             scroll: None,
+            spinner: None,
         }
     }
 
@@ -130,6 +138,14 @@ impl<'a> Sidebar<'a> {
     #[must_use]
     pub fn with_scroll(mut self, scroll: &'a Scroll) -> Self {
         self.scroll = Some(scroll);
+        self
+    }
+
+    /// Draws working panes with spinner frame `frame`; `None` draws the still
+    /// play glyph, as with motion off.
+    #[must_use]
+    pub fn with_spinner(mut self, frame: Option<usize>) -> Self {
+        self.spinner = frame;
         self
     }
 
@@ -239,25 +255,74 @@ fn twisty(has_children: bool, collapsed: bool) -> &'static str {
 /// A tombstone reports being closed whatever its process did: a closed row
 /// with live work beneath it has to look different from one that is merely
 /// finished.
-fn state_glyph(pane: &Pane, theme: &Theme) -> (&'static str, Style) {
+fn state_glyph(
+    pane: &Pane,
+    unseen: bool,
+    spinner: Option<usize>,
+    theme: &Theme,
+) -> (&'static str, Style) {
     if pane.closed {
         return (CLOSED, Style::default().fg(theme.faded));
     }
 
     match pane.status {
         PaneStatus::Starting => (STARTING, Style::default().fg(Color::Yellow)),
-        PaneStatus::Running => (RUNNING, Style::default().fg(Color::Green)),
-        PaneStatus::Idle => (IDLE, Style::default().fg(Color::Blue)),
-        PaneStatus::Blocked => (
-            BLOCKED,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
+        PaneStatus::Running => Rollup::Working.glyph(spinner, theme),
+        PaneStatus::Blocked => Rollup::Blocked.glyph(spinner, theme),
+        PaneStatus::Idle if unseen => Rollup::Done.glyph(spinner, theme),
+        PaneStatus::Idle => (IDLE, Style::default().fg(theme.faded)),
         // A pane that exited stays listed until it is closed, so it has to be
         // visibly different from one that is still working.
         PaneStatus::Exited(0) => (DONE, Style::default().fg(theme.faded)),
         PaneStatus::Exited(_) => (FAILED, Style::default().fg(Color::Red)),
+    }
+}
+
+/// The most urgent thing a group of panes is doing, for a row or a tab that
+/// stands for them. Ordered by urgency, so the largest wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Rollup {
+    /// Something is working.
+    Working,
+    /// Something finished while the user was looking elsewhere.
+    Done,
+    /// Something is waiting on the user.
+    Blocked,
+}
+
+impl Rollup {
+    /// The most urgent state among `panes`; `None` when they are all idle,
+    /// starting, exited or closed — nothing worth drawing for the group.
+    #[must_use]
+    pub fn of<'p>(state: &AppState, panes: impl IntoIterator<Item = &'p Pane>) -> Option<Rollup> {
+        panes
+            .into_iter()
+            .filter(|pane| !pane.closed)
+            .filter_map(|pane| match pane.status {
+                PaneStatus::Blocked => Some(Rollup::Blocked),
+                PaneStatus::Idle if state.is_unseen(pane.id) => Some(Rollup::Done),
+                PaneStatus::Running => Some(Rollup::Working),
+                _ => None,
+            })
+            .max()
+    }
+
+    /// Its glyph and colour.
+    #[must_use]
+    pub fn glyph(self, spinner: Option<usize>, theme: &Theme) -> (&'static str, Style) {
+        match self {
+            Rollup::Working => (
+                spinner.map_or(RUNNING, |frame| SPINNER[frame % SPINNER.len()]),
+                Style::default().fg(Color::Green),
+            ),
+            Rollup::Done => (UNSEEN, Style::default().fg(theme.accent)),
+            Rollup::Blocked => (
+                BLOCKED,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        }
     }
 }
 
@@ -838,9 +903,28 @@ impl Sidebar<'_> {
         write(buf, area, x, y, twisty(has_panes, collapsed), style);
         write(buf, area, x + 2, y, source_icon(project), style);
 
+        // A folded project stands for its panes, so it carries the most
+        // urgent of their states where a pane row carries its own; an open
+        // one leaves that to the rows below.
+        let rollup = collapsed
+            .then(|| Rollup::of(self.state, self.state.panes_for(id)))
+            .flatten();
+        let state_x = (area.x + area.width).saturating_sub(2);
+
         let name_x = x + NAME;
-        let room = (area.x + area.width).saturating_sub(name_x) as usize;
+        let right = if rollup.is_some() {
+            // The name stops a blank short of the glyph, as a pane title does.
+            state_x.saturating_sub(1)
+        } else {
+            area.x + area.width
+        };
+        let room = right.saturating_sub(name_x) as usize;
         write(buf, area, name_x, y, &truncate(&project.name, room), style);
+
+        if let Some(rollup) = rollup {
+            let (glyph, glyph_style) = rollup.glyph(self.spinner, &self.theme);
+            write(buf, area, state_x, y, glyph, glyph_style);
+        }
     }
 
     /// Draws a branch line, faded, where its project's name starts.
@@ -969,7 +1053,12 @@ impl Sidebar<'_> {
         // Two columns in from the frame, so the blank beside it keeps a glyph
         // drawn wider than its cell off the border. The title stops a blank
         // short of it.
-        let (glyph, glyph_style) = state_glyph(pane, &self.theme);
+        let (glyph, glyph_style) = state_glyph(
+            pane,
+            self.state.is_unseen(pane.id),
+            self.spinner,
+            &self.theme,
+        );
         let state_x = (area.x + area.width).saturating_sub(2);
 
         let title_x = x + NAME;

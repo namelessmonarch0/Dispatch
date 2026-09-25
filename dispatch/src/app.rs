@@ -505,6 +505,9 @@ pub struct App {
     clock: Box<dyn Fn() -> Instant>,
     /// Whether the interface animates spinners, pulses, easing and transitions.
     motion: bool,
+    /// When this run started, so every spinner on screen derives its frame
+    /// from the clock rather than keeping one of its own.
+    started: Instant,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -559,6 +562,7 @@ impl App {
             theme: Theme::fallback(),
             clock: Box::new(Instant::now),
             motion: true,
+            started: Instant::now(),
         }
     }
 
@@ -1073,6 +1077,15 @@ impl App {
     /// tested without sleeping.
     fn now(&self) -> Instant {
         (self.clock)()
+    }
+
+    /// Which spinner frame a working pane shows now, from the clock, so every
+    /// spinner on screen turns in step; `None` with motion off.
+    fn spinner_frame(&self) -> Option<usize> {
+        self.motion.then(|| {
+            let elapsed = self.now().saturating_duration_since(self.started);
+            usize::try_from(elapsed.as_millis() / 100).unwrap_or(0) % sidebar::SPINNER.len()
+        })
     }
 
     /// Takes on a pane that now exists, wherever its process is.
@@ -3159,7 +3172,8 @@ impl App {
             Sidebar::new(&self.state)
                 .with_harnesses(&self.harnesses)
                 .with_theme(self.theme)
-                .with_scroll(&self.sidebar_scroll),
+                .with_scroll(&self.sidebar_scroll)
+                .with_spinner(self.spinner_frame()),
             sidebar_area,
         );
         self.sidebar_area = sidebar_area;
@@ -3453,8 +3467,22 @@ impl App {
                 Style::default().fg(self.theme.faded)
             };
 
+            let panes = tileable
+                .chunks(PANES_PER_TAB)
+                .nth(index)
+                .unwrap_or_default();
+            let rollup = sidebar::Rollup::of(
+                &self.state,
+                panes.iter().filter_map(|id| self.state.pane(*id)),
+            );
+
             if index > 0 {
                 spans.push(Span::raw(" "));
+            }
+            if let Some(rollup) = rollup {
+                let (glyph, glyph_style) = rollup.glyph(self.spinner_frame(), &self.theme);
+                spans.push(Span::styled(" ", style));
+                spans.push(Span::styled(glyph, style.patch(glyph_style)));
             }
             spans.push(Span::styled(label, style));
         }
@@ -3485,6 +3513,18 @@ impl App {
         let waiting_reminder = (!self.pending.is_empty()
             && !matches!(self.overlay, Some(Overlay::Approval { .. })))
         .then(|| format!("{} delegation(s) waiting — ^a a", self.pending.len()));
+
+        // A blocked pane on another tab, or in a folded project, still needs
+        // to be found; the status row is the one place always on screen.
+        let blocked = self
+            .state
+            .projects()
+            .iter()
+            .flat_map(|project| self.state.panes_for(project.id))
+            .filter(|pane| !pane.closed && pane.status == PaneStatus::Blocked)
+            .count();
+        let blocked_reminder =
+            (blocked > 0 && self.overlay.is_none()).then(|| format!("{blocked} waiting on you"));
 
         // Read from the `Device.reachable` `sync_attachment` stamps each poll,
         // not asked live: this runs every frame, and re-checking the
@@ -3537,7 +3577,11 @@ impl App {
                 )
             };
 
-            match waiting_reminder {
+            let base = match waiting_reminder {
+                Some(reminder) => format!("{base}  {reminder}"),
+                None => base,
+            };
+            match blocked_reminder {
                 Some(reminder) => format!("{base}  {reminder}"),
                 None => base,
             }
@@ -5113,6 +5157,74 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn a_tab_is_prefixed_with_its_most_urgent_state() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 5);
+        app.state
+            .set_pane_status(panes[1], PaneStatus::Blocked)
+            .expect("exists");
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+        let text = rendered_text(&terminal);
+        let top: String = text
+            .lines()
+            .next()
+            .expect("a row")
+            .chars()
+            .skip(sidebar::WIDTH as usize)
+            .collect();
+
+        assert!(top.contains(&format!("{} 1 ", sidebar::BLOCKED)), "{top:?}");
+        assert!(
+            !top.contains(&format!("{} 2 ", sidebar::BLOCKED)),
+            "tab 2 has nothing blocked: {top:?}"
+        );
+    }
+
+    #[test]
+    fn the_status_row_counts_panes_waiting_on_the_user() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        for pane in &panes[..2] {
+            app.state
+                .set_pane_status(*pane, PaneStatus::Blocked)
+                .expect("exists");
+        }
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+        let text = rendered_text(&terminal);
+
+        assert!(
+            text.lines()
+                .last()
+                .expect("a row")
+                .contains("2 waiting on you"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_spinner_follows_the_clock_and_stops_with_motion_off() {
+        let (mut app, _, _, _) = attached_app();
+        let clock = hand_clock(&mut app);
+        app.started = clock.get();
+
+        advance(&clock, Duration::from_millis(350));
+        assert_eq!(app.spinner_frame(), Some(3));
+
+        app.set_motion(false);
+        assert_eq!(app.spinner_frame(), None);
     }
 
     #[test]
