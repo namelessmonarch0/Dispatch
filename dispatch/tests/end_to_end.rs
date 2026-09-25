@@ -579,8 +579,8 @@ fn a_pane_is_told_the_size_of_the_rectangle_it_was_given() {
     app.send(b"stty size\r");
 
     // One pane fills the width left by the sidebar and the height left by the
-    // status row, less its own border.
-    let expected = reported_size(100 - dispatch_tui::sidebar::WIDTH, 30 - 1);
+    // top row and the status row, less its own border.
+    let expected = reported_size(100 - dispatch_tui::sidebar::WIDTH, 30 - 2);
     assert!(
         app.wait_for(|lines| contains(lines, &expected)),
         "the child should report {expected}"
@@ -601,7 +601,8 @@ fn a_second_pane_halves_the_width_of_the_first() {
     app.send(b"stty size\r");
 
     let full = 100 - dispatch_tui::sidebar::WIDTH;
-    let expected = reported_size(full / 2, 30 - 1);
+    // The top row and the status row both come off the height, as above.
+    let expected = reported_size(full / 2, 30 - 2);
     assert!(
         app.wait_for(|lines| contains(lines, &expected)),
         "with two panes the child should report {expected}"
@@ -621,7 +622,8 @@ fn zoom_gives_a_pane_the_whole_grid_and_gives_it_back() {
 
     app.send(b"\x01z");
     app.send(b"stty size\r");
-    let zoomed = reported_size(full, 30 - 1);
+    // The top row and the status row both come off the height, as above.
+    let zoomed = reported_size(full, 30 - 2);
     assert!(
         app.wait_for(|lines| contains(lines, &zoomed)),
         "a zoomed pane should fill the grid and report {zoomed}"
@@ -629,7 +631,7 @@ fn zoom_gives_a_pane_the_whole_grid_and_gives_it_back() {
 
     app.send(b"\x01z");
     app.send(b"stty size\r");
-    let restored = reported_size(full / 2, 30 - 1);
+    let restored = reported_size(full / 2, 30 - 2);
     assert!(
         app.wait_for(|lines| contains(lines, &restored)),
         "unzooming should restore the grid and report {restored}"

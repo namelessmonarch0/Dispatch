@@ -101,6 +101,11 @@ impl AddMachine {
         &self.prompt
     }
 
+    /// The prompt on screen, for the caller to restyle before drawing it.
+    pub fn prompt_mut(&mut self) -> &mut Prompt {
+        &mut self.prompt
+    }
+
     /// Acts on one key.
     ///
     /// `validate` answers whether a name could be registered, so a taken name

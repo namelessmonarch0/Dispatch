@@ -10,6 +10,7 @@ pub mod ipc;
 pub mod paths;
 pub mod process;
 pub mod signal;
+pub mod tty;
 
 /// Serialises the tests that move the process-wide configuration directory.
 ///

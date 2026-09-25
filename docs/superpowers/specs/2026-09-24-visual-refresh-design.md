@@ -117,10 +117,12 @@ ESC ] 4 ; 5 ; ? BEL   palette slot 5 (magenta), the accent
 ESC [ c               primary device attributes
 ```
 
-and reads replies for at most 200 ms. Every terminal answers device
+and reads replies for at most one second. Every terminal answers device
 attributes, and answers in order, so its reply (`ESC [ ? … c`) arriving means
 every colour reply that is coming has come: reading stops there rather than
-waiting out the timeout on a terminal that ignores OSC queries. Replies
+waiting out the timeout on a terminal that ignores OSC queries. The bound is
+generous because it is only reached when something is wrong: a reply that
+arrived after the event loop started would be read as keystrokes. Replies
 are `ESC ] N ; rgb:R/G/B` terminated by `BEL` or `ESC \`, with 1–4 hex
 digits per channel, scaled to 8 bits. Any colour that did not arrive is taken
 from the fallback palette.
@@ -396,7 +398,7 @@ outside any repository is `None`. Nothing here is ever a message on screen.
 | Situation | Behaviour |
 |---|---|
 | Terminal ignores colour queries | Device-attributes reply ends the wait early; fallback colours |
-| Terminal answers nothing at all | 200 ms timeout; fallback colours |
+| Terminal answers nothing at all | One-second timeout; fallback colours |
 | No 24-bit colour | Tints quantised to xterm-256 |
 | Daemon too old to report branches | No branch rows; panes listed as today |
 | Pane process unreadable or gone | Branch `None`; the pane joins the project's own group |

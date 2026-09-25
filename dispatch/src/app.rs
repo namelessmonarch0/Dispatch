@@ -27,11 +27,12 @@ use dispatch_tui::input::{
     Action, Direction, Event, InputRouter, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseEventKind,
 };
-use dispatch_tui::{Item, PaneWidget, Picker, Prompt, Sidebar, sidebar};
+use dispatch_tui::{Item, PaneWidget, Picker, Prompt, Sidebar, Theme, sidebar};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Widget};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 
 /// How many panes are tiled at once.
 ///
@@ -41,21 +42,27 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Widget};
 /// and all of them are always listed in the sidebar.
 const PANES_PER_TAB: usize = 4;
 
+/// The program's name as the top-left corner spells it, letter-spaced the
+/// way a label rather than a heading is.
+const APP_NAME: &str = "D I S P A T C H";
+
+/// How much of a pane's title a tab shows.
+const TAB_TITLE: usize = 16;
+
 /// The border drawn around one pane.
 ///
-/// A plain thin line, brighter on the focused pane. Rounded corners read as
-/// softer than the square ones the sidebar and status row use, which is enough
-/// to tell a pane's edge from the frame of the interface around it.
-fn pane_block(focused: bool) -> Block<'static> {
-    let colour = if focused {
-        Color::White
+/// Square, like every other edge in the interface: faded when unfocused, and
+/// in the accent on the pane that has the keyboard, with its title in bold.
+fn pane_block(focused: bool, theme: &Theme) -> Block<'static> {
+    let (colour, title) = if focused {
+        (theme.accent, Style::default().add_modifier(Modifier::BOLD))
     } else {
-        Color::DarkGray
+        (theme.faded, Style::default())
     };
 
     Block::bordered()
-        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(colour))
+        .title_style(title)
 }
 
 /// What to write on a pane's border.
@@ -119,6 +126,16 @@ fn strip_mark(title: &str) -> &str {
             )
         })
         .trim()
+}
+
+/// `text` cut to `width` characters, marking the cut with an ellipsis.
+fn clip(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+
+    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
+    format!("{kept}…")
 }
 
 /// Frame budget. A chatty agent can produce output faster than any terminal
@@ -269,6 +286,21 @@ impl Overlay {
             | Overlay::AddMachine(_)
             | Overlay::OpenOn { .. }
             | Overlay::Approval { .. } => None,
+        }
+    }
+
+    /// Draws the overlay's frame in `style`.
+    fn set_border(&mut self, style: Style) {
+        match self {
+            Overlay::Harness(picker)
+            | Overlay::Project(picker)
+            | Overlay::Register(picker)
+            | Overlay::Machine(picker) => picker.set_border(style),
+            Overlay::Browse(browser) => browser.set_border(style),
+            Overlay::OpenOn { prompt, .. } => prompt.set_border(style),
+            Overlay::AddMachine(add) => add.prompt_mut().set_border(style),
+            // Built fresh each frame, with the theme's border already on it.
+            Overlay::Approval { .. } => {}
         }
     }
 }
@@ -441,6 +473,8 @@ pub struct App {
     /// can tell `a` and `A` apart without a real daemon to send it to.
     #[cfg(test)]
     sent: Vec<ClientMessage>,
+    /// The colours Dispatch draws its own chrome in.
+    theme: Theme,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -490,6 +524,7 @@ impl App {
             reopening_selection: None,
             #[cfg(test)]
             sent: Vec::new(),
+            theme: Theme::fallback(),
         }
     }
 
@@ -579,6 +614,11 @@ impl App {
     /// first draw with no sidebar row and no attachment to hang a warning on.
     pub fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
+    }
+
+    /// Draws the interface in `theme` from the next frame on.
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
     }
 
     /// The daemons this client is holding, or nothing when it holds none.
@@ -2320,6 +2360,7 @@ impl App {
             task: &request.task,
             waiting: self.pending.len().saturating_sub(1),
             scroll,
+            border: Style::default().fg(self.theme.faded),
         })
     }
 
@@ -2885,16 +2926,24 @@ impl App {
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
 
-        let sidebar_width = sidebar::WIDTH.min(area.width);
-        let sidebar_area = Rect::new(area.x, area.y, sidebar_width, area.height);
+        // One row across the top for the name and the tabs, one along the
+        // bottom for status, and everything between for the sidebar and the
+        // panes.
+        let top = Rect::new(area.x, area.y, area.width, area.height.min(1));
+        let body = Rect::new(
+            area.x,
+            area.y + top.height,
+            area.width,
+            area.height.saturating_sub(top.height + 1),
+        );
 
-        // One row at the bottom for status.
-        let body_height = area.height.saturating_sub(1);
+        let sidebar_width = sidebar::WIDTH.min(area.width);
+        let sidebar_area = Rect::new(body.x, body.y, sidebar_width, body.height);
         let panes_area = Rect::new(
-            area.x + sidebar_width,
-            area.y,
-            area.width.saturating_sub(sidebar_width),
-            body_height,
+            body.x + sidebar_width,
+            body.y,
+            body.width.saturating_sub(sidebar_width),
+            body.height,
         );
 
         frame.render_widget(
@@ -2903,21 +2952,11 @@ impl App {
         );
         self.sidebar_area = sidebar_area;
 
-        // One row above the grid, and only once there is a second tab: a row
-        // saying "1" and nothing else is a row of output given away for no
-        // information.
-        let panes_area = if self.tab_count() > 1 {
-            let tabs_row = Rect::new(panes_area.x, panes_area.y, panes_area.width, 1);
-            self.draw_tabs(frame, tabs_row);
-            Rect::new(
-                panes_area.x,
-                panes_area.y + 1,
-                panes_area.width,
-                panes_area.height.saturating_sub(1),
-            )
-        } else {
-            panes_area
-        };
+        self.draw_name(frame, Rect::new(top.x, top.y, sidebar_width, top.height));
+        self.draw_tabs(
+            frame,
+            Rect::new(panes_area.x, top.y, panes_area.width, top.height),
+        );
 
         self.frames = self.compute_frames(panes_area);
         self.layout = self
@@ -2933,6 +2972,11 @@ impl App {
 
     /// Draws whichever overlay is open, if any.
     fn draw_overlay(&mut self, frame: &mut Frame<'_>, panes_area: Rect) {
+        let border = Style::default().fg(self.theme.faded);
+        if let Some(overlay) = &mut self.overlay {
+            overlay.set_border(border);
+        }
+
         let Some(overlay) = &self.overlay else {
             return;
         };
@@ -3107,7 +3151,7 @@ impl App {
 
     /// The area inside a tile's border, which is what the pane itself owns.
     fn interior(frame: Rect) -> Rect {
-        pane_block(false).inner(frame)
+        Block::bordered().inner(frame)
     }
 
     fn draw_panes(&mut self, frame: &mut Frame<'_>) {
@@ -3126,7 +3170,7 @@ impl App {
             // sidebar. Without it two panes of similarly-coloured text read as
             // one pane with a very confusing wrap.
             frame.render_widget(
-                pane_block(is_focused).title(pane_title(&self.state, *id)),
+                pane_block(is_focused, &self.theme).title(pane_title(&self.state, *id)),
                 *outer,
             );
 
@@ -3146,38 +3190,60 @@ impl App {
         }
     }
 
+    /// Writes the program's name in the top row, over the sidebar's column.
+    fn draw_name(&self, frame: &mut Frame<'_>, area: Rect) {
+        if area.height == 0 || area.width < 2 {
+            return;
+        }
+
+        // One column in, where the sidebar's own text starts below it.
+        let row = Rect::new(area.x + 1, area.y, area.width - 1, 1);
+        Paragraph::new(APP_NAME)
+            .style(Style::default().fg(self.theme.faded))
+            .render(row, frame.buffer_mut());
+    }
+
     /// Draws the row of tabs above the grid.
+    ///
+    /// Each is its number and its first pane's title. The one on screen sits
+    /// on a tint rather than being inverted: it should read as the one you
+    /// are in, not as a warning.
     fn draw_tabs(&self, frame: &mut Frame<'_>, area: Rect) {
         if area.height == 0 {
             return;
         }
 
         let current = self.current_tab();
+        let tileable = self.tileable();
         let mut spans = Vec::new();
 
         for index in 0..self.tab_count() {
-            let panes = self
-                .tileable()
+            let title = tileable
                 .chunks(PANES_PER_TAB)
                 .nth(index)
-                .map_or(0, <[PaneId]>::len);
+                .and_then(<[PaneId]>::first)
+                .and_then(|id| self.state.pane(*id))
+                .map(|pane| clip(&pane.title, TAB_TITLE));
 
+            let label = match title {
+                Some(title) => format!(" {} {title} ", index + 1),
+                None => format!(" {} ", index + 1),
+            };
             let style = if index == current {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Gray)
+                    .bg(self.theme.tab)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(self.theme.faded)
             };
 
-            spans.push(ratatui::text::Span::styled(
-                format!(" {} ({panes}) ", index + 1),
-                style,
-            ));
+            if index > 0 {
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(label, style));
         }
 
-        Paragraph::new(ratatui::text::Line::from(spans)).render(area, frame.buffer_mut());
+        Paragraph::new(Line::from(spans)).render(area, frame.buffer_mut());
     }
 
     fn draw_status(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -3263,11 +3329,10 @@ impl App {
 
         let style = if self.router.is_armed() {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
+                .bg(self.theme.tab)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(self.theme.faded)
         };
 
         Paragraph::new(text)
@@ -3325,6 +3390,7 @@ mod tests {
     use std::sync::mpsc::{Receiver, Sender};
 
     use dispatch_core::{PaneRole, Project, ProjectSource};
+    use ratatui::style::Color;
 
     /// An `App` attached to a daemon that says only what a test tells it to,
     /// with one project already announced.
@@ -4558,13 +4624,14 @@ mod tests {
     fn a_click_on_a_project_row_selects_it_and_folds_its_panes() {
         let (mut app, _terminal, first, _parent, _child) = app_with_a_drawn_sidebar();
 
-        // The first row inside the sidebar's frame is the first project.
-        click(&mut app, 1, 1);
+        // The first row inside the sidebar's frame — below the top row and
+        // the frame's own edge — is the first project.
+        click(&mut app, 1, 2);
 
         assert_eq!(app.state.selected_project(), Some(first));
         assert!(app.state.is_project_collapsed(first), "and it folds");
 
-        click(&mut app, 1, 1);
+        click(&mut app, 1, 2);
         assert!(!app.state.is_project_collapsed(first), "and unfolds again");
     }
 
@@ -4574,8 +4641,8 @@ mod tests {
 
         let _ = app.state.focus(child);
         // A pane row is indented two columns inside the frame, and its twisty
-        // is the first of them.
-        click(&mut app, 3, 2);
+        // is the first of them — one row lower than before the top row.
+        click(&mut app, 3, 3);
 
         assert!(app.state.is_pane_collapsed(parent));
         assert_eq!(
@@ -4590,7 +4657,8 @@ mod tests {
         let (mut app, _terminal, _first, parent, child) = app_with_a_drawn_sidebar();
 
         let _ = app.state.focus(child);
-        click(&mut app, 8, 2);
+        // One row lower than before the top row.
+        click(&mut app, 8, 3);
 
         assert_eq!(app.state.focused_pane(), Some(parent));
         assert!(!app.state.is_pane_collapsed(parent), "and folds nothing");
@@ -4609,6 +4677,108 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn the_top_row_carries_the_name_and_the_tabs() {
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let pane = app
+            .state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+        app.state
+            .set_pane_title(pane, "refactor")
+            .expect("the pane exists");
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+
+        let text = rendered_text(&terminal);
+        let top = text.lines().next().expect("the frame has rows");
+        let over_sidebar: String = top.chars().take(sidebar::WIDTH as usize).collect();
+        let over_panes: String = top.chars().skip(sidebar::WIDTH as usize).collect();
+
+        assert_eq!(over_sidebar.trim(), APP_NAME, "{top:?}");
+        assert!(
+            over_panes.contains("1 refactor"),
+            "a lone tab is still drawn, named for its pane: {top:?}"
+        );
+    }
+
+    #[test]
+    fn the_active_tab_is_tinted_rather_than_inverted() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 5);
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+        let buf = terminal.backend().buffer();
+        let theme = Theme::fallback();
+
+        let top: Vec<&ratatui::buffer::Cell> = (sidebar::WIDTH..buf.area.width)
+            .filter_map(|x| buf.cell((x, 0)))
+            .collect();
+        let active = top
+            .iter()
+            .find(|cell| cell.symbol() == "2")
+            .expect("the focused pane's tab is drawn");
+        let inactive = top
+            .iter()
+            .find(|cell| cell.symbol() == "1")
+            .expect("the other tab is drawn");
+
+        assert_eq!(active.bg, theme.tab, "the fifth pane is focused, on tab 2");
+        assert!(!active.modifier.contains(Modifier::REVERSED));
+        assert_eq!(inactive.fg, theme.faded);
+        assert_eq!(inactive.bg, Color::Reset);
+    }
+
+    #[test]
+    fn pane_corners_are_square() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 2);
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+        let text = rendered_text(&terminal);
+
+        assert!(!text.contains('╭') && !text.contains('╯'), "{text}");
+        let panes: String = text
+            .lines()
+            .map(|line| {
+                line.chars()
+                    .skip(sidebar::WIDTH as usize)
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(panes.contains('┌') && panes.contains('┘'), "{text}");
+    }
+
+    #[test]
+    fn a_terminal_smaller_than_the_sidebar_still_draws() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 3);
+
+        for (width, height) in [(1, 1), (5, 2), (10, 3), (20, 4), (40, 2)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                    .expect("a test backend can be created");
+            terminal
+                .draw(|frame| app.draw(frame))
+                .expect("drawing into a tiny terminal does not fail");
+        }
     }
 
     /// A terminal sized so the approval prompt's own inner content area comes

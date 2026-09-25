@@ -269,6 +269,7 @@ fn main() -> Result<ExitCode> {
     // stdout and every exit path has to restore it.
     install_panic_hook();
     let mut guard = TerminalGuard::acquire()?;
+    app.set_theme(guard.theme());
 
     run(&mut app, &mut guard)?;
     Ok(ExitCode::SUCCESS)

@@ -6,6 +6,7 @@
 //! reports mouse movement as garbage.
 
 use std::io::{Stdout, stdout};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -15,8 +16,17 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use dispatch_tui::theme::{self, Depth, Replies, Theme};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+
+/// How long the terminal is given to say what its colours are.
+///
+/// An upper bound rather than a wait: the device-attributes reply ends it as
+/// soon as the terminal has answered, which locally takes a millisecond or
+/// two. Long enough for an SSH round trip, because an answer that arrives
+/// after the event loop has started is read as keystrokes.
+const ASK_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A terminal that restores itself.
 ///
@@ -25,12 +35,18 @@ use ratatui::backend::CrosstermBackend;
 /// backtrace.
 pub struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    theme: Theme,
 }
 
 impl TerminalGuard {
     /// Takes over the terminal.
     pub fn acquire() -> Result<Self> {
         enable_raw_mode().context("failed to put the terminal into raw mode")?;
+
+        // Raw, so the answers are neither echoed nor held back for a newline;
+        // before the alternate screen and the event loop, so nothing else is
+        // reading yet.
+        let theme = ask_for_theme();
 
         let mut out = stdout();
         execute!(
@@ -46,12 +62,18 @@ impl TerminalGuard {
         let terminal = Terminal::new(CrosstermBackend::new(out))
             .context("failed to create the terminal backend")?;
 
-        Ok(Self { terminal })
+        Ok(Self { terminal, theme })
     }
 
     /// The ratatui terminal, for drawing.
     pub fn terminal(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
         &mut self.terminal
+    }
+
+    /// The colours Dispatch draws its chrome in, mixed from what the terminal
+    /// said its own are.
+    pub fn theme(&self) -> Theme {
+        self.theme
     }
 
     /// Undoes everything `acquire` did.
@@ -88,4 +110,14 @@ pub fn install_panic_hook() {
         TerminalGuard::restore();
         default(info);
     }));
+}
+
+/// Asks the terminal for its colours and mixes Dispatch's from them.
+fn ask_for_theme() -> Theme {
+    let answer = dispatch_os::tty::ask(theme::QUERY, ASK_TIMEOUT, |bytes| {
+        Replies::parse(bytes).done
+    });
+    let depth = Depth::from_colorterm(std::env::var("COLORTERM").ok().as_deref());
+
+    Theme::new(Replies::parse(&answer).palette(), depth)
 }

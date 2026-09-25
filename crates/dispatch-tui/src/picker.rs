@@ -45,6 +45,9 @@ pub struct Picker {
     pub title: String,
     items: Vec<Item>,
     selected: usize,
+    /// The frame's colour, set by whoever draws the overlay so it matches
+    /// the rest of the interface.
+    border: Style,
 }
 
 impl Picker {
@@ -55,7 +58,13 @@ impl Picker {
             title: title.into(),
             items,
             selected: 0,
+            border: Style::default().fg(Color::Cyan),
         }
+    }
+
+    /// Draws the frame in `style`.
+    pub fn set_border(&mut self, style: Style) {
+        self.border = style;
     }
 
     /// The rows.
@@ -146,7 +155,7 @@ impl Widget for &Picker {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" {} ", self.title))
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.border);
         let inner = block.inner(rect);
         block.render(rect, buf);
 
