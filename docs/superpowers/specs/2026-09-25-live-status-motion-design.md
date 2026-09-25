@@ -88,8 +88,10 @@ enum travels inside `PaneUpdate::Status`, but a daemon never sends
 `Blocked`, so no older client ever meets it.
 
 **Done** is not a status. `AppState` gains `unseen: HashSet<PaneId>`, with
-`mark_unseen`, `is_unseen`, and clearing on `focus`. It is client state, like
-the folded rows.
+`mark_unseen`, `is_unseen`, and `mark_seen`. `AppState::focus` itself leaves
+the mark alone; the client calls `mark_seen` for the focused pane on each
+activity poll, so the mark clears shortly after focus rather than at the
+keystroke. It is client state, like the folded rows.
 
 ## Signals
 
@@ -391,9 +393,9 @@ the warning glyph and the done mark remain.
   idle only after a further 700 ms; echo ignored; blocked immediate in and
   out; idle-rule screen with fresh output stays working.
 - **App**, on a hand-advanced clock: a pane going working → idle unfocused is
-  marked done and focusing clears it; a bell marks an unfocused pane; no
-  marks inside the 3 s grace; scrolled-back panes are not evaluated; the
-  status row's "waiting on you".
+  marked done, and the next activity poll after it is focused clears the
+  mark; a bell marks an unfocused pane; no marks inside the 3 s grace;
+  scrolled-back panes are not evaluated; the status row's "waiting on you".
 - **Presentation**: each glyph and colour; spinner frame follows the clock;
   folded-project rollup order; tab prefix; no rollup on an open project.
 - **Motion**: `Tween` easing and bounds; `next_frame` for tweens, spinners,
