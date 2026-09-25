@@ -406,6 +406,7 @@ dependencies = [
  "dispatch-pty",
  "ratatui",
  "thiserror 2.0.20",
+ "toml",
  "tracing",
  "unicode-width 0.2.0",
 ]
