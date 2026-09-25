@@ -3151,6 +3151,7 @@ impl App {
     fn send_mouse(&mut self, id: PaneId, input: MouseInput) {
         use dispatch_pty::MouseButton;
 
+        let now = self.now();
         let wheel = match input.button {
             MouseButton::WheelUp => Some(-3),
             MouseButton::WheelDown => Some(3),
@@ -3187,6 +3188,10 @@ impl App {
         if !bytes.is_empty() {
             if let Err(error) = pane.backend.write(&bytes) {
                 tracing::warn!(%error, "failed to send a pointer event to a pane");
+            } else {
+                // Input like a keystroke: what the pane draws in answer — a
+                // highlight, a moved cursor — is not the agent at work.
+                pane.activity.input(now);
             }
             return;
         }
@@ -3981,6 +3986,7 @@ impl App {
     /// A child that is not told its new size redraws to the old one, which is
     /// the most visible bug this layer can have.
     pub fn resize_panes(&mut self) {
+        let now = self.now();
         let layout = self.layout.clone();
 
         for (id, rect) in layout {
@@ -4006,6 +4012,9 @@ impl App {
                 tracing::warn!(%error, "failed to resize a pane");
                 continue;
             }
+            // The program repaints to fit, and that repaint is this resize's
+            // doing rather than the program at work.
+            pane.activity.resized(now);
 
             if let Ok(screen) = pane.reader.read(pane.backend.terminal()) {
                 pane.screen = screen;
@@ -4251,6 +4260,98 @@ mod tests {
             status_of(&app, pane),
             PaneStatus::Idle,
             "the echo of a keystroke is not the agent working"
+        );
+    }
+
+    #[test]
+    fn the_repaint_after_a_resize_is_not_work() {
+        // Every agent and shell repaints on SIGWINCH. A pane that is resized
+        // because a sibling opened, closed or the terminal changed size has
+        // done nothing; counted as work, it would spin and then be marked
+        // done having finished nothing.
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let background = panes[0];
+        assert_ne!(app.state.focused_pane(), Some(background));
+        let mut small = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut small);
+        app.resize_panes();
+
+        advance(&clock, Duration::from_secs(4));
+        app.poll_panes();
+        assert_eq!(status_of(&app, background), PaneStatus::Idle);
+        let before = app.panes[&background].backend.size();
+
+        let mut large = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut large);
+        app.resize_panes();
+        assert_ne!(
+            app.panes[&background].backend.size(),
+            before,
+            "the unfocused pane was resized"
+        );
+
+        advance(&clock, Duration::from_millis(50));
+        print(&mut app, &daemon, background, b"\x1b[H\x1b[2Jrepainted\r\n");
+        for _ in 0..20 {
+            advance(&clock, Duration::from_millis(100));
+            app.poll_panes();
+            assert_eq!(
+                status_of(&app, background),
+                PaneStatus::Idle,
+                "a repaint is not work"
+            );
+        }
+        settle(&mut app, &clock);
+
+        assert!(
+            !app.state.is_unseen(background),
+            "and it finished nothing, so it is not done"
+        );
+    }
+
+    #[test]
+    fn what_a_pane_prints_in_answer_to_a_click_is_not_work() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        // Asks for the mouse while it starts, as a full-screen agent does.
+        print(&mut app, &daemon, pane, b"\x1b[?1000h\x1b[?1006h");
+        advance(&clock, Duration::from_secs(4));
+        app.poll_panes();
+        advance(&clock, Duration::from_millis(800));
+        app.poll_panes();
+        assert_eq!(status_of(&app, pane), PaneStatus::Idle);
+        let _ = sent.try_iter().count();
+
+        app.send_mouse(
+            pane,
+            MouseInput {
+                action: dispatch_pty::MouseAction::Press,
+                button: dispatch_pty::MouseButton::Left,
+                col: 2,
+                row: 1,
+                modifiers: dispatch_pty::Modifiers::default(),
+            },
+        );
+        assert!(
+            sent.try_iter()
+                .any(|m| matches!(m, ClientMessage::WritePane { pane: p, .. } if p == pane)),
+            "the click reached the pane"
+        );
+        advance(&clock, Duration::from_millis(40));
+        print(&mut app, &daemon, pane, b"\x1b[2;3Hclicked");
+        advance(&clock, Duration::from_millis(200));
+        app.poll_panes();
+
+        assert_eq!(
+            status_of(&app, pane),
+            PaneStatus::Idle,
+            "the answer to a click is not the agent working"
         );
     }
 

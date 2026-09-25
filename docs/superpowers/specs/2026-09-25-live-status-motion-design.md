@@ -98,8 +98,12 @@ keystroke. It is client state, like the folded rows.
 Per pane, in the client — which already keeps an emulator for every pane,
 remote ones included:
 
-- **Output activity**: when bytes last arrived. Output within 150 ms of a key
-  or paste this client sent to that pane is echo and does not count.
+- **Output activity**: when bytes last arrived. Output within 150 ms of a key,
+  paste or pointer event this client sent to that pane is echo and does not
+  count; nor does output within 500 ms of this client resizing the pane,
+  which is the program repainting to fit. A resize follows every pane
+  opening or closing beside it and every change of terminal size, and the
+  longer window covers a remote pane's round trip through the daemon.
 - **Title**: the raw title the program last set, spinner mark included. The
   client already strips the mark for display; it now keeps the raw string
   beside it.
@@ -198,8 +202,10 @@ pub struct Tracker { /* rules, timings, last signals, current state */ }
 
 impl Tracker {
     pub fn new(rules: Arc<StatusRules>) -> Self;
-    /// We sent the pane a keystroke or paste.
+    /// We sent the pane a keystroke, paste or pointer event.
     pub fn input(&mut self, now: Instant);
+    /// We told the pane its new size; its repaint within 500 ms is ignored.
+    pub fn resized(&mut self, now: Instant);
     /// Output arrived; within 150 ms of our own input it is echo and ignored.
     pub fn output(&mut self, now: Instant);
     pub fn signals(&mut self, signals: &Signals);
@@ -306,8 +312,8 @@ one, continuing from where it had got to, so fast focus changes never queue.
 
 `App` reads time through `clock: Box<dyn Fn() -> Instant>` — `Instant::now` in
 the binary; tests supply one they advance by hand, so animations and the
-detection timings (150 ms echo, 1 s activity, 700 ms damping, 3 s grace) are
-tested exactly, without sleeping.
+detection timings (150 ms echo, 500 ms repaint, 1 s activity, 700 ms damping,
+3 s grace) are tested exactly, without sleeping.
 
 ### Frame pacing
 
@@ -374,6 +380,7 @@ the warning glyph and the done mark remain.
 | An agent's UI changes and no rule matches | Falls to activity and idle, never to blocked |
 | A prompt the rules do not know | Idle, not blocked — strict, as herdr |
 | Typing into a pane | Echo within 150 ms of our own input is not activity |
+| A pane resized — a sibling opened or closed, the terminal resized | Its repaint within 500 ms is not activity |
 | Reattaching to a daemon | Replayed output flashes working briefly; no done marks within 3 s |
 | Scrolled back in a pane | Detection holds its last state |
 | Terminal without 24-bit colour | Animated colours step through the 256-colour palette |

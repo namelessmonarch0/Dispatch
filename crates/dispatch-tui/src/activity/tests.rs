@@ -98,6 +98,28 @@ fn the_echo_of_input_is_not_activity() {
 }
 
 #[test]
+fn the_redraw_after_a_resize_is_not_activity() {
+    let start = Instant::now();
+    let mut tracker = Tracker::new(none());
+    tracker.evaluate(start, &[]);
+
+    tracker.resized(start + MS(100));
+    tracker.output(start + MS(590));
+    assert_eq!(
+        tracker.evaluate(start + MS(600), &[]),
+        None,
+        "redrawing to the new size is not work"
+    );
+
+    tracker.output(start + MS(700));
+    assert_eq!(
+        tracker.evaluate(start + MS(710), &[]),
+        Some(Verdict::Working),
+        "output once the redraw is over is the program's own"
+    );
+}
+
+#[test]
 fn blocked_is_reported_at_once_and_left_at_once() {
     let start = Instant::now();
     let mut tracker = Tracker::new(rules(
