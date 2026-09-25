@@ -1974,3 +1974,201 @@ fn closing_an_unknown_project_is_reported() {
         }
     )));
 }
+
+/// Makes `dir` a repository on `branch`, as far as reading `HEAD` goes.
+fn check_out(dir: &Path, branch: &str) {
+    std::fs::create_dir_all(dir.join(".git")).expect("temp dir is writable");
+    std::fs::write(
+        dir.join(".git").join("HEAD"),
+        format!("ref: refs/heads/{branch}\n"),
+    )
+    .expect("temp dir is writable");
+}
+
+/// A daemon with one project in a repository on `main`, looking at branches
+/// on every tick rather than every two seconds.
+fn daemon_in_a_repository(label: &str) -> (Daemon, ProjectId, TempDir) {
+    let dir = TempDir::new(label);
+    check_out(&dir.0, "main");
+    let registry = harnesses(&dir.0.join("harnesses"));
+
+    let mut daemon = Daemon::new(registry, "test-device");
+    daemon.branch_every = Duration::ZERO;
+    let root = dispatch_os::paths::resolve(&dir.0).expect("the temp dir resolves");
+    let project = daemon.open_project(root);
+
+    (daemon, project, dir)
+}
+
+/// The pane a `PaneSpawned` among `messages` announced.
+fn spawned_pane(messages: &[ServerMessage]) -> Option<PaneId> {
+    messages.iter().find_map(|message| match message {
+        ServerMessage::PaneSpawned { pane, .. } => Some(*pane),
+        _ => None,
+    })
+}
+
+/// The branch last reported for `pane`, if any report was seen.
+fn last_branch(messages: &[ServerMessage], pane: PaneId) -> Option<Option<String>> {
+    messages.iter().rev().find_map(|message| match message {
+        ServerMessage::PaneChanged {
+            pane: changed,
+            update: PaneUpdate::Branch { branch },
+        } if *changed == pane => Some(branch.clone()),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_project_in_a_repository_is_announced_with_its_branch() {
+    let (mut daemon, project, _dir) = daemon_in_a_repository("branch-open");
+    let inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+
+    let announced = drain(&inbox)
+        .into_iter()
+        .find_map(|message| match message {
+            ServerMessage::ProjectOpened { project: opened } if opened.id == project => {
+                Some(opened)
+            }
+            _ => None,
+        })
+        .expect("the project is announced on subscribe");
+
+    assert_eq!(announced.branch.as_deref(), Some("main"));
+}
+
+#[test]
+fn switching_a_projects_branch_is_announced() {
+    let (mut daemon, project, dir) = daemon_in_a_repository("branch-switch");
+    let inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let _ = drain(&inbox);
+
+    check_out(&dir.0, "feat/tabs");
+
+    wait_for(&mut daemon, &inbox, |messages| {
+        messages.iter().any(|message| {
+            matches!(
+                message,
+                ServerMessage::ProjectChanged {
+                    project: changed,
+                    update: ProjectUpdate::Branch { branch: Some(branch) },
+                } if *changed == project && branch == "feat/tabs"
+            )
+        })
+    });
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_pane_reports_the_branch_of_the_directory_its_shell_is_in() {
+    let (mut daemon, project, dir) = daemon_in_a_repository("branch-pane");
+    check_out(&dir.0.join("wt"), "feat/wt");
+
+    let inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let _ = drain(&inbox);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::SpawnPane {
+            project,
+            harness: "shell".into(),
+            size: (80, 24),
+        },
+    );
+
+    let seen = wait_for(&mut daemon, &inbox, |messages| {
+        spawned_pane(messages).and_then(|pane| last_branch(messages, pane))
+            == Some(Some("main".into()))
+    });
+    let pane = spawned_pane(&seen).expect("the pane was announced");
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane,
+            bytes: b"cd wt\n".to_vec(),
+        },
+    );
+    wait_for(&mut daemon, &inbox, |messages| {
+        last_branch(messages, pane) == Some(Some("feat/wt".into()))
+    });
+
+    // A client attaching now is told where the pane is, rather than left to
+    // wait for it to move again.
+    let late = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+    assert_eq!(
+        last_branch(&drain(&late), pane),
+        Some(Some("feat/wt".into()))
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_exited_pane_keeps_the_branch_it_last_had() {
+    // Between its process exiting and the exit being noticed, a pane's
+    // directory cannot be read. Reporting that as "no branch" would bounce
+    // the finished pane out of its group for no reason.
+    let (mut daemon, project, _dir) = daemon_in_a_repository("branch-exit");
+    let inbox = daemon.attach_for_test(1);
+    daemon.request_for_test(1, hello());
+    daemon.request_for_test(1, ClientMessage::Subscribe);
+    let _ = drain(&inbox);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::SpawnPane {
+            project,
+            harness: "shell".into(),
+            size: (80, 24),
+        },
+    );
+    let seen = wait_for(&mut daemon, &inbox, |messages| {
+        spawned_pane(messages).and_then(|pane| last_branch(messages, pane))
+            == Some(Some("main".into()))
+    });
+    let pane = spawned_pane(&seen).expect("the pane was announced");
+    // Kept rather than shadowed: broadcasting only ever happens on a change,
+    // so this pane's one and only `Branch` report is the one already seen
+    // above, and "the last word" has to be read across the whole history or
+    // there will be no word here at all.
+    let mut all = seen;
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane,
+            bytes: b"exit\n".to_vec(),
+        },
+    );
+    all.extend(wait_for(&mut daemon, &inbox, |messages| {
+        messages.iter().any(|message| {
+            matches!(
+                message,
+                ServerMessage::PaneChanged {
+                    pane: changed,
+                    update: PaneUpdate::Status { status: PaneStatus::Exited(_) },
+                } if *changed == pane
+            )
+        })
+    }));
+
+    for _ in 0..20 {
+        daemon.tick();
+        all.extend(drain(&inbox));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(
+        last_branch(&all, pane),
+        Some(Some("main".into())),
+        "the last word on the pane's branch is still main: {all:#?}"
+    );
+}

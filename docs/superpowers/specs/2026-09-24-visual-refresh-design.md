@@ -385,9 +385,11 @@ same looking as the daemon does, in
 `poll_panes`, on the same cadence, with the same two functions, for its own
 panes and the projects on its own machine.
 
-The cost is a handful of small file reads per pane every two seconds. Any
-failure — a process that has exited, one owned by another user, a directory
-outside any repository — is `None`, never a message on screen.
+The cost is a handful of small file reads per pane every two seconds.
+A pane whose directory cannot be read — a process between exiting and
+being reaped, or one owned by another user — keeps the branch it last had
+rather than being reported as on none. A directory that can be read but is
+outside any repository is `None`. Nothing here is ever a message on screen.
 
 ## Failure cases
 

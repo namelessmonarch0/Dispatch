@@ -43,6 +43,9 @@ pub struct DaemonPane {
     /// waiting on this pane's output cannot be answered at the exit. This is how
     /// long that wait has lasted.
     pub exited_at: Option<std::time::Instant>,
+    /// The branch last reported to clients, so a look that finds the same
+    /// one says nothing.
+    pub branch: Option<String>,
 }
 
 impl DaemonPane {
