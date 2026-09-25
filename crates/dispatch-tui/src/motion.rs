@@ -129,6 +129,16 @@ impl<K: Copy + Eq + Hash> Animations<K> {
         self.running.values().any(|(tween, _)| !tween.done(now))
     }
 
+    /// Whether the store holds nothing: no tween moving, and none finished
+    /// but not yet swept.
+    ///
+    /// A finished tween still owes a frame: the one that sweeps it up and so
+    /// draws what it animated at rest.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.running.is_empty()
+    }
+
     /// Forgets the tweens that have finished by `now`, returning their keys.
     pub fn sweep(&mut self, now: Instant) -> Vec<K> {
         let finished: Vec<K> = self

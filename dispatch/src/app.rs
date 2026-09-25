@@ -494,6 +494,17 @@ pub struct App {
     ///
     /// Only drawing wants this; everything else means [`App::layout`].
     frames: Vec<(PaneId, Rect)>,
+    /// The area [`App::frames`] was laid out for.
+    ///
+    /// What a hold is stamped with, rather than the area of the frame that
+    /// starts it: a terminal that shrank since the last frame would otherwise
+    /// hold tiles that no longer fit on screen.
+    frames_area: Rect,
+    /// The project whose panes [`App::frames`] holds.
+    ///
+    /// Switching to another project swaps the whole grid; its panes going
+    /// off screen is not them closing.
+    frames_project: Option<ProjectId>,
 
     /// Where the sidebar was drawn last frame.
     ///
@@ -632,6 +643,8 @@ impl App {
             harnesses,
             router: InputRouter::new(),
             frames: Vec::new(),
+            frames_area: Rect::default(),
+            frames_project: None,
             layout: Vec::new(),
             sidebar_area: Rect::default(),
             sidebar_scroll: sidebar::Scroll::new(),
@@ -1247,9 +1260,13 @@ impl App {
     /// running needs about thirty a second, a spinner ten, and nothing
     /// moving needs none — a still Dispatch draws only when something
     /// changes.
+    ///
+    /// A tween that has finished but not been swept up still asks: the frame
+    /// that sweeps it is the one that shows its end, and a closed pane's tile
+    /// holds the grid until that frame is drawn.
     #[must_use]
-    pub fn next_frame(&self, now: Instant) -> Option<Duration> {
-        if self.animations.active(now) {
+    pub fn next_frame(&self, _now: Instant) -> Option<Duration> {
+        if !self.animations.is_empty() {
             return Some(TWEEN_FRAME);
         }
 
@@ -3599,9 +3616,12 @@ impl App {
     /// place for a moment while its border retracts, and the rest of the grid
     /// keeps its shape for drawing and input alike until the last such tile
     /// is gone; then everything reflows once. A resize ends that at once:
-    /// held tiles belong to a screen that no longer exists.
+    /// held tiles belong to a screen that no longer exists. So does a switch
+    /// to another project, whose grid has nothing to do with this one's.
     fn lay_out(&mut self, area: Rect, now: Instant) -> Vec<(PaneId, Rect)> {
         let tileable = self.tileable();
+        let project = self.state.selected_project();
+        let switched = project != self.frames_project;
 
         let finished = self
             .closing
@@ -3613,35 +3633,53 @@ impl App {
                 .retain(|(id, _)| self.animations.value(Target::Close(*id), now).is_some());
         }
 
-        let leaving: Vec<(PaneId, Rect)> = self
-            .frames
-            .iter()
-            .filter(|(id, _)| !tileable.contains(id))
-            .copied()
-            .collect();
+        // Only a pane that has actually gone is leaving: closed, exited, or
+        // no longer known at all. One folded back under its parent is still
+        // running, and the grid simply goes on without it.
+        let leaving: Vec<(PaneId, Rect)> = if switched {
+            Vec::new()
+        } else {
+            self.frames
+                .iter()
+                .filter(|(id, _)| {
+                    !tileable.contains(id)
+                        && self
+                            .state
+                            .pane(*id)
+                            .is_none_or(|pane| pane.closed || !pane.status.is_live())
+                })
+                .copied()
+                .collect()
+        };
         if self.animations.enabled() {
             for (id, rect) in leaving {
                 self.animations.start(Target::Close(id), now, CLOSE, 0.0);
                 self.closing.push((id, rect));
                 if self.held.is_none() {
-                    self.held = Some((area, self.frames.clone()));
+                    self.held = Some((self.frames_area, self.frames.clone()));
                 }
             }
         }
 
-        if self.closing.is_empty() || self.held.as_ref().is_some_and(|(held, _)| *held != area) {
+        if switched
+            || self.closing.is_empty()
+            || self.held.as_ref().is_some_and(|(held, _)| *held != area)
+        {
             self.held = None;
             self.closing.clear();
         }
 
-        match &self.held {
+        let frames = match &self.held {
             Some((_, frames)) => frames
                 .iter()
                 .filter(|(id, _)| tileable.contains(id))
                 .copied()
                 .collect(),
             None => self.compute_frames(area),
-        }
+        };
+        self.frames_area = area;
+        self.frames_project = project;
+        frames
     }
 
     /// The area inside a tile's border, which is what the pane itself owns.
@@ -3696,13 +3734,19 @@ impl App {
         }
 
         for (id, rect) in &self.closing {
+            // Kept to the grid this frame is drawn in: a tile is never drawn
+            // past the edge of the screen, whatever the screen did since.
+            let rect = rect.intersection(self.frames_area);
+            if rect.is_empty() {
+                continue;
+            }
             let t = self
                 .animations
                 .value(Target::Close(*id), now)
                 .unwrap_or(1.0);
-            Clear.render(*rect, frame.buffer_mut());
-            frame.render_widget(pane_block(self.theme.faded, false), *rect);
-            mask_border(frame.buffer_mut(), *rect, 1.0 - t);
+            Clear.render(rect, frame.buffer_mut());
+            frame.render_widget(pane_block(self.theme.faded, false), rect);
+            mask_border(frame.buffer_mut(), rect, 1.0 - t);
         }
 
         // Placing the real cursor is what makes typing feel native rather
@@ -5980,6 +6024,126 @@ mod tests {
                 "{rect:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_held_grid_lifts_on_its_own_once_the_tile_has_retracted() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        // Nothing spinning, so nothing but the animations asks for frames.
+        for pane in &panes {
+            app.state
+                .set_pane_status(*pane, PaneStatus::Idle)
+                .expect("exists");
+        }
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        let before = app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == panes[0])
+            .expect("tiled")
+            .1;
+
+        // The close is input, so it is drawn at once; from then on frames
+        // come only when `next_frame` asks for them, as in `main.rs`.
+        app.close_focused();
+        drawn(&mut app, &mut terminal);
+        let mut last_draw = app.now();
+        for _ in 0..250 {
+            advance(&clock, Duration::from_millis(1));
+            let now = app.now();
+            if app
+                .next_frame(now)
+                .is_some_and(|every| now.duration_since(last_draw) >= every)
+            {
+                drawn(&mut app, &mut terminal);
+                last_draw = now;
+            }
+        }
+
+        assert!(app.closing.is_empty(), "the tile has retracted");
+        assert!(app.held.is_none(), "and nothing holds the grid");
+        let after = app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == panes[0])
+            .expect("tiled")
+            .1;
+        assert!(after.width > before.width, "the other pane has reflowed");
+    }
+
+    #[test]
+    fn a_pane_leaving_as_the_terminal_shrinks_is_laid_out_for_the_new_size() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+
+        // The pane goes and the terminal shrinks before the next frame, so
+        // one draw is the first to see both.
+        app.close_focused();
+        let mut smaller = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut smaller);
+
+        for (_, rect) in app.frames.iter().chain(&app.closing) {
+            assert!(
+                rect.x + rect.width <= 60 && rect.y + rect.height <= 20,
+                "{rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_projects_lays_out_the_new_one_at_once() {
+        let (mut app, first, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let project = Project::new("/tmp/second", ProjectSource::LocalDir);
+        let second = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("the app is listening");
+        app.poll_daemon();
+        app.select_project(second);
+        let theirs = spawn_several(&mut app, &daemon, second, 2);
+        app.select_project(first);
+        let ours = spawn_several(&mut app, &daemon, first, 2);
+        app.select_project(first);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+        assert!(
+            ours.iter()
+                .all(|pane| app.frames.iter().any(|(id, _)| id == pane)),
+            "the first project's panes are on screen"
+        );
+
+        app.select_project(second);
+        drawn(&mut app, &mut terminal);
+
+        assert!(
+            app.closing.is_empty(),
+            "the first project's panes have not closed"
+        );
+        assert!(app.held.is_none(), "so nothing holds the grid");
+        assert!(
+            theirs
+                .iter()
+                .all(|pane| app.frames.iter().any(|(id, _)| id == pane)),
+            "the second project's panes are laid out: {:?}",
+            app.frames
+        );
     }
 
     #[test]

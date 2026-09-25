@@ -77,3 +77,19 @@ fn with_motion_off_nothing_starts() {
     assert_eq!(animations.value('a', start), None);
     assert!(!animations.active(start));
 }
+
+#[test]
+fn a_finished_tween_is_still_held_until_it_is_swept() {
+    let start = Instant::now();
+    let mut animations = Animations::new(true);
+    assert!(animations.is_empty());
+    animations.start('a', start, MS(100), 0.0);
+
+    assert!(!animations.active(start + MS(150)), "it has run its course");
+    assert!(
+        !animations.is_empty(),
+        "but the frame that shows it at rest has not been drawn"
+    );
+    animations.sweep(start + MS(150));
+    assert!(animations.is_empty());
+}
