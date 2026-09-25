@@ -30,10 +30,11 @@ use dispatch_tui::input::{
     MouseEventKind,
 };
 use dispatch_tui::motion::{Animations, SPIN_FRAME, TWEEN_FRAME};
+use dispatch_tui::theme::Role;
 use dispatch_tui::{Item, PaneWidget, Picker, Prompt, Sidebar, Theme, sidebar, truncate};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 
@@ -52,15 +53,17 @@ const APP_NAME: &str = "D I S P A T C H";
 /// How many columns of a pane's title a tab shows.
 const TAB_TITLE: usize = 16;
 
-/// The border drawn around one pane.
+/// The border drawn around one pane, in `colour`, its title bold when
+/// `focused`.
 ///
-/// Square, like every other edge in the interface: faded when unfocused, and
-/// in the accent on the pane that has the keyboard, with its title in bold.
-fn pane_block(focused: bool, theme: &Theme) -> Block<'static> {
-    let (colour, title) = if focused {
-        (theme.accent, Style::default().add_modifier(Modifier::BOLD))
+/// Square, like every other edge in the interface. The colour is worked out
+/// by the caller, which knows whether the border is easing between faded and
+/// the accent.
+fn pane_block(colour: Color, focused: bool) -> Block<'static> {
+    let title = if focused {
+        Style::default().add_modifier(Modifier::BOLD)
     } else {
-        (theme.faded, Style::default())
+        Style::default()
     };
 
     Block::bordered()
@@ -146,6 +149,13 @@ const EVALUATE_EVERY: Duration = Duration::from_millis(250);
 /// replayed every pane's recent output at once, and without this every pane
 /// would come back "finished while you were away".
 const GRACE: Duration = Duration::from_secs(3);
+
+/// How long focus takes to move: the borders easing between faded and the
+/// accent, and the sidebar's tint on its way to the focused row.
+const EASE: Duration = Duration::from_millis(150);
+
+/// How long a row pulses for attention, all three times.
+const PULSE: Duration = Duration::from_millis(1200);
 
 /// How much of a task's opening words becomes a subagent's first title.
 ///
@@ -534,6 +544,13 @@ pub struct App {
     started: Instant,
     /// Running tweens, one per thing on screen that is moving.
     animations: Animations<Target>,
+    /// The pane focused when the last frame was drawn, so the next one can
+    /// tell focus has moved and ease the borders it moved between.
+    last_focus: Option<PaneId>,
+    /// The row the sidebar's focus tint stood on in the last frame.
+    last_anchor: Option<sidebar::Anchor>,
+    /// Where the sidebar's focus tint is gliding from, while it glides.
+    glide_from: Option<sidebar::Anchor>,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -590,6 +607,9 @@ impl App {
             motion: true,
             started: Instant::now(),
             animations: Animations::new(true),
+            last_focus: None,
+            last_anchor: None,
+            glide_from: None,
         }
     }
 
@@ -1116,6 +1136,61 @@ impl App {
         })
     }
 
+    /// How far toward the accent `id`'s border is at `now`: 1.0 focused and
+    /// at rest, 0.0 unfocused and at rest, between while easing.
+    ///
+    /// At rest, focused means as of the last frame drawn rather than as the
+    /// state says now: a change of focus is only noticed when the next frame
+    /// is drawn, and the ease it starts has to start from what was on screen.
+    fn border_level(&self, id: PaneId, now: Instant) -> f32 {
+        if let Some(value) = self.animations.value(Target::Focus(id), now) {
+            return value;
+        }
+        if let Some(value) = self.animations.value(Target::Blur(id), now) {
+            return 1.0 - value;
+        }
+        if self.last_focus == Some(id) {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Starts the easing a change of focus sets off: the new pane's border
+    /// toward the accent, the old one's back to faded, and the sidebar tint
+    /// from the old row to the new — each from wherever it had got to.
+    fn notice_focus(&mut self, now: Instant) {
+        let focus = self.state.focused_pane();
+        let anchor = focus
+            .map(sidebar::Anchor::Pane)
+            .or_else(|| self.state.selected_project().map(sidebar::Anchor::Project));
+
+        if focus != self.last_focus {
+            if let Some(new) = focus {
+                let from = self.border_level(new, now);
+                self.animations.stop(Target::Blur(new));
+                self.animations.start(Target::Focus(new), now, EASE, from);
+            }
+            if let Some(old) = self.last_focus {
+                let from = 1.0 - self.border_level(old, now);
+                self.animations.stop(Target::Focus(old));
+                self.animations.start(Target::Blur(old), now, EASE, from);
+            }
+        }
+
+        if anchor != self.last_anchor {
+            // A glide replaced mid-way starts from the row the old one was
+            // heading to: within 150 ms that reads as continuous.
+            self.glide_from = self.last_anchor;
+            if self.glide_from.is_some() {
+                self.animations.start(Target::Glide, now, EASE, 0.0);
+            }
+        }
+
+        self.last_focus = focus;
+        self.last_anchor = anchor;
+    }
+
     /// How long until the next frame something on screen needs: a tween
     /// running needs about thirty a second, a spinner ten, and nothing
     /// moving needs none — a still Dispatch draws only when something
@@ -1193,7 +1268,11 @@ impl App {
 
         let graced = now.saturating_duration_since(pane.adopted) < GRACE;
         if signals.bell && focused != Some(id) && !graced {
+            let was_unseen = self.state.is_unseen(id);
             self.state.mark_unseen(id);
+            if !was_unseen {
+                self.animations.start(Target::Pulse(id), now, PULSE, 0.0);
+            }
         }
 
         signals.title
@@ -1994,6 +2073,7 @@ impl App {
             let _ = self.state.set_pane_status(id, status);
             changed = true;
 
+            let was_unseen = self.state.is_unseen(id);
             let graced = now.saturating_duration_since(adopted) < GRACE;
             if before == PaneStatus::Running
                 && status == PaneStatus::Idle
@@ -2001,6 +2081,14 @@ impl App {
                 && !graced
             {
                 self.state.mark_unseen(id);
+            }
+
+            // A pane that now wants the user — blocked, or finished out of
+            // sight — pulses its row so the eye finds it.
+            if (status == PaneStatus::Blocked && focused != Some(id))
+                || self.state.is_unseen(id) && !was_unseen
+            {
+                self.animations.start(Target::Pulse(id), now, PULSE, 0.0);
             }
         }
 
@@ -3181,6 +3269,7 @@ impl App {
         let area = frame.area();
         let now = self.now();
         self.animations.sweep(now);
+        self.notice_focus(now);
 
         // One row across the top for the name and the tabs, one along the
         // bottom for status, and everything between for the sidebar and the
@@ -3219,12 +3308,30 @@ impl App {
         );
         self.anchored = (anchor, sidebar_area);
 
+        let sidebar_motion = sidebar::SidebarMotion {
+            pulses: self
+                .state
+                .projects()
+                .iter()
+                .flat_map(|project| self.state.panes_for(project.id))
+                .filter_map(|pane| {
+                    self.animations
+                        .linear(Target::Pulse(pane.id), now)
+                        .map(|t| (pane.id, sidebar::pulse_strength(t)))
+                })
+                .collect(),
+            glide: self
+                .glide_from
+                .zip(self.animations.value(Target::Glide, now))
+                .map(|(from, t)| sidebar::Glide { from, t }),
+        };
         frame.render_widget(
             Sidebar::new(&self.state)
                 .with_harnesses(&self.harnesses)
                 .with_theme(self.theme)
                 .with_scroll(&self.sidebar_scroll)
-                .with_spinner(self.spinner_frame()),
+                .with_spinner(self.spinner_frame())
+                .with_motion(&sidebar_motion),
             sidebar_area,
         );
         self.sidebar_area = sidebar_area;
@@ -3241,7 +3348,7 @@ impl App {
             .iter()
             .map(|(id, frame)| (*id, Self::interior(*frame)))
             .collect();
-        self.draw_panes(frame);
+        self.draw_panes(frame, now);
         self.draw_status(frame, area);
 
         self.draw_overlay(frame, panes_area);
@@ -3431,7 +3538,7 @@ impl App {
         Block::bordered().inner(frame)
     }
 
-    fn draw_panes(&mut self, frame: &mut Frame<'_>) {
+    fn draw_panes(&mut self, frame: &mut Frame<'_>, now: Instant) {
         let focused = self.state.focused_pane();
         let mut cursor = None;
 
@@ -3446,8 +3553,22 @@ impl App {
             // is what separates one agent's output from the next and from the
             // sidebar. Without it two panes of similarly-coloured text read as
             // one pane with a very confusing wrap.
+            let level = self.border_level(*id, now);
+            let colour = if self.animations.value(Target::Focus(*id), now).is_some()
+                || self.animations.value(Target::Blur(*id), now).is_some()
+            {
+                self.theme.blend(
+                    self.theme.rgb(Role::Faded),
+                    self.theme.rgb(Role::Accent),
+                    level,
+                )
+            } else if is_focused {
+                self.theme.accent
+            } else {
+                self.theme.faded
+            };
             frame.render_widget(
-                pane_block(is_focused, &self.theme).title(pane_title(&self.state, *id)),
+                pane_block(colour, is_focused).title(pane_title(&self.state, *id)),
                 *outer,
             );
 
@@ -5315,6 +5436,142 @@ mod tests {
             .start(Target::Glide, now, Duration::from_millis(150), 0.0);
 
         assert_eq!(app.next_frame(now), Some(Duration::from_millis(33)));
+    }
+
+    /// The colour of the top-left corner of `pane`'s tile, as last drawn.
+    fn corner(
+        app: &App,
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        pane: PaneId,
+    ) -> Color {
+        let (_, rect) = app
+            .frames
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .expect("the pane is tiled");
+        terminal
+            .backend()
+            .buffer()
+            .cell((rect.x, rect.y))
+            .expect("the corner is on screen")
+            .fg
+    }
+
+    fn drawn(app: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>) {
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+    }
+
+    #[test]
+    fn focus_eases_the_border_from_faded_to_accent() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        let theme = Theme::fallback();
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+        drawn(&mut app, &mut terminal);
+
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_millis(60));
+        drawn(&mut app, &mut terminal);
+
+        let (new, old) = (
+            corner(&app, &terminal, panes[0]),
+            corner(&app, &terminal, panes[1]),
+        );
+        for colour in [new, old] {
+            assert_ne!(colour, theme.faded, "mid-ease");
+            assert_ne!(colour, theme.accent, "mid-ease");
+        }
+
+        advance(&clock, Duration::from_millis(200));
+        drawn(&mut app, &mut terminal);
+        assert_eq!(corner(&app, &terminal, panes[0]), theme.accent);
+        assert_eq!(corner(&app, &terminal, panes[1]), theme.faded);
+    }
+
+    #[test]
+    fn rapid_focus_changes_continue_rather_than_queue() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_secs(1));
+
+        for pane in [panes[0], panes[1], panes[0], panes[2]] {
+            app.focus_pane(pane);
+            drawn(&mut app, &mut terminal);
+            advance(&clock, Duration::from_millis(20));
+        }
+
+        advance(&clock, Duration::from_millis(200));
+        drawn(&mut app, &mut terminal);
+        let theme = Theme::fallback();
+        assert_eq!(corner(&app, &terminal, panes[2]), theme.accent);
+        assert_eq!(corner(&app, &terminal, panes[0]), theme.faded);
+        assert_eq!(corner(&app, &terminal, panes[1]), theme.faded);
+        assert!(!app.animations.active(app.now()), "nothing left running");
+    }
+
+    #[test]
+    fn with_motion_off_focus_changes_at_once() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        app.set_motion(false);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+
+        assert_eq!(corner(&app, &terminal, panes[0]), Theme::fallback().accent);
+    }
+
+    #[test]
+    fn a_pane_turning_blocked_out_of_focus_pulses() {
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            status: Some(
+                toml::from_str(
+                    r#"
+                    [[rules]]
+                    state = "blocked"
+                    region = "screen"
+                    contains = ["proceed?"]
+                    "#,
+                )
+                .expect("the rules parse"),
+            ),
+            ..dispatch_config::HarnessDef::default()
+        };
+        let (client, daemon, _sent) = Client::for_test();
+        let mut app = App::attached([def].into_iter().collect(), client);
+        let project = Project::new("/tmp/pulse", ProjectSource::LocalDir);
+        let project_id = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("listening");
+        app.poll_daemon();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project_id, 2);
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, panes[0], b"Do you want to proceed?\r\n");
+
+        assert!(
+            app.animations
+                .linear(Target::Pulse(panes[0]), app.now())
+                .is_some()
+        );
     }
 
     #[test]

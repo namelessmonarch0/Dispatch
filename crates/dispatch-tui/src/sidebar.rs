@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use crate::theme::Theme;
+use crate::theme::{Role, Theme};
 use dispatch_config::HarnessRegistry;
 use dispatch_config::harness::DEFAULT_ICON;
 use dispatch_core::{
@@ -94,6 +94,35 @@ fn inner(area: Rect) -> Rect {
     Block::bordered().inner(area)
 }
 
+/// What moves in the sidebar this frame.
+#[derive(Debug, Clone, Default)]
+pub struct SidebarMotion {
+    /// Rows pulsing for attention, with how strongly each shows now
+    /// (0.0–1.0) — the caller turns a pulse's progress into this with
+    /// [`pulse_strength`].
+    pub pulses: Vec<(PaneId, f32)>,
+    /// The focus tint on its way to the focused row.
+    pub glide: Option<Glide>,
+}
+
+/// The focus tint moving from one row to the focused one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Glide {
+    /// Where it started.
+    pub from: Anchor,
+    /// How far it has got, eased, 0.0–1.0.
+    pub t: f32,
+}
+
+/// How strongly a pulse shows `t` of the way through it: three rises and
+/// falls, from nothing and back to nothing.
+#[must_use]
+pub fn pulse_strength(t: f32) -> f32 {
+    (std::f32::consts::PI * 3.0 * t.clamp(0.0, 1.0))
+        .sin()
+        .powi(2)
+}
+
 /// Renders the project list.
 #[derive(Debug, Clone, Copy)]
 pub struct Sidebar<'a> {
@@ -102,6 +131,7 @@ pub struct Sidebar<'a> {
     theme: Theme,
     scroll: Option<&'a Scroll>,
     spinner: Option<usize>,
+    motion: Option<&'a SidebarMotion>,
 }
 
 impl<'a> Sidebar<'a> {
@@ -114,6 +144,7 @@ impl<'a> Sidebar<'a> {
             theme: Theme::fallback(),
             scroll: None,
             spinner: None,
+            motion: None,
         }
     }
 
@@ -146,6 +177,14 @@ impl<'a> Sidebar<'a> {
     #[must_use]
     pub fn with_spinner(mut self, frame: Option<usize>) -> Self {
         self.spinner = frame;
+        self
+    }
+
+    /// Draws what is moving this frame: rows pulsing, and the focus tint on
+    /// its way to its row.
+    #[must_use]
+    pub fn with_motion(mut self, motion: &'a SidebarMotion) -> Self {
+        self.motion = Some(motion);
         self
     }
 
@@ -728,6 +767,14 @@ impl Widget for Sidebar<'_> {
         let selected = self.state.selected_project();
         let focused = self.state.focused_pane();
 
+        // The focus tint, while it moves, is drawn here rather than by the
+        // row it belongs to: gliding, it is on a row that is not the focused
+        // one; fading, it is on two at once.
+        let glide = self.motion.and_then(|motion| motion.glide);
+        if let Some(glide) = glide {
+            self.render_glide(buf, &sections, glide);
+        }
+
         for (index, section) in sections.iter().enumerate() {
             if index > 0 {
                 divider(buf, area, section.header, edge);
@@ -861,6 +908,55 @@ pub fn section_at(
 }
 
 impl Sidebar<'_> {
+    /// Whether the focus tint is moving this frame, and so is drawn by
+    /// [`Sidebar::render_glide`] rather than by the row it belongs to.
+    fn gliding(&self) -> bool {
+        self.motion.is_some_and(|motion| motion.glide.is_some())
+    }
+
+    /// Draws the moving focus tint: gliding row by row when both ends are in
+    /// one section's view, fading out of one and into the other otherwise.
+    fn render_glide(&self, buf: &mut Buffer, sections: &[Section<'_>], glide: Glide) {
+        let to = self
+            .state
+            .focused_pane()
+            .map(Anchor::Pane)
+            .or_else(|| self.state.selected_project().map(Anchor::Project));
+        let Some(to) = to else {
+            return;
+        };
+
+        let find = |anchor: Anchor| {
+            sections.iter().enumerate().find_map(|(index, section)| {
+                section
+                    .visible()
+                    .find(|(_, row)| row.is(anchor))
+                    .map(|(y, _)| (index, y, section.body))
+            })
+        };
+        let text = self.theme.text;
+
+        match (find(glide.from), find(to)) {
+            (Some((a, from_y, body)), Some((b, to_y, _))) if a == b => {
+                let span = f32::from(to_y) - f32::from(from_y);
+                let y = (f32::from(from_y) + span * glide.t).round() as u16;
+                fill(buf, body, body.x, y, self.tinted());
+            }
+            (from, to) => {
+                let (background, tint) =
+                    (self.theme.rgb(Role::Background), self.theme.rgb(Role::Tint));
+                if let Some((_, y, body)) = from {
+                    let colour = self.theme.blend(background, tint, 1.0 - glide.t);
+                    fill(buf, body, body.x, y, Style::default().bg(colour).fg(text));
+                }
+                if let Some((_, y, body)) = to {
+                    let colour = self.theme.blend(background, tint, glide.t);
+                    fill(buf, body, body.x, y, Style::default().bg(colour).fg(text));
+                }
+            }
+        }
+    }
+
     /// Draws one project row, at the left edge of its section.
     fn render_project(
         &self,
@@ -889,7 +985,10 @@ impl Sidebar<'_> {
         // the name: a highlight that stops where a short name does reads as
         // part of the name. It sets the text colour too, which everything
         // written on the row after it keeps.
-        if is_selected {
+        //
+        // A project row is what the focus tint stands on only when no pane
+        // is focused; then, while that tint moves, the glide draws it.
+        if is_selected && !(self.gliding() && self.state.focused_pane().is_none()) {
             fill(buf, area, x, y, self.tinted());
         }
 
@@ -1040,8 +1139,30 @@ impl Sidebar<'_> {
         };
 
         let x = area.x + indent;
-        if is_focused {
+        // While the focus tint moves, the glide draws it.
+        if is_focused && !self.gliding() {
             fill(buf, area, x, y, self.tinted());
+        }
+
+        // Under the text rather than over it: the row pulses, and what it
+        // says — the glyph above all — stays as it was.
+        if let Some(strength) = self
+            .motion
+            .and_then(|motion| motion.pulses.iter().find(|(id, _)| *id == pane.id))
+            .map(|(_, strength)| *strength)
+        {
+            let colour = self.theme.blend(
+                self.theme.rgb(Role::Background),
+                self.theme.rgb(Role::Pulse),
+                strength,
+            );
+            fill(
+                buf,
+                area,
+                x,
+                y,
+                Style::default().bg(colour).fg(self.theme.text),
+            );
         }
 
         let has_children = !self.state.children_of(pane.id).is_empty();

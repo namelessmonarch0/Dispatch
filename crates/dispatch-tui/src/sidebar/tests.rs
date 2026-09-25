@@ -1615,3 +1615,111 @@ fn an_open_project_and_an_idle_one_show_no_rollup() {
         "nothing to say"
     );
 }
+
+fn render_moving(state: &AppState, motion: &SidebarMotion, height: u16) -> Buffer {
+    let area = Rect::new(0, 0, WIDTH, height);
+    let mut buf = Buffer::empty(area);
+    Sidebar::new(state)
+        .with_motion(motion)
+        .render(area, &mut buf);
+    buf
+}
+
+#[test]
+fn a_pulse_rises_and_falls_three_times() {
+    assert_eq!(pulse_strength(0.0), 0.0);
+    assert!(pulse_strength(1.0 / 6.0) > 0.99, "the first peak");
+    assert!(pulse_strength(1.0 / 3.0) < 0.01, "the first trough");
+    assert!(pulse_strength(1.0) < 0.01, "and it settles");
+}
+
+#[test]
+fn a_pulsing_row_is_drawn_toward_the_pulse_colour() {
+    let (mut state, alpha, _) = state();
+    let pane = spawn(&mut state, alpha, "claude");
+    spawn(&mut state, alpha, "codex"); // focus moves off the first
+    let theme = Theme::fallback();
+    let motion = SidebarMotion {
+        pulses: vec![(pane, 1.0)],
+        glide: None,
+    };
+
+    let buf = render_moving(&state, &motion, 6);
+
+    assert_eq!(
+        buf.cell((LEFT + 8, TOP + 1)).expect("cell exists").bg,
+        theme.blend(theme.rgb(Role::Background), theme.rgb(Role::Pulse), 1.0)
+    );
+}
+
+#[test]
+fn the_focus_tint_glides_through_the_rows_between() {
+    let (mut state, alpha, _) = state();
+    let first = spawn(&mut state, alpha, "claude");
+    spawn(&mut state, alpha, "codex");
+    let last = spawn(&mut state, alpha, "opencode"); // focused
+    let tint = Theme::fallback().tint;
+    let motion = SidebarMotion {
+        pulses: Vec::new(),
+        glide: Some(Glide {
+            from: Anchor::Pane(first),
+            t: 0.5,
+        }),
+    };
+
+    let buf = render_moving(&state, &motion, 8);
+
+    // First at TOP+1, last at TOP+3: halfway is TOP+2.
+    assert_eq!(buf.cell((LEFT + 8, TOP + 2)).expect("cell").bg, tint);
+    assert_ne!(
+        buf.cell((LEFT + 8, TOP + 3)).expect("cell").bg,
+        tint,
+        "not arrived yet"
+    );
+    let _ = last;
+}
+
+#[test]
+fn a_glide_between_sections_fades_instead() {
+    let (mut state, laptop, tower) = fleet();
+    let on_laptop = state
+        .projects()
+        .iter()
+        .find(|p| p.device == laptop)
+        .expect("one")
+        .id;
+    let on_tower = state
+        .projects()
+        .iter()
+        .find(|p| p.device == tower)
+        .expect("one")
+        .id;
+    let from = spawn(&mut state, on_laptop, "claude");
+    let _ = state.select_project(on_tower);
+    spawn(&mut state, on_tower, "codex"); // focused
+    let theme = Theme::fallback();
+    let motion = SidebarMotion {
+        pulses: Vec::new(),
+        glide: Some(Glide {
+            from: Anchor::Pane(from),
+            t: 0.5,
+        }),
+    };
+
+    let buf = render_moving(&state, &motion, 14);
+    let halfway = theme.blend(theme.rgb(Role::Background), theme.rgb(Role::Tint), 0.5);
+    let row_of = |text: &str| {
+        (0..buf.area.height)
+            .find(|y| row_text(&buf, *y).contains(text))
+            .unwrap_or_else(|| panic!("{text:?} is drawn"))
+    };
+
+    assert_eq!(
+        buf.cell((LEFT + 8, row_of("claude"))).expect("cell").bg,
+        halfway
+    );
+    assert_eq!(
+        buf.cell((LEFT + 8, row_of("codex"))).expect("cell").bg,
+        halfway
+    );
+}

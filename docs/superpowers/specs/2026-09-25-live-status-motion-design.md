@@ -325,7 +325,7 @@ passes. A Dispatch with nothing moving still draws nothing.
 |---|---|---|
 | Working | the spinner glyph (sidebar and tab) advances one braille frame per 100 ms, derived from the clock so all spinners are in step | continuous |
 | Attention (a pane turns blocked, or is marked unseen) | its sidebar row's background pulses three times between the background and a strong accent mix (background 55% toward accent), then settles; the glyph stays | 1.2 s |
-| Focus moves | the new pane's border eases `faded` → `accent`, the old one's `accent` → `faded`; the sidebar's focus tint glides row by row from the old row to the new when both are drawn in one section, and cross-fades (old out, new in) otherwise | 150 ms |
+| Focus moves | the new pane's border eases `faded` → `accent`, the old one's `accent` → `faded`; the sidebar's focus tint glides row by row from the old row to the new when both are drawn in one section, and cross-fades (old out, new in) otherwise. A glide replaced mid-way starts from the row the previous one was heading to. | 150 ms |
 | Pane opens | its border is revealed clockwise from the top-left corner | 200 ms |
 | Pane closes or exits the grid | its tile keeps its place, interior cleared, while its border retracts anticlockwise; then the grid reflows | 150 ms |
 | Tab switch | the active tab's tint slides from the old tab's position and width to the new one's | 150 ms |
