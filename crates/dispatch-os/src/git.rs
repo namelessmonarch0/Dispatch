@@ -23,8 +23,20 @@ const SHORT: usize = 7;
 #[must_use]
 pub fn head(dir: &Path) -> Option<String> {
     let git_dir = git_dir(dir)?;
-    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = read_file(&git_dir.join("HEAD"))?;
     parse_head(&head)
+}
+
+/// What `path` holds, when it is a regular file.
+///
+/// Anything else is refused before it is opened: reading a FIFO waits for a
+/// writer that may never come, and the daemon looks from its one loop, so
+/// one where `.git` or `HEAD` should be would stop it for good.
+fn read_file(path: &Path) -> Option<String> {
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
 }
 
 /// The git directory of the repository containing `dir`, walking up.
@@ -42,7 +54,7 @@ fn git_dir(dir: &Path) -> Option<PathBuf> {
         return Some(dot_git);
     }
 
-    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let text = read_file(&dot_git)?;
     let target = text
         .lines()
         .find_map(|line| line.strip_prefix("gitdir:"))?
@@ -50,6 +62,11 @@ fn git_dir(dir: &Path) -> Option<PathBuf> {
 
     Some(dot_git.parent()?.join(target))
 }
+
+/// What a reftable repository's `HEAD` names. It keeps its refs elsewhere
+/// and leaves this in the file, a name no branch can have, for tools that
+/// read `HEAD` as a file and would otherwise find the repository broken.
+const REFTABLE_PLACEHOLDER: &str = ".invalid";
 
 /// What a `HEAD` file says, as the sidebar should show it.
 fn parse_head(head: &str) -> Option<String> {
@@ -59,7 +76,7 @@ fn parse_head(head: &str) -> Option<String> {
         return reference
             .trim()
             .strip_prefix("refs/heads/")
-            .filter(|name| !name.is_empty())
+            .filter(|name| !name.is_empty() && *name != REFTABLE_PLACEHOLDER)
             .map(str::to_string);
     }
 
@@ -194,6 +211,27 @@ mod tests {
     fn a_ref_that_is_not_a_branch_has_no_branch() {
         let dir = Scratch::new("tag");
         repository(&dir.0, "ref: refs/tags/v1.0\n");
+
+        assert_eq!(head(&dir.0), None);
+    }
+
+    #[test]
+    fn a_reftable_repositorys_placeholder_head_has_no_branch() {
+        // A reftable repository keeps its refs elsewhere and leaves `HEAD`
+        // naming a branch no repository can have, for tools that read it as
+        // a file.
+        let dir = Scratch::new("reftable");
+        repository(&dir.0, "ref: refs/heads/.invalid\n");
+
+        assert_eq!(head(&dir.0), None);
+    }
+
+    #[test]
+    fn a_head_that_is_not_a_regular_file_has_no_branch() {
+        // A directory stands in, on every platform, for what cannot be made
+        // portably: a FIFO, whose read would wait for a writer forever.
+        let dir = Scratch::new("head-dir");
+        std::fs::create_dir_all(dir.0.join(".git").join("HEAD")).expect("temp dir is writable");
 
         assert_eq!(head(&dir.0), None);
     }
