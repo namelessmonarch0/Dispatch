@@ -15,7 +15,7 @@ mod testing;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub use config::{Config, DelegationLimits, LoadedConfig};
+pub use config::{Config, DelegationLimits, InterfaceConfig, LoadedConfig};
 pub use harness::{HarnessDef, Launch, SettingDef, SettingKind, TaskArgs, TaskLaunch};
 pub use status::{RuleState, StatusInput, StatusRules};
 

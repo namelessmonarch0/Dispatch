@@ -265,6 +265,17 @@ fn main() -> Result<ExitCode> {
         app.add_project(root);
     }
 
+    // Only `[interface]` is the client's; the daemon reads the rest. Unknown
+    // keys are logged rather than fatal, as the daemon does.
+    let config_path =
+        dispatch_os::paths::config_file().context("failed to locate the configuration file")?;
+    let loaded = dispatch_config::Config::load_reporting(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    if !loaded.unknown.is_empty() {
+        tracing::warn!(keys = ?loaded.unknown, path = %config_path.display(), "ignoring unknown configuration keys");
+    }
+    app.set_motion(loaded.config.interface.motion);
+
     // From here on the terminal belongs to Dispatch, so nothing may write to
     // stdout and every exit path has to restore it.
     install_panic_hook();

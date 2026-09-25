@@ -503,6 +503,8 @@ pub struct App {
     /// Where the time comes from: the real clock in the binary, one moved by
     /// hand in tests, so every timing here can be tested without sleeping.
     clock: Box<dyn Fn() -> Instant>,
+    /// Whether the interface animates spinners, pulses, easing and transitions.
+    motion: bool,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -556,6 +558,7 @@ impl App {
             sent: Vec::new(),
             theme: Theme::fallback(),
             clock: Box::new(Instant::now),
+            motion: true,
         }
     }
 
@@ -650,6 +653,11 @@ impl App {
     /// Draws the interface in `theme` from the next frame on.
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
+    }
+
+    /// Turns motion on or off: spinners, pulses, easing and transitions.
+    pub fn set_motion(&mut self, on: bool) {
+        self.motion = on;
     }
 
     /// The daemons this client is holding, or nothing when it holds none.
