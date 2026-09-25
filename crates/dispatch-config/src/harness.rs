@@ -146,6 +146,11 @@ pub struct HarnessDef {
     /// Settings the harness manager offers for this harness.
     #[serde(default)]
     pub settings: Vec<SettingDef>,
+
+    /// Rules that read this agent's state off its screen. Absent means the
+    /// built-in rules for its id, if Dispatch has some.
+    #[serde(default)]
+    pub status: Option<crate::status::StatusDef>,
 }
 
 impl HarnessDef {
