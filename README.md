@@ -83,11 +83,90 @@ while you are looking inside it, shut while its panes are folded away or it has
 none -- with a git mark beside it when its root is a repository. A pane shows
 the icon of the harness running in it -- the `icon` key in that harness's TOML, so a harness you
 register yourself can have one too. On the right, one glyph says what the pane
-is doing: starting, running, idle, exited cleanly, exited badly, or closed and
-still listed for the sake of a subagent under it.
+is doing, read off its terminal as it runs:
+
+| Glyph | The pane is |
+|---|---|
+| a spinner | working: output is arriving, or its rules say it is busy |
+| a faded pause | idle: waiting for you to give it something |
+| a yellow warning | blocked: waiting on a decision only you can make, such as a permission prompt |
+| an accent check-circle | done: it finished while you were looking elsewhere |
+| an hourglass | starting |
+| a faded check, a red cross | exited cleanly, exited badly |
+| a faded ban | closed, and still listed for the sake of a subagent under it |
+
+A pane is marked done when it goes from working to idle, or rings the bell,
+while another pane has the focus; its row pulses, as does one that turns
+blocked out of sight. The mark stays until you look: focusing the pane clears
+it. Nothing is marked in a pane's first three seconds, so reattaching to a
+daemon, which replays every pane's recent output, does not bring them all
+back done. A subagent reads as working from the moment it starts until it
+exits, unless it is blocked: its one-shot task prints little before its
+answer, and quiet is not finished.
+
+A folded project's row carries the most urgent state among its panes --
+blocked, then done, then working -- and each tab is prefixed the same way, so
+a pane that needs you shows from anywhere. The status row counts the blocked
+panes too: `2 waiting on you`.
 
 Every glyph is a Nerd Font one, so Dispatch wants a patched font in the
 terminal it runs in.
+
+## Status rules
+
+A pane's state comes from its terminal: output arriving means it is working,
+and quiet means idle -- though not the echo of your own typing, or its repaint
+after a resize. Each harness's rules recognise what activity alone cannot -- a
+spinner in the title, a permission prompt. `claude`, `codex`, `opencode` and
+`agy` have rules built in, adapted from
+[herdr](https://github.com/ogulcancelik/herdr)'s detection manifests. A
+harness's own TOML can carry its own:
+
+```toml
+# ~/.config/dispatch/harnesses/claude.toml
+# Claude Code's permission prompt: the question, with a numbered yes under it.
+[[status.rules]]
+state = "blocked"
+region = "bottom:15"
+contains = ["do you want to proceed?"]
+regex = ['(?i)^\s*❯?\s*1\.\s*yes\b']
+priority = 990
+```
+
+- `state` is `working`, `idle` or `blocked`.
+- `region` is where to look: `title`, the title the program last set, spinner
+  and all; `progress`, its last `OSC 9;4` progress report, after the `9;`;
+  `bottom:N`, the last N non-blank lines of the screen; or `screen`, all of it.
+- `contains` must all appear, `any` at least one, and `not` none; all three
+  ignore case. `regex` must match some line of the region, and is
+  case-sensitive unless it says `(?i)`. A rule needs at least one of
+  `contains`, `any` or `regex`.
+- `priority` orders the rules, highest first, ties in file order, and the
+  first that matches decides. An `idle` rule does not outrank output still
+  arriving.
+
+A harness's own `[status]` replaces the built-ins for it rather than adding to
+them, so start from a copy of them in
+`crates/dispatch-config/src/status/builtin.rs`. `[status]` with `rules = []`
+means activity alone decides; with no `[status]` at all, the built-ins for its
+id apply, and a harness with none goes by activity alone. A rule with an
+unknown state or region, a regex that does not compile, or nothing to match on
+is logged and skipped, and the harness loads without it.
+
+## Motion
+
+Working panes spin, a pane that wants you pulses its row, focus eases from one
+border to the next, a new pane draws its border in and a closed one retracts
+it, and the active tab's tint slides across. To keep the screen still:
+
+```toml
+# ~/.config/dispatch/config.toml
+[interface]
+motion = false   # default true
+```
+
+Every change then shows at once, a working pane shows a still play glyph, and
+nothing pulses; every state is still shown.
 
 ## Keeping projects
 
