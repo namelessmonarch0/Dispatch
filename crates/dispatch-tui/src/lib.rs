@@ -12,5 +12,5 @@ pub use input::{Action, Direction, InputRouter, Prefix};
 pub use pane::PaneWidget;
 pub use picker::{Item, Picker};
 pub use prompt::{Note, Prompt};
-pub use sidebar::Sidebar;
+pub use sidebar::{Sidebar, truncate};
 pub use theme::Theme;

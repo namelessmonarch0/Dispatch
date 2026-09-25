@@ -194,8 +194,10 @@ fn fill(buf: &mut Buffer, area: Rect, x: u16, y: u16, style: Style) {
 /// ellipsis.
 ///
 /// Project names come from directory names and are routinely longer than the
-/// sidebar.
-fn truncate(text: &str, width: usize) -> String {
+/// sidebar. Public so every cut in the interface is measured the same way:
+/// counting characters lets a wide one take two columns it was never given.
+#[must_use]
+pub fn truncate(text: &str, width: usize) -> String {
     if text.width() <= width {
         return text.to_string();
     }

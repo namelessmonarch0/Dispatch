@@ -27,7 +27,7 @@ use dispatch_tui::input::{
     Action, Direction, Event, InputRouter, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseEventKind,
 };
-use dispatch_tui::{Item, PaneWidget, Picker, Prompt, Sidebar, Theme, sidebar};
+use dispatch_tui::{Item, PaneWidget, Picker, Prompt, Sidebar, Theme, sidebar, truncate};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -46,7 +46,7 @@ const PANES_PER_TAB: usize = 4;
 /// way a label rather than a heading is.
 const APP_NAME: &str = "D I S P A T C H";
 
-/// How much of a pane's title a tab shows.
+/// How many columns of a pane's title a tab shows.
 const TAB_TITLE: usize = 16;
 
 /// The border drawn around one pane.
@@ -126,16 +126,6 @@ fn strip_mark(title: &str) -> &str {
             )
         })
         .trim()
-}
-
-/// `text` cut to `width` characters, marking the cut with an ellipsis.
-fn clip(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.to_string();
-    }
-
-    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
-    format!("{kept}…")
 }
 
 /// Frame budget. A chatty agent can produce output faster than any terminal
@@ -3289,7 +3279,7 @@ impl App {
                 .nth(index)
                 .and_then(<[PaneId]>::first)
                 .and_then(|id| self.state.pane(*id))
-                .map(|pane| clip(&pane.title, TAB_TITLE));
+                .map(|pane| truncate(&pane.title, TAB_TITLE));
 
             let label = match title {
                 Some(title) => format!(" {} {title} ", index + 1),
@@ -4781,6 +4771,49 @@ mod tests {
         assert!(
             over_panes.contains("1 refactor"),
             "a lone tab is still drawn, named for its pane: {top:?}"
+        );
+    }
+
+    #[test]
+    fn a_tab_title_is_cut_by_the_columns_it_takes() {
+        // Twelve wide characters are twenty-four columns: counted as twelve,
+        // they fit a sixteen-column title and ran half as far again past it.
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let pane = app
+            .state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+        app.state
+            .set_pane_title(pane, "日本語のプロジェクト名前")
+            .expect("the pane exists");
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+        let buf = terminal.backend().buffer();
+        let top: Vec<&ratatui::buffer::Cell> = (sidebar::WIDTH..buf.area.width)
+            .filter_map(|x| buf.cell((x, 0)))
+            .collect();
+
+        let number = top
+            .iter()
+            .position(|cell| cell.symbol() == "1")
+            .expect("the tab is drawn");
+        let cut = top
+            .iter()
+            .position(|cell| cell.symbol() == "…")
+            .expect("the title is cut, and says so");
+        // The title starts a blank after the tab's number.
+        let title = number + 2;
+        assert!(
+            cut + 1 - title <= TAB_TITLE,
+            "the title takes {} columns",
+            cut + 1 - title
         );
     }
 
