@@ -377,7 +377,7 @@ fn run(app: &mut App, guard: &mut TerminalGuard) -> Result<()> {
             needs_draw = false;
         }
 
-        let timeout = App::poll_timeout(last_draw);
+        let timeout = App::poll_timeout(last_draw, Instant::now());
 
         if event::poll(timeout).context("failed to poll for input")? {
             let event = event::read().context("failed to read input")?;

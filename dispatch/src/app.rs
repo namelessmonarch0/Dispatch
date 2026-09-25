@@ -4044,10 +4044,19 @@ impl App {
         }
     }
 
-    /// How long to wait for input before drawing again.
+    /// How long to wait for input before drawing again: what is left of the
+    /// current frame, or a whole frame once that has passed.
+    ///
+    /// Never zero. Once a frame went by with nothing to draw, a timeout
+    /// counted down from the last draw would stay at zero, and the loop would
+    /// poll without waiting and spin a core for as long as Dispatch sat idle.
+    /// A whole frame still picks up pane output within a frame.
     #[must_use]
-    pub fn poll_timeout(last_draw: Instant) -> Duration {
-        FRAME.saturating_sub(last_draw.elapsed())
+    pub fn poll_timeout(last_draw: Instant, now: Instant) -> Duration {
+        match FRAME.saturating_sub(now.saturating_duration_since(last_draw)) {
+            Duration::ZERO => FRAME,
+            left => left,
+        }
     }
 }
 
@@ -5865,6 +5874,28 @@ mod tests {
 
         app.set_motion(false);
         assert_eq!(app.next_frame(later), None, "a still glyph needs no frames");
+    }
+
+    #[test]
+    fn the_loop_waits_out_what_is_left_of_the_frame() {
+        let drawn = Instant::now();
+
+        assert_eq!(
+            App::poll_timeout(drawn, drawn + Duration::from_millis(10)),
+            FRAME - Duration::from_millis(10)
+        );
+    }
+
+    #[test]
+    fn an_idle_loop_waits_a_whole_frame_rather_than_spinning() {
+        let drawn = Instant::now();
+
+        assert_eq!(App::poll_timeout(drawn, drawn + FRAME), FRAME);
+        assert_eq!(
+            App::poll_timeout(drawn, drawn + Duration::from_secs(5)),
+            FRAME,
+            "long after the last frame, still never zero"
+        );
     }
 
     #[test]
