@@ -299,6 +299,7 @@ dependencies = [
  "dispatch-pty",
  "dispatch-tui",
  "ratatui",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

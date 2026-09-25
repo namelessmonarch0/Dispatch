@@ -13,6 +13,7 @@ use dispatch_core::{
 };
 use dispatch_layout::{tile, tile_zoomed};
 use dispatch_proto::{ClientMessage, DelegateOutcome, PaneUpdate, ProjectUpdate, ServerMessage};
+use dispatch_pty::Signals;
 use dispatch_pty::{
     KeyEncoder, MouseEncoder, MouseInput, PtySession, RunState, Screen, ScreenReader, ScrollTo,
     Size, TitleScanner,
@@ -22,6 +23,7 @@ use crate::add_machine::{self, AddMachine, Checked, Step};
 use crate::approval::Approval;
 use crate::backend::{Backend, RemotePane};
 use dispatch_config::machines::{self, Machine};
+use dispatch_tui::activity::{Tracker, Verdict};
 use dispatch_tui::browser::Browser;
 use dispatch_tui::input::{
     Action, Direction, Event, InputRouter, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -132,6 +134,18 @@ fn strip_mark(title: &str) -> &str {
 /// can draw it, so redraws are coalesced rather than done per byte.
 const FRAME: Duration = Duration::from_millis(16);
 
+/// How soon after output a pane's state is looked at again.
+const EVALUATE_AFTER_OUTPUT: Duration = Duration::from_millis(100);
+
+/// How often every pane's state is looked at, output or not: an idle verdict
+/// needs time to pass, not bytes, to be confirmed.
+const EVALUATE_EVERY: Duration = Duration::from_millis(250);
+
+/// How long a new pane is kept from being marked done. A client attaching is
+/// replayed every pane's recent output at once, and without this every pane
+/// would come back "finished while you were away".
+const GRACE: Duration = Duration::from_secs(3);
+
 /// How much of a task's opening words becomes a subagent's first title.
 ///
 /// All a subagent's row has room for: in a [`sidebar::WIDTH`]-column sidebar,
@@ -206,6 +220,14 @@ struct Pane {
     screen: Screen,
     /// Watches the output for the title the child sets for itself.
     titles: TitleScanner,
+    /// What the pane is doing, from its output, screen and title.
+    activity: Tracker,
+    /// When this client took the pane on, for the grace before done marks.
+    adopted: Instant,
+    /// When its state was last worked out.
+    evaluated: Option<Instant>,
+    /// Whether it printed since then.
+    dirty: bool,
 }
 
 /// What has the keyboard, so a keystroke meant for an agent — or an approval
@@ -478,6 +500,9 @@ pub struct App {
     sent: Vec<ClientMessage>,
     /// The colours Dispatch draws its own chrome in.
     theme: Theme,
+    /// Where the time comes from: the real clock in the binary, one moved by
+    /// hand in tests, so every timing here can be tested without sleeping.
+    clock: Box<dyn Fn() -> Instant>,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -530,6 +555,7 @@ impl App {
             #[cfg(test)]
             sent: Vec::new(),
             theme: Theme::fallback(),
+            clock: Box::new(Instant::now),
         }
     }
 
@@ -1034,6 +1060,13 @@ impl App {
         self.adopt(id, Backend::Local(session), &display_name)
     }
 
+    /// The time, read through the clock the app was given: the real one in
+    /// the binary, one moved by hand in tests, so every timing here can be
+    /// tested without sleeping.
+    fn now(&self) -> Instant {
+        (self.clock)()
+    }
+
     /// Takes on a pane that now exists, wherever its process is.
     ///
     /// The sidebar should read "Claude Code", not "claude". The harness id is a
@@ -1047,6 +1080,13 @@ impl App {
 
         let _ = self.state.set_pane_title(id, display_name);
 
+        let rules = self
+            .state
+            .pane(id)
+            .map(|pane| self.harnesses.status_rules(pane.harness.as_str()))
+            .unwrap_or_default();
+        let now = self.now();
+
         self.panes.insert(
             id,
             Pane {
@@ -1057,10 +1097,36 @@ impl App {
                 reader,
                 screen,
                 titles: TitleScanner::new(),
+                activity: Tracker::new(rules),
+                adopted: now,
+                evaluated: None,
+                dirty: false,
             },
         );
 
         Ok(())
+    }
+
+    /// Takes in what one burst of a pane's output said besides its text.
+    ///
+    /// Returns the new title, for the caller to rename the pane with, and
+    /// marks the pane unseen on a bell when the user is looking elsewhere.
+    fn take_output(&mut self, id: PaneId, bytes: &[u8]) -> Option<String> {
+        let now = self.now();
+        let focused = self.state.focused_pane();
+        let pane = self.panes.get_mut(&id)?;
+
+        let signals: Signals = pane.titles.scan_signals(bytes);
+        pane.activity.output(now);
+        pane.activity.signals(&signals);
+        pane.dirty = true;
+
+        let graced = now.saturating_duration_since(pane.adopted) < GRACE;
+        if signals.bell && focused != Some(id) && !graced {
+            self.state.mark_unseen(id);
+        }
+
+        signals.title
     }
 
     /// Acts on whatever the daemon has said since the last call.
@@ -1386,12 +1452,11 @@ impl App {
                     target.screen = screen;
                 }
 
-                // Read here as well as for a local pane: the same bytes carry
-                // the title whichever side the process is on, and a client that
-                // has just been replayed a pane's output learns its name from
-                // it.
-                let title = target.titles.scan(&bytes);
-                if let Some(title) = title {
+                // The borrow above ends here, so `take_output` can borrow
+                // `self.panes` again: it reads the same bytes for the title,
+                // whichever side the process is on, so a client that has just
+                // been replayed a pane's output learns its name from it.
+                if let Some(title) = self.take_output(pane, &bytes) {
                     self.rename(pane, &title);
                 }
 
@@ -1684,7 +1749,7 @@ impl App {
     pub fn poll_panes(&mut self) -> bool {
         let mut changed = false;
         let mut exited = Vec::new();
-        let mut renamed = Vec::new();
+        let mut outputs = Vec::new();
 
         for (id, pane) in &mut self.panes {
             let output = pane.backend.drain();
@@ -1692,13 +1757,10 @@ impl App {
             if !output.is_empty() {
                 changed = true;
 
-                if let Some(title) = pane.titles.scan(&output) {
-                    renamed.push((*id, title));
-                }
-
                 if let Ok(screen) = pane.reader.read(pane.backend.terminal()) {
                     pane.screen = screen;
                 }
+                outputs.push((*id, output));
             }
 
             if let RunState::Exited(code) = pane.backend.state() {
@@ -1706,8 +1768,10 @@ impl App {
             }
         }
 
-        for (id, title) in renamed {
-            self.rename(id, &title);
+        for (id, output) in outputs {
+            if let Some(title) = self.take_output(id, &output) {
+                self.rename(id, &title);
+            }
         }
 
         for (id, code) in exited {
@@ -1736,6 +1800,10 @@ impl App {
         }
 
         if self.refresh_local_branches() {
+            changed = true;
+        }
+
+        if self.refresh_activity() {
             changed = true;
         }
 
@@ -1792,6 +1860,78 @@ impl App {
         for (id, root) in roots {
             let branch = dispatch_os::git::head(&root);
             changed |= self.state.set_project_branch(id, branch).unwrap_or(false);
+        }
+
+        changed
+    }
+
+    /// Works out what every pane is doing, and records what changed.
+    ///
+    /// A pane is looked at soon after it prints, and every pane on a slower
+    /// tick so a quiet one can settle to idle. A pane scrolled back is left
+    /// alone: its screen is history, not the live one. Returns whether any
+    /// status changed.
+    fn refresh_activity(&mut self) -> bool {
+        let now = self.now();
+        let focused = self.state.focused_pane();
+
+        if let Some(focused) = focused {
+            self.state.mark_seen(focused);
+        }
+
+        let mut verdicts = Vec::new();
+        for (id, pane) in &mut self.panes {
+            if pane.scrolled_back {
+                continue;
+            }
+
+            let due = pane.evaluated.is_none_or(|at| {
+                let since = now.saturating_duration_since(at);
+                (pane.dirty && since >= EVALUATE_AFTER_OUTPUT) || since >= EVALUATE_EVERY
+            });
+            if !due {
+                continue;
+            }
+
+            pane.evaluated = Some(now);
+            pane.dirty = false;
+
+            if let Some(verdict) = pane.activity.evaluate(now, &pane.screen.text_lines()) {
+                verdicts.push((*id, verdict, pane.adopted));
+            }
+        }
+
+        let mut changed = false;
+        for (id, verdict, adopted) in verdicts {
+            let Some(before) = self.state.pane(id).map(|pane| pane.status) else {
+                continue;
+            };
+            // An exited pane's last word is its exit; nothing read off its
+            // final screen may overwrite that.
+            if !before.is_live() {
+                continue;
+            }
+
+            let status = match verdict {
+                Verdict::Working => PaneStatus::Running,
+                Verdict::Idle => PaneStatus::Idle,
+                Verdict::Blocked => PaneStatus::Blocked,
+            };
+            if status == before {
+                continue;
+            }
+
+            let _ = self.state.set_pane_status(id, status);
+            changed = true;
+
+            let graced = now.saturating_duration_since(adopted) < GRACE;
+            if before == PaneStatus::Running
+                && status == PaneStatus::Idle
+                && focused != Some(id)
+                && !graced
+            {
+                self.state.mark_unseen(id);
+            }
         }
 
         changed
@@ -2735,6 +2875,7 @@ impl App {
     }
 
     fn send_key(&mut self, key: dispatch_pty::Key, mods: dispatch_pty::Modifiers) {
+        let now = self.now();
         let Some(id) = self.state.focused_pane() else {
             return;
         };
@@ -2765,6 +2906,8 @@ impl App {
             Ok(bytes) if !bytes.is_empty() => {
                 if let Err(error) = pane.backend.write(&bytes) {
                     tracing::warn!(%error, "failed to write to a pane");
+                } else {
+                    pane.activity.input(now);
                 }
             }
             Ok(_) => {}
@@ -2872,6 +3015,7 @@ impl App {
     }
 
     fn paste(&mut self, text: &str) {
+        let now = self.now();
         let Some(id) = self.state.focused_pane() else {
             return;
         };
@@ -2896,6 +3040,8 @@ impl App {
 
         if let Err(error) = pane.backend.write(&bytes) {
             tracing::warn!(%error, "failed to paste into a pane");
+        } else {
+            pane.activity.input(now);
         }
     }
 
@@ -3452,6 +3598,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
     use std::sync::mpsc::{Receiver, Sender};
 
     use dispatch_core::{PaneRole, Project, ProjectSource};
@@ -3542,6 +3690,221 @@ mod tests {
         app.poll_daemon();
 
         ids
+    }
+
+    /// A clock the test moves by hand, installed in `app`.
+    fn hand_clock(app: &mut App) -> Rc<Cell<Instant>> {
+        let now = Rc::new(Cell::new(Instant::now()));
+        let reading = Rc::clone(&now);
+        app.clock = Box::new(move || reading.get());
+        now
+    }
+
+    fn advance(clock: &Rc<Cell<Instant>>, by: Duration) {
+        clock.set(clock.get() + by);
+    }
+
+    /// Delivers `bytes` as `pane`'s output and lets the app take it in.
+    fn print(app: &mut App, daemon: &Sender<ServerMessage>, pane: PaneId, bytes: &[u8]) {
+        daemon
+            .send(ServerMessage::PaneOutput {
+                pane,
+                bytes: bytes.to_vec(),
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+        app.poll_panes();
+    }
+
+    fn status_of(app: &App, pane: PaneId) -> PaneStatus {
+        app.state.pane(pane).expect("the pane exists").status
+    }
+
+    /// Lets a pane that has stopped printing settle: a second of quiet makes
+    /// it idle, which is reported once it has held for the settling time.
+    fn settle(app: &mut App, clock: &Rc<Cell<Instant>>) {
+        advance(clock, Duration::from_millis(1100));
+        app.poll_panes();
+        advance(clock, Duration::from_millis(800));
+        app.poll_panes();
+    }
+
+    #[test]
+    fn output_makes_a_pane_working_and_quiet_makes_it_idle() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, pane, b"compiling\r\n");
+        assert_eq!(status_of(&app, pane), PaneStatus::Running);
+
+        advance(&clock, Duration::from_millis(1100));
+        app.poll_panes();
+        assert_eq!(status_of(&app, pane), PaneStatus::Running, "still settling");
+
+        advance(&clock, Duration::from_millis(800));
+        app.poll_panes();
+        assert_eq!(status_of(&app, pane), PaneStatus::Idle);
+    }
+
+    #[test]
+    fn a_pane_finishing_out_of_focus_is_marked_done_until_focused() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let (background, foreground) = (panes[0], panes[1]);
+        assert_eq!(app.state.focused_pane(), Some(foreground));
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, background, b"working\r\n");
+        settle(&mut app, &clock);
+
+        assert_eq!(status_of(&app, background), PaneStatus::Idle);
+        assert!(app.state.is_unseen(background), "it finished out of sight");
+        assert!(!app.state.is_unseen(foreground));
+
+        app.focus_pane(background);
+        app.poll_panes();
+        assert!(
+            !app.state.is_unseen(background),
+            "looking at it clears the mark"
+        );
+    }
+
+    #[test]
+    fn a_reattach_replay_marks_nothing_done() {
+        // A client attaching is replayed every pane's recent output at once;
+        // without the grace every pane would come back "done".
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+
+        for pane in &panes {
+            print(&mut app, &daemon, *pane, b"history\r\n");
+        }
+        settle(&mut app, &clock);
+
+        for pane in &panes {
+            assert_eq!(status_of(&app, *pane), PaneStatus::Idle);
+            assert!(!app.state.is_unseen(*pane));
+        }
+    }
+
+    #[test]
+    fn a_bell_from_a_pane_out_of_focus_marks_it() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, panes[0], b"\x07");
+
+        assert!(app.state.is_unseen(panes[0]));
+    }
+
+    #[test]
+    fn typing_into_a_pane_is_not_work() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        advance(&clock, Duration::from_secs(4));
+        app.poll_panes();
+        assert_eq!(status_of(&app, pane), PaneStatus::Idle);
+
+        app.send_key(
+            dispatch_pty::Key::Char('l'),
+            dispatch_pty::Modifiers::default(),
+        );
+        advance(&clock, Duration::from_millis(40));
+        print(&mut app, &daemon, pane, b"l");
+        advance(&clock, Duration::from_millis(200));
+        app.poll_panes();
+
+        assert_eq!(
+            status_of(&app, pane),
+            PaneStatus::Idle,
+            "the echo of a keystroke is not the agent working"
+        );
+    }
+
+    #[test]
+    fn a_pane_scrolled_back_keeps_its_state() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, pane, b"output\r\n");
+        assert_eq!(status_of(&app, pane), PaneStatus::Running);
+
+        app.panes.get_mut(&pane).expect("adopted").scrolled_back = true;
+        settle(&mut app, &clock);
+
+        assert_eq!(
+            status_of(&app, pane),
+            PaneStatus::Running,
+            "the screen is not the live one, so it is not read"
+        );
+    }
+
+    #[test]
+    fn a_pane_that_exits_mid_work_stays_exited_and_unmarked() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, panes[0], b"working\r\n");
+        daemon
+            .send(ServerMessage::PaneChanged {
+                pane: panes[0],
+                update: PaneUpdate::Status {
+                    status: PaneStatus::Exited(0),
+                },
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+        settle(&mut app, &clock);
+
+        assert_eq!(status_of(&app, panes[0]), PaneStatus::Exited(0));
+        assert!(!app.state.is_unseen(panes[0]));
+    }
+
+    #[test]
+    fn a_harnesss_rules_decide_blocked() {
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            status: Some(
+                toml::from_str(
+                    r#"
+                    [[rules]]
+                    state = "blocked"
+                    region = "screen"
+                    contains = ["proceed?"]
+                    "#,
+                )
+                .expect("the rules parse"),
+            ),
+            ..dispatch_config::HarnessDef::default()
+        };
+        let (client, daemon, _sent) = Client::for_test();
+        let mut app = App::attached([def].into_iter().collect(), client);
+        let project = Project::new("/tmp/rules", ProjectSource::LocalDir);
+        let project_id = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("the app is listening");
+        app.poll_daemon();
+        let clock = hand_clock(&mut app);
+        let pane = spawn_several(&mut app, &daemon, project_id, 1)[0];
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, pane, b"Do you want to proceed?\r\n");
+
+        assert_eq!(status_of(&app, pane), PaneStatus::Blocked);
     }
 
     #[test]
