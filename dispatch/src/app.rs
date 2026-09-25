@@ -420,6 +420,12 @@ pub struct App {
     sidebar_area: Rect,
     /// How far each machine's section of the sidebar is scrolled.
     sidebar_scroll: sidebar::Scroll,
+    /// The row the sidebar was last scrolled to follow.
+    ///
+    /// Compared against the focus and the selection each frame: only a
+    /// change nudges the scroll, so a wheel scroll is not undone by the very
+    /// next frame drawn after it.
+    anchored: Option<sidebar::Anchor>,
     /// Subagents the user has opened, so they join the tiled grid.
     ///
     /// Which rows are open is a per-client choice, not a property of the
@@ -516,6 +522,7 @@ impl App {
             layout: Vec::new(),
             sidebar_area: Rect::default(),
             sidebar_scroll: sidebar::Scroll::new(),
+            anchored: None,
             expanded: HashSet::new(),
             pending: VecDeque::new(),
             answered: HashMap::new(),
@@ -1827,6 +1834,30 @@ impl App {
             return Ok(());
         }
 
+        // The wheel over the sidebar scrolls the section under it; the grid
+        // never sees it, since no pane is under the pointer.
+        if let Event::Mouse(mouse) = event
+            && matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+            && let Some(device) = sidebar::section_at(
+                &self.state,
+                self.sidebar_area,
+                &self.sidebar_scroll,
+                mouse.column,
+                mouse.row,
+            )
+        {
+            let offset = self.sidebar_scroll.entry(device).or_insert(0);
+            *offset = if mouse.kind == MouseEventKind::ScrollUp {
+                offset.saturating_sub(1)
+            } else {
+                offset.saturating_add(1)
+            };
+            return Ok(());
+        }
+
         let layout = std::mem::take(&mut self.layout);
         let action = self.router.handle(event, &layout);
         self.layout = layout;
@@ -2953,6 +2984,22 @@ impl App {
             body.width.saturating_sub(sidebar_width),
             body.height,
         );
+
+        // Scrolled to the focus only when the focus has moved, so the wheel's
+        // scroll survives every frame drawn in between.
+        let anchor = self
+            .state
+            .focused_pane()
+            .map(sidebar::Anchor::Pane)
+            .or_else(|| self.state.selected_project().map(sidebar::Anchor::Project));
+        let moved = anchor != self.anchored;
+        sidebar::settle(
+            &self.state,
+            sidebar_area,
+            &mut self.sidebar_scroll,
+            if moved { anchor } else { None },
+        );
+        self.anchored = anchor;
 
         frame.render_widget(
             Sidebar::new(&self.state)
@@ -6658,5 +6705,41 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(app.state.devices().len(), devices, "no row was added");
+    }
+
+    #[test]
+    fn the_wheel_over_the_sidebar_scrolls_it_rather_than_a_pane() {
+        let mut app = App::new(HarnessRegistry::default());
+        for index in 0..40 {
+            app.state.add_project(Project::new(
+                format!("/tmp/p{index}"),
+                ProjectSource::LocalDir,
+            ));
+        }
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+
+        let wheel = Event::Mouse(dispatch_tui::input::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle(&wheel, Size::new(100, 20))
+            .expect("the wheel is handled");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+
+        // Row 0 is the top row and row 1 the sidebar's frame, so row 2 is the
+        // first project shown — p1 now, and not scrolled back to the
+        // selected p0 by the redraw.
+        let text = rendered_text(&terminal);
+        let first = sidebar_column(text.lines().nth(2).expect("the frame has rows"));
+        assert!(first.contains(" p1 "), "{text}");
     }
 }

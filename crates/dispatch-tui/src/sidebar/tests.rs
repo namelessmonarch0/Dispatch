@@ -1227,3 +1227,144 @@ fn a_long_branch_name_is_cut_short_inside_the_frame() {
     );
     assert!(line.contains('…'), "the cut is visible: {line:?}");
 }
+
+/// One machine with `count` projects named p0, p1, ….
+fn many(count: usize) -> AppState {
+    let mut state = AppState::new();
+    for index in 0..count {
+        state.add_project(Project::new(
+            format!("/tmp/p{index}"),
+            ProjectSource::LocalDir,
+        ));
+    }
+    state
+}
+
+fn render_scrolled(state: &AppState, scroll: &Scroll, width: u16, height: u16) -> Vec<String> {
+    let area = Rect::new(0, 0, width, height);
+    let mut buf = Buffer::empty(area);
+    Sidebar::new(state)
+        .with_scroll(scroll)
+        .render(area, &mut buf);
+    (0..height).map(|y| row_text(&buf, y)).collect()
+}
+
+#[test]
+fn a_scrolled_section_starts_at_its_offset() {
+    let state = many(20);
+    let scroll = Scroll::from([(DeviceId::nil(), 5)]);
+
+    let lines = render_scrolled(&state, &scroll, WIDTH, 8);
+
+    assert!(lines[TOP as usize].contains(" p5 "), "{lines:#?}");
+}
+
+#[test]
+fn an_offset_past_the_end_is_brought_back() {
+    let state = many(20);
+    let mut scroll = Scroll::from([(DeviceId::nil(), 99)]);
+
+    settle(&state, Rect::new(0, 0, WIDTH, 8), &mut scroll, None);
+
+    // Six rows inside the frame show the last six of twenty.
+    assert_eq!(scroll[&DeviceId::nil()], 14);
+}
+
+#[test]
+fn settling_on_a_pane_scrolls_just_far_enough_to_show_it() {
+    let mut state = many(20);
+    let p15 = state.projects()[15].id;
+    let pane = spawn(&mut state, p15, "claude");
+    let mut scroll = Scroll::new();
+
+    settle(
+        &state,
+        Rect::new(0, 0, WIDTH, 8),
+        &mut scroll,
+        Some(Anchor::Pane(pane)),
+    );
+
+    // The pane is row 16; showing it as the last of six rows starts at 11.
+    assert_eq!(scroll[&DeviceId::nil()], 11);
+    let lines = render_scrolled(&state, &scroll, WIDTH, 8);
+    assert!(lines[TOP as usize + 5].contains("claude"), "{lines:#?}");
+}
+
+#[test]
+fn settling_without_an_anchor_leaves_the_wheels_scroll_alone() {
+    let state = many(20);
+    let mut scroll = Scroll::from([(DeviceId::nil(), 3)]);
+
+    settle(&state, Rect::new(0, 0, WIDTH, 8), &mut scroll, None);
+
+    assert_eq!(scroll[&DeviceId::nil()], 3);
+}
+
+#[test]
+fn rows_hidden_below_are_counted_on_the_line_after_the_section() {
+    let state = many(20);
+    let lines = render_scrolled(&state, &Scroll::new(), WIDTH, 8);
+
+    assert!(lines[7].contains("↓ 14"), "{lines:#?}");
+}
+
+#[test]
+fn rows_hidden_above_are_counted_beside_the_sections_name() {
+    let state = many(20);
+    let scroll = Scroll::from([(DeviceId::nil(), 5)]);
+
+    let lines = render_scrolled(&state, &scroll, WIDTH, 8);
+
+    assert!(lines[0].contains("Projects ↑ 5"), "{lines:#?}");
+}
+
+#[test]
+fn a_divider_carries_a_count_for_each_section_it_separates() {
+    let mut state = AppState::new();
+    let laptop = state.add_device(Device::new("laptop"));
+    let tower = state.add_device(Device::new("a-tower-with-a-very-long-hostname"));
+    for index in 0..10 {
+        state.add_project(
+            Project::new(format!("/tmp/l{index}"), ProjectSource::LocalDir).with_device(laptop),
+        );
+        state.add_project(
+            Project::new(format!("/tmp/t{index}"), ProjectSource::LocalDir).with_device(tower),
+        );
+    }
+    let scroll = Scroll::from([(tower, 2)]);
+
+    // Twelve rows: ten inside, one divider, nine shared five and four.
+    let lines = render_scrolled(&state, &scroll, WIDTH, 12);
+    let divider = &lines[6];
+
+    assert!(
+        divider.contains("↑ 2"),
+        "the tower's own count: {divider:?}"
+    );
+    assert!(divider.contains("↓ 5"), "the laptop's count: {divider:?}");
+    assert!(divider.ends_with('┤'), "{divider:?}");
+}
+
+#[test]
+fn a_click_in_a_scrolled_section_finds_the_row_drawn_there() {
+    let state = many(20);
+    let p5 = state.projects()[5].id;
+    let scroll = Scroll::from([(DeviceId::nil(), 5)]);
+
+    assert_eq!(
+        hit_test(&state, Rect::new(0, 0, WIDTH, 8), &scroll, LEFT + 4, TOP),
+        Some(Hit::Project(p5))
+    );
+}
+
+#[test]
+fn the_wheel_finds_the_section_under_it() {
+    let (state, laptop, tower) = fleet();
+    let area = Rect::new(0, 0, WIDTH, 10);
+    let scroll = Scroll::new();
+
+    assert_eq!(section_at(&state, area, &scroll, 5, 1), Some(laptop));
+    assert_eq!(section_at(&state, area, &scroll, 5, 6), Some(tower));
+    assert_eq!(section_at(&state, area, &scroll, 5, 5), None, "a divider");
+    assert_eq!(section_at(&state, area, &scroll, 0, 1), None, "the frame");
+}

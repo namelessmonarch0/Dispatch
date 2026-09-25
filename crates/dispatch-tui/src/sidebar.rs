@@ -22,8 +22,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// cost two columns, and the sidebar is two wider so titles keep their room.
 pub const WIDTH: u16 = 34;
 
-/// The title on the frame.
-const TITLE: &str = " Projects ";
+/// What the sidebar is called when it is one list.
+const TITLE: &str = "Projects";
 
 /// What a pane is doing, one glyph per state, drawn in the row's last column.
 ///
@@ -252,13 +252,32 @@ enum Row<'a> {
     Pane(PaneId, u16),
 }
 
+impl Row<'_> {
+    /// Whether this is the row `anchor` names.
+    fn is(&self, anchor: Anchor) -> bool {
+        match (*self, anchor) {
+            (Row::Pane(id, _), Anchor::Pane(wanted)) => id == wanted,
+            (Row::Project(id), Anchor::Project(wanted)) => id == wanted,
+            _ => false,
+        }
+    }
+}
+
+/// A row the sidebar should keep in view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Anchor {
+    /// The focused pane's row.
+    Pane(PaneId),
+    /// The selected project's row, when no pane is focused.
+    Project(ProjectId),
+}
+
 /// Where a top-level pane's row starts: under its project's name.
 const PANE: u16 = 4;
 
 /// One machine's share of the sidebar.
 struct Section<'a> {
     /// Which offset in [`Scroll`] this section reads.
-    #[expect(dead_code, reason = "read once a section can be scrolled")]
     key: DeviceId,
     /// The machine named on the section's header, when the sidebar is split.
     device: Option<DeviceId>,
@@ -279,7 +298,6 @@ impl<'a> Section<'a> {
     }
 
     /// How many rows are hidden below the body.
-    #[expect(dead_code, reason = "read once hidden rows are counted")]
     fn below(&self) -> usize {
         self.rows
             .len()
@@ -371,6 +389,36 @@ fn section<'a>(
         body,
         rows,
         offset,
+    }
+}
+
+/// Brings every section's scroll back inside its rows and, when `anchor` is
+/// given, scrolls the section holding that row just far enough to show it.
+///
+/// The caller passes an anchor only when the focus or the selection has
+/// moved: anchoring every frame would undo a wheel scroll as fast as it
+/// happened.
+pub fn settle(state: &AppState, area: Rect, scroll: &mut Scroll, anchor: Option<Anchor>) {
+    let found: Vec<(DeviceId, usize, Option<usize>, usize)> = sections(state, area, scroll)
+        .iter()
+        .map(|section| {
+            let at = anchor.and_then(|anchor| section.rows.iter().position(|row| row.is(anchor)));
+            (
+                section.key,
+                section.offset,
+                at,
+                usize::from(section.body.height),
+            )
+        })
+        .collect();
+
+    for (key, offset, at, height) in found {
+        let offset = match at {
+            Some(at) if height > 0 && at < offset => at,
+            Some(at) if height > 0 && at >= offset + height => at + 1 - height,
+            _ => offset,
+        };
+        scroll.insert(key, u16::try_from(offset).unwrap_or(u16::MAX));
     }
 }
 
@@ -562,6 +610,12 @@ fn divider(buf: &mut Buffer, area: Rect, y: u16, style: Style) {
     }
 }
 
+/// The text counting rows hidden below `section`, for the line after it.
+fn below_label(section: &Section<'_>) -> Option<String> {
+    let below = section.below();
+    (below > 0).then(|| format!(" ↓ {below} "))
+}
+
 impl Widget for Sidebar<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
@@ -580,7 +634,13 @@ impl Widget for Sidebar<'_> {
             if index > 0 {
                 divider(buf, area, section.header, edge);
             }
-            self.render_label(buf, area, section);
+            // The section above's `↓` count is drawn at the right end of this
+            // same line, so the name leaves it room.
+            let reserve = index
+                .checked_sub(1)
+                .and_then(|previous| below_label(&sections[previous]))
+                .map_or(0, |label| label.width() + 1);
+            self.render_label(buf, area, section, reserve);
 
             for (y, row) in section.visible() {
                 match *row {
@@ -594,6 +654,17 @@ impl Widget for Sidebar<'_> {
                         self.render_pane(buf, section.body, y, pane, focused, indent);
                     }
                 }
+            }
+        }
+
+        // Counted on the line after each section — the next one's name line,
+        // or the bottom border — right-aligned, one dash in from the corner.
+        for section in &sections {
+            if let Some(label) = below_label(section) {
+                let y = section.body.y + section.body.height;
+                let width = u16::try_from(label.width()).unwrap_or(u16::MAX);
+                let x = (area.x + area.width).saturating_sub(2 + width);
+                write(buf, area, x, y, &label, edge);
             }
         }
     }
@@ -668,6 +739,29 @@ fn hit_row(state: &AppState, body: Rect, row: &Row<'_>, x: u16) -> Option<Hit> {
     }
 }
 
+/// Which machine's section holds `(x, y)`, for the wheel to scroll.
+///
+/// Only a section's rows count: the frame and the lines naming machines
+/// belong to no one section's scroll.
+#[must_use]
+pub fn section_at(
+    state: &AppState,
+    area: Rect,
+    scroll: &Scroll,
+    x: u16,
+    y: u16,
+) -> Option<DeviceId> {
+    let inner = inner(area);
+    if x < inner.x || x >= inner.x + inner.width {
+        return None;
+    }
+
+    sections(state, area, scroll)
+        .into_iter()
+        .find(|section| y >= section.body.y && y < section.body.y + section.body.height)
+        .map(|section| section.key)
+}
+
 impl Sidebar<'_> {
     /// Draws one project row, at the left edge of its section.
     fn render_project(
@@ -730,19 +824,33 @@ impl Sidebar<'_> {
         );
     }
 
-    /// Writes a section's name onto the line that heads it.
+    /// Writes a section's name onto the line that heads it, followed by how
+    /// many of its rows are scrolled away above, leaving `reserve` columns
+    /// free at the right for the count of the section above it.
     ///
     /// Dim and labelled when the machine's connection is down: its agents are
     /// still running, so the section stays, but a name that looks live while
     /// nothing can reach it is worse than no name.
-    fn render_label(&self, buf: &mut Buffer, area: Rect, section: &Section<'_>) {
+    fn render_label(&self, buf: &mut Buffer, area: Rect, section: &Section<'_>, reserve: usize) {
         // Inside the corners, with a blank either side, the way a frame's own
         // title sits.
         let line = Rect::new(area.x + 1, section.header, area.width.saturating_sub(2), 1);
-        let room = usize::from(line.width.saturating_sub(2));
+        let up = if section.offset > 0 {
+            format!(" ↑ {}", section.offset)
+        } else {
+            String::new()
+        };
+        let room = usize::from(line.width.saturating_sub(2)).saturating_sub(up.width() + reserve);
 
         let Some(id) = section.device else {
-            write(buf, line, line.x, line.y, TITLE, Style::default());
+            write(
+                buf,
+                line,
+                line.x,
+                line.y,
+                &format!(" {TITLE}{up} "),
+                Style::default(),
+            );
             return;
         };
         let Some(device) = self.state.device(id) else {
@@ -767,7 +875,7 @@ impl Sidebar<'_> {
             )
         };
 
-        write(buf, line, line.x, line.y, &format!(" {name} "), style);
+        write(buf, line, line.x, line.y, &format!(" {name}{up} "), style);
     }
 
     /// Draws one pane row `indent` columns in from the sidebar's edge.
