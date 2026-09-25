@@ -752,7 +752,9 @@ impl Sidebar<'_> {
         let (name, style) = if device.reachable {
             (
                 truncate(&device.name, room),
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Reset)
+                    .add_modifier(Modifier::BOLD),
             )
         } else {
             // The name gives way rather than the word this line exists to

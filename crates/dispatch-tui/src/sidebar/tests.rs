@@ -1028,6 +1028,33 @@ fn a_pending_device_with_no_projects_still_gets_a_section() {
 }
 
 #[test]
+fn a_reachable_machines_name_is_drawn_at_full_strength() {
+    // The name is written onto the frame, which is faded; a live machine's
+    // must not take that colour, or it looks as dead as an unreachable one.
+    let (mut state, _, tower) = fleet();
+    state.set_device_reachable(tower, false);
+
+    let buf = render(&state, WIDTH, 10);
+    let lines = render_lines(&state, WIDTH, 10);
+    let divider = lines
+        .iter()
+        .position(|line| line.contains("tower"))
+        .expect("the second machine is named");
+    let first_letter = |y: usize, name: &str| {
+        let x = u16::try_from(column_of(&lines[y], name)).expect("inside the sidebar");
+        let y = u16::try_from(y).expect("inside the sidebar");
+        buf.cell((x, y)).expect("cell exists").clone()
+    };
+
+    let laptop = first_letter(0, "laptop");
+    assert_eq!(laptop.fg, Color::Reset, "{lines:#?}");
+    assert!(laptop.modifier.contains(Modifier::BOLD), "{lines:#?}");
+
+    let tower = first_letter(divider, "tower");
+    assert_eq!(tower.fg, Theme::fallback().faded, "{lines:#?}");
+}
+
+#[test]
 fn the_git_mark_column_is_reserved_on_every_project_row() {
     // Reserved rather than inserted, so a repository and a plain directory
     // line their names up with each other.
