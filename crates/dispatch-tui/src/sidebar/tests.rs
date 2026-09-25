@@ -2,6 +2,7 @@
 
 use super::*;
 
+use crate::theme::Theme;
 use dispatch_core::{Device, DeviceId, HarnessId, Pane, PaneId, Project, ProjectSource};
 
 /// State with two projects; the first is selected.
@@ -115,19 +116,31 @@ fn the_selected_project_is_emphasised() {
 }
 
 #[test]
-fn the_focused_pane_is_marked() {
+fn the_focused_pane_is_tinted() {
     let (mut state, alpha, _) = state();
     spawn(&mut state, alpha, "claude");
     spawn(&mut state, alpha, "codex");
 
     // Spawning focuses the new pane, so codex is focused.
     let buf = render(&state, WIDTH, 10);
+    let tint = Theme::fallback().tint;
 
-    assert!(
-        !row_text(&buf, TOP + 1).contains('▌'),
+    assert_ne!(
+        buf.cell((LEFT + 8, TOP + 1)).expect("cell exists").bg,
+        tint,
         "claude is not focused"
     );
-    assert!(row_text(&buf, TOP + 2).contains('▌'), "codex is focused");
+    for x in LEFT + 4..WIDTH - 1 {
+        assert_eq!(
+            buf.cell((x, TOP + 2)).expect("cell exists").bg,
+            tint,
+            "column {x} of the focused row is tinted"
+        );
+    }
+    assert!(
+        !row_text(&buf, TOP + 2).contains('▌'),
+        "and not marked with a bar"
+    );
 }
 
 #[test]
@@ -143,6 +156,25 @@ fn a_long_name_is_truncated_rather_than_overflowing() {
 
     assert!(line.chars().count() <= 20, "line overflowed: {line:?}");
     assert!(line.contains('…'), "truncation should be visible: {line:?}");
+}
+
+#[test]
+fn a_wide_name_is_cut_by_the_columns_it_takes() {
+    // Four CJK characters take eight columns; counting them as four would
+    // let the row run past the frame.
+    let mut state = AppState::new();
+    state.add_project(
+        Project::new("/tmp/x", ProjectSource::LocalDir).with_name("日本語のプロジェクト名前"),
+    );
+
+    let buf = render(&state, 20, 5);
+    let line = row_text(&buf, TOP);
+
+    assert!(
+        line.ends_with('│'),
+        "the frame is not overwritten: {line:?}"
+    );
+    assert!(line.contains('…'), "the cut is visible: {line:?}");
 }
 
 #[test]
@@ -312,7 +344,7 @@ fn a_click_on_a_closed_panes_tombstone_finds_nothing() {
     state.close_pane(pane).expect("the pane exists");
 
     let area = Rect::new(0, 0, WIDTH, 10);
-    assert_eq!(hit_test(&state, area, LEFT + 4, TOP + 1), None);
+    assert_eq!(hit_test(&state, area, LEFT + 8, TOP + 1), None);
 }
 
 #[test]
@@ -360,29 +392,27 @@ fn rows_are_drawn_inside_the_frame() {
 }
 
 #[test]
-fn the_selected_projects_whole_row_is_highlighted() {
+fn the_selected_projects_whole_row_is_tinted() {
     // Emphasis on the name alone is easy to miss in a list of directory names
-    // that already look alike. The bar runs the width of the list so the eye
+    // that already look alike. The tint runs the width of the list so the eye
     // finds it without reading.
     let (state, _, _) = state();
     let buf = render(&state, WIDTH, 6);
+    let tint = Theme::fallback().tint;
 
     for x in LEFT..WIDTH - 1 {
+        let cell = buf.cell((x, TOP)).expect("cell exists");
+        assert_eq!(cell.bg, tint, "column {x} of the selected row is tinted");
         assert!(
-            buf.cell((x, TOP))
-                .expect("cell exists")
-                .modifier
-                .contains(Modifier::REVERSED),
-            "column {x} of the selected row is part of the bar"
+            !cell.modifier.contains(Modifier::REVERSED),
+            "and not inverted"
         );
     }
 
-    assert!(
-        !buf.cell((LEFT, TOP + 1))
-            .expect("cell exists")
-            .modifier
-            .contains(Modifier::REVERSED),
-        "an unselected project carries no bar"
+    assert_ne!(
+        buf.cell((LEFT, TOP + 1)).expect("cell exists").bg,
+        tint,
+        "an unselected project carries no tint"
     );
 }
 
@@ -391,12 +421,47 @@ fn the_frame_is_not_painted_by_the_highlight() {
     let (state, _, _) = state();
     let buf = render(&state, WIDTH, 6);
 
-    assert!(
-        !buf.cell((0, TOP))
+    assert_ne!(
+        buf.cell((0, TOP)).expect("cell exists").bg,
+        Theme::fallback().tint,
+        "the tint stops at the frame"
+    );
+}
+
+#[test]
+fn every_icon_has_a_blank_column_after_it() {
+    // A Nerd Font glyph is routinely drawn wider than its cell; with nothing
+    // after it, it runs into the next glyph or the first letter of the name.
+    let (mut state, alpha, _) = state();
+    spawn(&mut state, alpha, "claude");
+
+    let buf = render(&state, WIDTH, 6);
+    let blank = |x: u16, y: u16| buf.cell((x, y)).expect("cell exists").symbol() == " ";
+
+    // The project: twisty, blank, folder, blank, name.
+    assert!(blank(LEFT + 1, TOP) && blank(LEFT + 3, TOP));
+    // The pane: twisty, blank, harness icon, blank, title.
+    assert!(blank(LEFT + 5, TOP + 1) && blank(LEFT + 7, TOP + 1));
+}
+
+#[test]
+fn the_state_glyph_keeps_a_blank_between_it_and_the_frame() {
+    let (mut state, alpha, _) = state();
+    spawn(&mut state, alpha, "claude");
+
+    let buf = render(&state, WIDTH, 6);
+
+    assert_eq!(
+        buf.cell((WIDTH - 2, TOP + 1))
             .expect("cell exists")
-            .modifier
-            .contains(Modifier::REVERSED),
-        "the bar stops at the frame"
+            .symbol(),
+        " "
+    );
+    assert_eq!(
+        buf.cell((WIDTH - 1, TOP + 1))
+            .expect("cell exists")
+            .symbol(),
+        "│"
     );
 }
 
@@ -444,24 +509,11 @@ fn a_pane_with_children_carries_a_twisty_and_one_without_does_not() {
     state.toggle_pane_collapsed(parent);
     let buf = render(&state, WIDTH, 8);
     assert_eq!(
-        buf.cell((LEFT + 2, TOP + 1)).expect("cell exists").symbol(),
+        buf.cell((LEFT + 4, TOP + 1)).expect("cell exists").symbol(),
         SHUT,
         "and it flips when collapsed"
     );
     let _ = lonely;
-}
-
-#[test]
-fn the_focus_marker_is_not_a_twisty() {
-    // Two different `▸` in one row read as one control.
-    let (mut state, alpha, _) = state();
-    spawn(&mut state, alpha, "claude");
-
-    let buf = render(&state, WIDTH, 6);
-    let row = row_text(&buf, TOP + 1);
-
-    assert!(row.contains('▌'), "the focused pane is marked: {row:?}");
-    assert!(!row.contains(SHUT), "and not with a twisty: {row:?}");
 }
 
 #[test]
@@ -549,13 +601,13 @@ fn a_click_on_a_panes_twisty_toggles_it_rather_than_focusing_it() {
 
     let area = Rect::new(0, 0, WIDTH, 10);
 
-    // The twisty sits in the row's first column, two in from the list's edge.
+    // The twisty sits in the row's first column, four in from the list's edge.
     assert_eq!(
-        hit_test(&state, area, LEFT + 2, TOP + 1),
+        hit_test(&state, area, LEFT + 4, TOP + 1),
         Some(Hit::Twisty(parent))
     );
     assert_eq!(
-        hit_test(&state, area, LEFT + 3, TOP + 1),
+        hit_test(&state, area, LEFT + 5, TOP + 1),
         Some(Hit::Pane(parent)),
         "the rest of the row still focuses the pane"
     );
@@ -569,7 +621,7 @@ fn a_click_on_a_childless_panes_twisty_column_focuses_it() {
 
     let area = Rect::new(0, 0, WIDTH, 10);
     assert_eq!(
-        hit_test(&state, area, LEFT + 2, TOP + 1),
+        hit_test(&state, area, LEFT + 4, TOP + 1),
         Some(Hit::Pane(pane))
     );
 }
@@ -588,7 +640,7 @@ fn a_tombstones_twisty_still_toggles() {
 
     let area = Rect::new(0, 0, WIDTH, 10);
     assert_eq!(
-        hit_test(&state, area, LEFT + 2, TOP + 1),
+        hit_test(&state, area, LEFT + 4, TOP + 1),
         Some(Hit::Twisty(parent))
     );
 }
@@ -602,10 +654,10 @@ fn the_twisty_is_a_nerd_font_caret() {
     assert_eq!(SHUT, "\u{f0da}");
 }
 
-/// The last column inside the frame, where a pane's state is drawn.
+/// Two columns in from the frame, where a pane's state is drawn.
 fn state_cell(buf: &Buffer, y: u16) -> (String, Color) {
     let cell = buf
-        .cell((buf.area.width - 2, y))
+        .cell((buf.area.width - 3, y))
         .expect("the row has a last column");
     (cell.symbol().to_string(), cell.fg)
 }
@@ -671,7 +723,7 @@ fn a_tombstone_says_it_is_closed() {
 
     assert_eq!(
         state_cell(&buf, TOP + 1),
-        (CLOSED.to_string(), Color::DarkGray)
+        (CLOSED.to_string(), Theme::fallback().faded)
     );
 }
 
@@ -711,10 +763,9 @@ fn a_pane_is_marked_with_the_icon_of_its_harness() {
         .with_harnesses(&harnesses)
         .render(area, &mut buf);
 
-    // Two columns in from the row's own edge: past its twisty and its focus
-    // marker.
+    // Two columns in from the row's own start, past its twisty and a blank.
     assert_eq!(
-        buf.cell((LEFT + 2 + 2, TOP + 1))
+        buf.cell((LEFT + 4 + 2, TOP + 1))
             .expect("cell exists")
             .symbol(),
         "C"
@@ -736,7 +787,7 @@ fn a_pane_whose_harness_is_unregistered_is_marked_generically() {
         .render(area, &mut buf);
 
     assert_eq!(
-        buf.cell((LEFT + 2 + 2, TOP + 1))
+        buf.cell((LEFT + 4 + 2, TOP + 1))
             .expect("cell exists")
             .symbol(),
         dispatch_config::harness::DEFAULT_ICON
@@ -744,38 +795,7 @@ fn a_pane_whose_harness_is_unregistered_is_marked_generically() {
 }
 
 #[test]
-fn a_project_folder_is_open_while_its_panes_are_shown() {
-    let (mut state, alpha, _) = state();
-    spawn(&mut state, alpha, "claude");
-
-    let buf = render(&state, WIDTH, 6);
-    assert_eq!(
-        buf.cell((LEFT + 2, TOP)).expect("cell exists").symbol(),
-        OPEN_FOLDER
-    );
-
-    state.toggle_project_collapsed(alpha);
-    let buf = render(&state, WIDTH, 6);
-    assert_eq!(
-        buf.cell((LEFT + 2, TOP)).expect("cell exists").symbol(),
-        SHUT_FOLDER
-    );
-}
-
-#[test]
-fn a_project_with_nothing_in_it_is_a_shut_folder() {
-    // There is nothing inside it to be looking at.
-    let (state, _, _) = state();
-    let buf = render(&state, WIDTH, 6);
-
-    assert_eq!(
-        buf.cell((LEFT + 2, TOP)).expect("cell exists").symbol(),
-        SHUT_FOLDER
-    );
-}
-
-#[test]
-fn a_repository_carries_a_git_mark_beside_its_folder() {
+fn a_plain_directory_is_a_folder_and_a_repository_is_marked_as_one() {
     let mut state = AppState::new();
     state.add_project(Project::new("/tmp/plain", ProjectSource::LocalDir));
     state.add_project(Project::new(
@@ -786,14 +806,12 @@ fn a_repository_carries_a_git_mark_beside_its_folder() {
     let buf = render(&state, WIDTH, 6);
 
     assert_eq!(
-        buf.cell((LEFT + 1, TOP)).expect("cell exists").symbol(),
-        " ",
-        "a plain directory has no git mark"
+        buf.cell((LEFT + 2, TOP)).expect("cell exists").symbol(),
+        SHUT_FOLDER
     );
     assert_eq!(
-        buf.cell((LEFT + 1, TOP + 1)).expect("cell exists").symbol(),
-        REPOSITORY,
-        "and a repository does"
+        buf.cell((LEFT + 2, TOP + 1)).expect("cell exists").symbol(),
+        REPOSITORY
     );
 }
 

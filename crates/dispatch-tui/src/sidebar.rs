@@ -5,6 +5,7 @@
 //! more than one, because a lone row naming this machine costs a line and
 //! indents everything under it to say what the user already knows.
 
+use crate::theme::Theme;
 use dispatch_config::HarnessRegistry;
 use dispatch_config::harness::DEFAULT_ICON;
 use dispatch_core::{AppState, DeviceId, Pane, PaneId, PaneStatus, ProjectId, ProjectSource};
@@ -12,13 +13,14 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Widget};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Width the sidebar asks for.
 ///
-/// Four columns wider than the list itself needs: two go to the frame and two
-/// to the twisty column, so the room a title has to be read in is what it was
-/// before either was drawn.
-pub const WIDTH: u16 = 32;
+/// Every icon is followed by a blank column, because a Nerd Font glyph drawn
+/// wider than its cell otherwise runs into whatever is next to it. Those gaps
+/// cost two columns, and the sidebar is two wider so titles keep their room.
+pub const WIDTH: u16 = 34;
 
 /// The title on the frame.
 const TITLE: &str = " Projects ";
@@ -60,16 +62,10 @@ const SHUT: &str = "\u{f0da}";
 /// Drawn where a node has no children to hide.
 const LEAF: &str = " ";
 
-/// The mark beside the folder of a project kept in a git repository.
-///
-/// Its own column, blank on a project that is a plain directory, so both kinds
-/// of row line their names up with each other.
+/// The mark of a project kept in a git repository.
 pub const REPOSITORY: &str = "\u{e725}";
 
-/// A project whose panes are listed below it.
-pub const OPEN_FOLDER: &str = "\u{f115}";
-
-/// A project whose panes are folded away, or which has none.
+/// A plain directory's mark.
 pub const SHUT_FOLDER: &str = "\u{f07b}";
 
 /// The mark on a machine's row.
@@ -78,19 +74,8 @@ pub const MACHINE: &str = "\u{f109}";
 /// What a machine's row says when its connection is down.
 const UNREACHABLE: &str = "unreachable";
 
-/// How far a row's text sits from the start of that row.
-///
-/// The same for both kinds of row, which is what lines a project's name up
-/// with the titles beneath it. A project spends those columns on its twisty,
-/// the git mark and its folder; a pane spends them on its twisty, its focus
-/// marker and the icon of the harness running in it.
+/// How far a row's text sits from its start: twisty, blank, icon, blank.
 const NAME: u16 = 4;
-
-/// Marks the focused pane's row.
-///
-/// A bar rather than an arrow: the twisty beside it is already an arrow, and
-/// two of them in one row read as one control.
-const FOCUS: &str = "▌";
 
 /// The frame drawn around the list.
 fn block() -> Block<'static> {
@@ -111,6 +96,7 @@ fn inner(area: Rect) -> Rect {
 pub struct Sidebar<'a> {
     state: &'a AppState,
     harnesses: Option<&'a HarnessRegistry>,
+    theme: Theme,
 }
 
 impl<'a> Sidebar<'a> {
@@ -120,6 +106,7 @@ impl<'a> Sidebar<'a> {
         Self {
             state,
             harnesses: None,
+            theme: Theme::fallback(),
         }
     }
 
@@ -133,6 +120,13 @@ impl<'a> Sidebar<'a> {
         self
     }
 
+    /// Draws in `theme` rather than the built-in one.
+    #[must_use]
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
+    }
+
     /// The mark for the harness running in `pane`.
     fn icon(&self, pane: &Pane) -> &str {
         self.harnesses
@@ -141,51 +135,67 @@ impl<'a> Sidebar<'a> {
     }
 }
 
-/// The mark for a project's folder, by whether you are looking inside it.
-fn folder_icon(open: bool) -> &'static str {
-    if open { OPEN_FOLDER } else { SHUT_FOLDER }
-}
-
-/// The mark beside that folder, by what kind of directory it is.
+/// A project's mark: git for a repository, a folder for a plain directory.
+///
+/// One mark rather than a folder with a git mark beside it: the twisty
+/// already says whether the folder is open, and a second glyph there was one
+/// more thing to collide.
 fn source_icon(source: &ProjectSource) -> &'static str {
     match source {
-        ProjectSource::LocalDir => " ",
+        ProjectSource::LocalDir => SHUT_FOLDER,
         ProjectSource::GitRepo { .. } => REPOSITORY,
     }
 }
 
 /// Writes `text` at `(x, y)`, clipped to `area`, and returns the next column.
+///
+/// Measured in display columns rather than characters, so a wide character
+/// takes the two cells it is drawn in rather than pushing the rest of the row
+/// out of line.
 fn write(buf: &mut Buffer, area: Rect, x: u16, y: u16, text: &str, style: Style) -> u16 {
-    let mut cursor = x;
-
-    for grapheme in text.chars() {
-        if cursor >= area.x + area.width || y >= area.y + area.height {
-            break;
-        }
-        if let Some(cell) = buf.cell_mut((cursor, y)) {
-            cell.set_symbol(&grapheme.to_string());
-            cell.set_style(style);
-        }
-        cursor += 1;
+    let right = area.x + area.width;
+    if x >= right || y < area.y || y >= area.y + area.height {
+        return x;
     }
 
-    cursor
+    buf.set_stringn(x, y, text, usize::from(right - x), style).0
 }
 
-/// Truncates `text` to `width` columns, marking the cut with an ellipsis.
+/// Paints the row from `x` to the list's right edge in `style`, under
+/// whatever is written on it afterwards.
+fn fill(buf: &mut Buffer, area: Rect, x: u16, y: u16, style: Style) {
+    for column in x..area.x + area.width {
+        if let Some(cell) = buf.cell_mut((column, y)) {
+            cell.set_style(style);
+        }
+    }
+}
+
+/// Truncates `text` to `width` display columns, marking the cut with an
+/// ellipsis.
 ///
 /// Project names come from directory names and are routinely longer than the
 /// sidebar.
 fn truncate(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
+    if text.width() <= width {
         return text.to_string();
     }
     if width <= 1 {
         return "…".to_string();
     }
 
-    let kept: String = text.chars().take(width - 1).collect();
-    format!("{kept}…")
+    let mut kept = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let columns = character.width().unwrap_or(0);
+        if used + columns > width - 1 {
+            break;
+        }
+        kept.push(character);
+        used += columns;
+    }
+    kept.push('…');
+    kept
 }
 
 /// The glyph in a row's twisty column.
@@ -205,9 +215,9 @@ fn twisty(has_children: bool, collapsed: bool) -> &'static str {
 /// A tombstone reports being closed whatever its process did: a closed row
 /// with live work beneath it has to look different from one that is merely
 /// finished.
-fn state_glyph(pane: &Pane) -> (&'static str, Style) {
+fn state_glyph(pane: &Pane, theme: &Theme) -> (&'static str, Style) {
     if pane.closed {
-        return (CLOSED, Style::default().fg(Color::DarkGray));
+        return (CLOSED, Style::default().fg(theme.faded));
     }
 
     match pane.status {
@@ -216,7 +226,7 @@ fn state_glyph(pane: &Pane) -> (&'static str, Style) {
         PaneStatus::Idle => (IDLE, Style::default().fg(Color::Blue)),
         // A pane that exited stays listed until it is closed, so it has to be
         // visibly different from one that is still working.
-        PaneStatus::Exited(0) => (DONE, Style::default().fg(Color::DarkGray)),
+        PaneStatus::Exited(0) => (DONE, Style::default().fg(theme.faded)),
         PaneStatus::Exited(_) => (FAILED, Style::default().fg(Color::Red)),
     }
 }
@@ -289,14 +299,14 @@ fn rows(state: &AppState) -> Vec<Row> {
                     continue;
                 }
 
-                rows.push(Row::Pane(pane.id, step + 2));
+                rows.push(Row::Pane(pane.id, step + 4));
 
                 if state.is_pane_collapsed(pane.id) {
                     continue;
                 }
 
                 for child in state.children_of(pane.id) {
-                    rows.push(Row::Pane(child.id, step + 4));
+                    rows.push(Row::Pane(child.id, step + 6));
                 }
             }
         }
@@ -311,7 +321,9 @@ impl Widget for Sidebar<'_> {
             return;
         }
 
-        block().render(area, buf);
+        block()
+            .border_style(Style::default().fg(self.theme.faded))
+            .render(area, buf);
         let area = inner(area);
         if area.width == 0 || area.height == 0 {
             return;
@@ -396,8 +408,8 @@ impl Sidebar<'_> {
     /// Draws one project row `indent` columns in from the sidebar's edge.
     ///
     /// The indent is nonzero only under a machine row, which is what pushes a
-    /// project's own columns — its twisty, its git mark, its folder, its name
-    /// — in to sit under that machine rather than under the frame.
+    /// project's own columns — its twisty, its mark, its name — in to sit
+    /// under that machine rather than under the frame.
     fn render_project(
         &self,
         buf: &mut Buffer,
@@ -414,54 +426,33 @@ impl Sidebar<'_> {
             .find(|p| p.id == id)
             .expect("the caller iterates over registered projects");
 
+        let x = area.x + indent;
         let is_selected = selected == Some(id);
         let style = if is_selected {
-            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            Style::default().add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
+
+        // The tint runs the full width of the list rather than the width of
+        // the name: a highlight that stops where a short name does reads as
+        // part of the name. It starts at the row's own indent, so a project
+        // under a machine does not paint over that machine's row.
+        if is_selected {
+            fill(buf, area, x, y, Style::default().bg(self.theme.tint));
+        }
 
         let has_panes = self
             .state
             .panes_for(id)
             .iter()
             .any(|pane| pane.parent.is_none());
-
-        // The bar runs the full width of the list rather than the width of the
-        // name: a highlight that stops where a short name does reads as part
-        // of the name instead of as the row being selected. It starts at the
-        // row's own indent, not the frame's edge, so a selected project under
-        // a machine does not paint over that machine's row.
-        if is_selected {
-            let width = (area.width.saturating_sub(indent)) as usize;
-            let blanks = " ".repeat(width);
-            write(buf, area, area.x + indent, y, &blanks, style);
-        }
-
-        // Open only when there is something inside to be looking at: a folder
-        // standing open on a project with no panes promises nothing.
         let collapsed = self.state.is_project_collapsed(id);
-        let open = has_panes && !collapsed;
 
-        write(
-            buf,
-            area,
-            area.x + indent,
-            y,
-            twisty(has_panes, collapsed),
-            style,
-        );
-        write(
-            buf,
-            area,
-            area.x + indent + 1,
-            y,
-            source_icon(&project.source),
-            style,
-        );
-        write(buf, area, area.x + indent + 2, y, folder_icon(open), style);
+        write(buf, area, x, y, twisty(has_panes, collapsed), style);
+        write(buf, area, x + 2, y, source_icon(&project.source), style);
 
-        let name_x = area.x + indent + NAME;
+        let name_x = x + NAME;
         let room = (area.x + area.width).saturating_sub(name_x) as usize;
         write(buf, area, name_x, y, &truncate(&project.name, room), style);
     }
@@ -479,7 +470,7 @@ impl Sidebar<'_> {
         let style = if device.reachable {
             Style::default().add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(self.theme.faded)
         };
 
         let has_projects = self
@@ -496,7 +487,7 @@ impl Sidebar<'_> {
             twisty(has_projects, self.state.is_device_collapsed(id)),
             style,
         );
-        write(buf, area, area.x + 1, y, MACHINE, style);
+        write(buf, area, area.x + 2, y, MACHINE, style);
 
         let room = (area.x + area.width).saturating_sub(area.x + NAME) as usize;
 
@@ -508,7 +499,7 @@ impl Sidebar<'_> {
             // end is the name, not the word the row exists to show. The name
             // gives way instead, so "unreachable" is always drawn whole.
             let suffix = format!(" — {UNREACHABLE}");
-            let name_room = room.saturating_sub(suffix.chars().count());
+            let name_room = room.saturating_sub(suffix.width());
             format!("{}{suffix}", truncate(&device.name, name_room))
         };
         write(buf, area, area.x + NAME, y, &name, style);
@@ -530,28 +521,32 @@ impl Sidebar<'_> {
         // A tombstone has no process behind it, so it can never be the row
         // the user is focused on.
         let is_focused = !pane.closed && focused == Some(pane.id);
-        let marker = if is_focused { FOCUS } else { " " };
         let style = if is_focused {
             Style::default().add_modifier(Modifier::BOLD)
         } else if pane.closed {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(self.theme.faded)
         } else {
             Style::default()
         };
 
+        let x = area.x + indent;
+        if is_focused {
+            fill(buf, area, x, y, Style::default().bg(self.theme.tint));
+        }
+
         let has_children = !self.state.children_of(pane.id).is_empty();
         let twisty = twisty(has_children, self.state.is_pane_collapsed(pane.id));
 
-        write(buf, area, area.x + indent, y, twisty, style);
-        write(buf, area, area.x + indent + 1, y, marker, style);
-        write(buf, area, area.x + indent + 2, y, self.icon(pane), style);
+        write(buf, area, x, y, twisty, style);
+        write(buf, area, x + 2, y, self.icon(pane), style);
 
-        // The state glyph owns the row's last column, so a long title is cut
-        // short before it rather than drawn under it.
-        let (glyph, glyph_style) = state_glyph(pane);
-        let state_x = (area.x + area.width).saturating_sub(1);
+        // Two columns in from the frame, so the blank beside it keeps a glyph
+        // drawn wider than its cell off the border. The title stops a blank
+        // short of it.
+        let (glyph, glyph_style) = state_glyph(pane, &self.theme);
+        let state_x = (area.x + area.width).saturating_sub(2);
 
-        let title_x = area.x + indent + NAME;
+        let title_x = x + NAME;
         let room = state_x.saturating_sub(title_x + 1) as usize;
         write(buf, area, title_x, y, &truncate(&pane.title, room), style);
 

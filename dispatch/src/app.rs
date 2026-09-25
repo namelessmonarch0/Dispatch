@@ -2947,7 +2947,9 @@ impl App {
         );
 
         frame.render_widget(
-            Sidebar::new(&self.state).with_harnesses(&self.harnesses),
+            Sidebar::new(&self.state)
+                .with_harnesses(&self.harnesses)
+                .with_theme(self.theme),
             sidebar_area,
         );
         self.sidebar_area = sidebar_area;
@@ -4640,9 +4642,9 @@ mod tests {
         let (mut app, _terminal, _first, parent, child) = app_with_a_drawn_sidebar();
 
         let _ = app.state.focus(child);
-        // A pane row is indented two columns inside the frame, and its twisty
-        // is the first of them — one row lower than before the top row.
-        click(&mut app, 3, 3);
+        // A pane row starts four columns inside the frame, and its twisty is
+        // the first of them.
+        click(&mut app, 5, 3);
 
         assert!(app.state.is_pane_collapsed(parent));
         assert_eq!(
