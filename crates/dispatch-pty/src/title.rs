@@ -25,13 +25,50 @@ enum State {
     Escape,
     /// Seen `ESC ]`, reading the command number.
     Command,
-    /// Inside a title's text.
-    Title,
+    /// Inside a title's or a progress report's text.
+    Payload,
     /// Inside some other OSC, which is skipped.
     Other,
     /// Seen `ESC` inside an OSC: `ESC \` ends it.
     Terminator,
 }
+
+/// Which kind of payload the scanner is reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Collecting {
+    /// A title, from `OSC 0`, `OSC 1` or `OSC 2`.
+    Title,
+    /// A progress report, from `OSC 9;4`.
+    Progress,
+}
+
+/// What one byte finished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Event {
+    Title(String),
+    Progress(String),
+    Bell,
+}
+
+/// What a chunk of output said besides its text.
+///
+/// The title is how an agent names itself and — for several — how it says it
+/// is busy; progress (`OSC 9;4`) is how some report a running turn; a bare
+/// bell is how a program asks to be looked at. All three are read off the
+/// same bytes the screen is drawn from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Signals {
+    /// The last title completed in the chunk.
+    pub title: Option<String>,
+    /// The last `OSC 9;4` payload completed in the chunk, after `9;`: `4;0`,
+    /// `4;1;40`, …
+    pub progress: Option<String>,
+    /// Whether a bare `BEL` rang.
+    pub bell: bool,
+}
+
+/// The OSC number that carries progress reports, as `9;4;…`.
+const NOTIFY: u16 = 9;
 
 /// Finds the titles a child sets, across however many chunks they arrive in.
 ///
@@ -50,6 +87,8 @@ pub struct TitleScanner {
     /// Set when a title overran [`MAX_TITLE`], so the rest is skipped rather
     /// than a truncated name being reported.
     overran: bool,
+    /// What the payload being read will be, once it ends.
+    collecting: Collecting,
 }
 
 impl Default for TitleScanner {
@@ -68,6 +107,7 @@ impl TitleScanner {
             numbered: false,
             pending: Vec::new(),
             overran: false,
+            collecting: Collecting::Title,
         }
     }
 
@@ -76,19 +116,27 @@ impl TitleScanner {
     /// The last rather than every one: a child that sets several titles in one
     /// write means only the newest, and the caller wants what to display.
     pub fn scan(&mut self, bytes: &[u8]) -> Option<String> {
-        let mut latest = None;
+        self.scan_signals(bytes).title
+    }
+
+    /// Scans `bytes` for everything they say besides their text.
+    pub fn scan_signals(&mut self, bytes: &[u8]) -> Signals {
+        let mut signals = Signals::default();
 
         for &byte in bytes {
-            if let Some(title) = self.step(byte) {
-                latest = Some(title);
+            match self.step(byte) {
+                Some(Event::Title(title)) => signals.title = Some(title),
+                Some(Event::Progress(progress)) => signals.progress = Some(progress),
+                Some(Event::Bell) => signals.bell = true,
+                None => {}
             }
         }
 
-        latest
+        signals
     }
 
     /// Consumes one byte.
-    fn step(&mut self, byte: u8) -> Option<String> {
+    fn step(&mut self, byte: u8) -> Option<Event> {
         const ESC: u8 = 0x1b;
         const BEL: u8 = 0x07;
 
@@ -96,6 +144,8 @@ impl TitleScanner {
             State::Text => {
                 if byte == ESC {
                     self.state = State::Escape;
+                } else if byte == BEL {
+                    return Some(Event::Bell);
                 }
             }
 
@@ -125,9 +175,14 @@ impl TitleScanner {
                     self.overran = false;
                     // `OSC 0` sets both icon name and title, `OSC 1` the icon
                     // name, `OSC 2` the title. All three are what a child means
-                    // by "call me this".
+                    // by "call me this". `OSC 9` is read too, for the progress
+                    // reports that travel as `9;4;…`.
                     self.state = if self.numbered && self.command <= 2 {
-                        State::Title
+                        self.collecting = Collecting::Title;
+                        State::Payload
+                    } else if self.numbered && self.command == NOTIFY {
+                        self.collecting = Collecting::Progress;
+                        State::Payload
                     } else {
                         State::Other
                     };
@@ -137,7 +192,7 @@ impl TitleScanner {
                 _ => self.state = State::Other,
             },
 
-            State::Title => match byte {
+            State::Payload => match byte {
                 BEL => {
                     self.state = State::Text;
                     return self.finish();
@@ -158,10 +213,10 @@ impl TitleScanner {
             State::Terminator => {
                 // `ESC \` ends an OSC. Anything else means the sequence was
                 // interrupted, and whatever follows is ordinary output.
-                let ended_title = byte == b'\\' && !self.pending.is_empty();
+                let ended_payload = byte == b'\\' && !self.pending.is_empty();
                 self.state = State::Text;
 
-                if ended_title {
+                if ended_payload {
                     return self.finish();
                 }
 
@@ -189,20 +244,24 @@ impl TitleScanner {
         self.pending.push(byte);
     }
 
-    /// Takes the finished title, if there is one worth reporting.
-    fn finish(&mut self) -> Option<String> {
+    /// Takes the finished payload, if there is one worth reporting.
+    fn finish(&mut self) -> Option<Event> {
         let bytes = std::mem::take(&mut self.pending);
         let overran = std::mem::take(&mut self.overran);
 
         // Lossy: a child that writes a broken byte in its title should get a
         // replacement character in the sidebar, not have the title dropped.
-        let title = String::from_utf8_lossy(&bytes).trim().to_string();
+        let text = String::from_utf8_lossy(&bytes).trim().to_string();
 
-        if overran || title.is_empty() {
+        if overran || text.is_empty() {
             return None;
         }
 
-        Some(title)
+        match self.collecting {
+            Collecting::Title => Some(Event::Title(text)),
+            // `OSC 9` alone is a notification; only `9;4` reports progress.
+            Collecting::Progress => text.starts_with("4;").then_some(Event::Progress(text)),
+        }
     }
 }
 
