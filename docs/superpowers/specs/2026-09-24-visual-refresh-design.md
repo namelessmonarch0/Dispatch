@@ -275,23 +275,35 @@ of the sections it separates.
 
 ### One layout for drawing and clicking
 
-`rows()` becomes `layout(state, area, scroll) -> Vec<Placed>`, where
+`rows()` becomes one `Section` per machine (or one, headerless, when there is
+only one), each holding its own rows:
 
 ```rust
-struct Placed {
-    y: u16,
-    kind: PlacedKind, // Divider(DeviceId), Project(ProjectId), Branch(ProjectId),
-                      // Pane(PaneId)
-    indent: u16,
+enum Row<'a> {
+    Project(ProjectId),
+    Branch(ProjectId, &'a str),
+    Pane(PaneId, u16), // indent
+}
+
+struct Section<'a> {
+    key: DeviceId,       // which offset in `Scroll` this section reads
+    device: Option<DeviceId>,
+    header: u16,         // the line naming it: the top border, or a divider
+    body: Rect,          // where its rows are drawn, after scrolling
+    rows: Vec<Row<'a>>,  // every row it has, drawn or not
+    offset: usize,       // how many rows are scrolled away above `body`
 }
 ```
 
-Both `render` and `hit_test` walk it, which keeps the existing guarantee
-that a click can only land on a row that is actually drawn. `Hit` gains
-nothing new: a divider answers `Hit::Device`, a branch row
-`Hit::Project`. `hit_test` takes the scroll offsets as an argument.
+Both `render` and `hit_test` call `sections(state, area, scroll)` and then
+walk each section's visible rows, which keeps the existing guarantee that a
+click can only land on a row that is actually drawn: folding and scrolling
+are safe because a hidden row is missing from both walks at once. `Hit`
+gains nothing new: a section's header line answers `Hit::Device`, a branch
+row `Hit::Project`. `hit_test` and the wheel's `section_at` both take the
+scroll offsets as an argument.
 
-The first machine's divider is the frame's top border, which today lies
+The first machine's header is the frame's top border, which today lies
 outside the area `hit_test` accepts. When the sidebar is split, that row is
 accepted too, and answers `Hit::Device` for the first machine; with one
 machine it stays outside, as now.
@@ -330,9 +342,10 @@ pub fn dispatch_os::git::head(dir: &Path) -> Option<String>;
 Walks up from `dir` to the nearest `.git`. A directory is the git directory;
 a file is a worktree or submodule, `gitdir: <path>`, resolved relative to the
 file's own directory. Reads `HEAD`: `ref: refs/heads/<name>` yields `<name>`;
-forty hex digits yield `@` and the first seven; anything else, or any I/O
-error, yields `None`. It reads files only — no `git` subprocess, so nothing
-depends on `git` being installed on a remote machine.
+forty or sixty-four hex digits (a SHA-1 or a SHA-256 commit) yield `@` and
+the first seven; anything else, or any I/O error, yields `None`. It reads
+files only — no `git` subprocess, so nothing depends on `git` being
+installed on a remote machine.
 
 ### Model
 
@@ -404,7 +417,7 @@ outside any repository is `None`. Nothing here is ever a message on screen.
 | Terminal answers nothing at all | One-second timeout; fallback colours |
 | No 24-bit colour | Tints quantised to xterm-256 |
 | Daemon too old to report branches | No branch rows; panes listed as today |
-| Pane process unreadable or gone | Branch `None`; the pane joins the project's own group |
+| Pane process unreadable or gone | Keeps the branch it last had, rather than being reported as on none |
 | Branch changes (`git switch`) | Picked up within two seconds |
 | Sidebar too short for every section's minimum | Sections take one row each, in order, until the height runs out; folded ones cost only their divider |
 
