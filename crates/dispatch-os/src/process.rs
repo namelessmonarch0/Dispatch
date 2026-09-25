@@ -77,6 +77,19 @@ pub fn terminate_tree(pid: u32, grace: Duration) -> Result<(), ProcessError> {
     imp::terminate_tree(pid, grace)
 }
 
+/// The working directory of whatever is in the foreground of the terminal
+/// `pid` runs in.
+///
+/// For a shell running `cd wt && claude` that is Claude in `wt`, not the
+/// shell: the foreground program is the one the user is looking at. Falls
+/// back to `pid`'s own directory when the terminal's foreground cannot be
+/// read, and is `None` where neither can -- a process that has exited, one
+/// owned by another user, or a platform with no way to ask.
+#[must_use]
+pub fn working_dir(pid: u32) -> Option<std::path::PathBuf> {
+    cwd::working_dir(pid)
+}
+
 #[cfg(unix)]
 mod imp {
     use super::{Duration, ProcessError};
@@ -282,6 +295,176 @@ mod imp {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod cwd {
+    use std::path::PathBuf;
+
+    pub(super) fn working_dir(pid: u32) -> Option<PathBuf> {
+        foreground(pid)
+            .and_then(|leader| std::fs::read_link(format!("/proc/{leader}/cwd")).ok())
+            .or_else(|| std::fs::read_link(format!("/proc/{pid}/cwd")).ok())
+    }
+
+    /// The foreground process group of the terminal `pid` runs in.
+    fn foreground(pid: u32) -> Option<u32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        tpgid(&stat)
+    }
+
+    /// Field 8 of a `/proc/<pid>/stat` line: the foreground process group of
+    /// the process's terminal.
+    ///
+    /// The command name is field 2, in parentheses, and may itself hold
+    /// spaces or parentheses, so fields are counted from the last `)` rather
+    /// than from the start of the line.
+    pub(super) fn tpgid(stat: &str) -> Option<u32> {
+        let rest = &stat[stat.rfind(')')? + 1..];
+
+        // After the name: state, ppid, pgrp, session, tty_nr, tpgid.
+        let field: i64 = rest.split_whitespace().nth(5)?.parse().ok()?;
+
+        // -1 is "no controlling terminal".
+        u32::try_from(field).ok().filter(|group| *group > 0)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_foreground_group_is_read_past_a_name_with_spaces_and_parentheses() {
+            // The command name is free text in parentheses, so counting
+            // fields from the start of the line breaks on the first name
+            // with a space in it.
+            let stat = "4242 (a (weird) name) S 1 4242 4242 34817 5151 4194560 0 0";
+
+            assert_eq!(tpgid(stat), Some(5151));
+        }
+
+        #[test]
+        fn a_process_with_no_terminal_has_no_foreground_group() {
+            let stat = "4242 (daemon) S 1 4242 4242 0 -1 4194560 0 0";
+
+            assert_eq!(tpgid(stat), None);
+        }
+
+        #[test]
+        fn a_process_with_no_terminal_reports_its_own_directory() {
+            use std::os::unix::process::CommandExt;
+
+            let dir = std::env::temp_dir().join(format!("dispatch-os-cwd-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("temp dir is writable");
+            let dir = dir.canonicalize().expect("the temp dir resolves");
+
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30").current_dir(&dir);
+            // SAFETY: setsid is async-signal-safe and the closure allocates
+            // nothing. It detaches the child from the test runner's terminal,
+            // whose foreground job would otherwise be the answer.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().expect("sleep starts");
+
+            let found = working_dir(child.id());
+
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+
+            assert_eq!(found, Some(dir));
+        }
+
+        #[test]
+        fn a_process_that_does_not_exist_has_no_directory() {
+            assert_eq!(working_dir(u32::MAX), None);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod cwd {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
+
+    pub(super) fn working_dir(pid: u32) -> Option<PathBuf> {
+        foreground(pid)
+            .and_then(directory_of)
+            .or_else(|| directory_of(pid))
+    }
+
+    /// The foreground process group of the terminal `pid` runs in.
+    fn foreground(pid: u32) -> Option<u32> {
+        let pid = libc::c_int::try_from(pid).ok()?;
+        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+
+        // SAFETY: `proc_bsdinfo` is plain data, and all zeroes is a valid
+        // value of it.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+
+        // SAFETY: the buffer is `info`, owned by this frame, and `size` is
+        // its exact length.
+        let read = unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
+        };
+
+        (read == size && info.e_tpgid > 0).then_some(info.e_tpgid)
+    }
+
+    /// `pid`'s own working directory.
+    fn directory_of(pid: u32) -> Option<PathBuf> {
+        let pid = libc::c_int::try_from(pid).ok()?;
+        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_vnodepathinfo>()).ok()?;
+
+        // SAFETY: `proc_vnodepathinfo` is plain data, and all zeroes is a
+        // valid value of it.
+        let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+
+        // SAFETY: the buffer is `info`, owned by this frame, and `size` is
+        // its exact length.
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                (&raw mut info).cast(),
+                size,
+            )
+        };
+        if read != size {
+            return None;
+        }
+
+        // `vip_path` is a MAXPATHLEN buffer, which libc spells as 32 rows of
+        // 32 to stay within what an old compiler could derive traits for.
+        let bytes: Vec<u8> = info
+            .pvi_cdir
+            .vip_path
+            .as_flattened()
+            .iter()
+            .map(|&byte| byte as u8)
+            .collect();
+        let path = CStr::from_bytes_until_nul(&bytes).ok()?;
+
+        (!path.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(path.to_bytes())))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod cwd {
+    /// Windows has no terminal foreground to ask about, and nothing else
+    /// Dispatch runs on is supported.
+    pub(super) fn working_dir(_pid: u32) -> Option<std::path::PathBuf> {
+        None
     }
 }
 
