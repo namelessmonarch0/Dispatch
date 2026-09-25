@@ -78,6 +78,8 @@ pub struct Theme {
     pub tab: Color,
     /// The focused pane's border.
     pub accent: Color,
+    /// Text drawn over `tint` or `tab`.
+    pub text: Color,
 }
 ```
 
@@ -87,9 +89,13 @@ pub struct Theme {
 | `tint`   | background mixed 10% toward foreground        |
 | `tab`    | background mixed 30% toward accent            |
 | `accent` | the accent itself                            |
+| `text`   | the palette foreground — text drawn over `tint` or `tab` |
 
 Ordinary text is left as `Color::Reset`, so it stays the terminal's own
-foreground. The state glyph colours stay ANSI (`Green`, `Yellow`, `Red`,
+foreground. Text on a tinted row, the active tab or the `PREFIX` badge takes
+`text` instead: those backgrounds are the fallback's dark ones when the
+terminal did not answer, and a light theme's dark text is unreadable on
+them. The state glyph colours stay ANSI (`Green`, `Yellow`, `Red`,
 `Blue`): the terminal's palette already themes them.
 
 `Theme::fallback()` is built from a fixed dark palette — background

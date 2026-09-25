@@ -28,13 +28,14 @@ fn every_role_is_mixed_from_the_palette() {
     );
     assert_eq!(theme.tab, rgb(palette.background.mix(palette.accent, 0.30)));
     assert_eq!(theme.accent, rgb(palette.accent));
+    assert_eq!(theme.text, rgb(palette.foreground));
 }
 
 #[test]
 fn a_terminal_without_24_bit_colour_gets_palette_indices() {
     let theme = Theme::new(Palette::FALLBACK, Depth::Indexed);
 
-    for colour in [theme.faded, theme.tint, theme.tab] {
+    for colour in [theme.faded, theme.tint, theme.tab, theme.text] {
         assert!(matches!(colour, Color::Indexed(_)), "{colour:?}");
     }
 }

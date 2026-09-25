@@ -3291,9 +3291,13 @@ impl App {
                 Some(title) => format!(" {} {title} ", index + 1),
                 None => format!(" {} ", index + 1),
             };
+            // `tab` is mixed from the palette, the fallback's dark one when
+            // the terminal did not answer, so the text on it comes from the
+            // palette too rather than being the terminal's own.
             let style = if index == current {
                 Style::default()
                     .bg(self.theme.tab)
+                    .fg(self.theme.text)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(self.theme.faded)
@@ -3389,9 +3393,12 @@ impl App {
             }
         };
 
+        // On `tab`, like the active tab, and in the same text colour for the
+        // same reason.
         let style = if self.router.is_armed() {
             Style::default()
                 .bg(self.theme.tab)
+                .fg(self.theme.text)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(self.theme.faded)
@@ -4799,9 +4806,41 @@ mod tests {
             .expect("the other tab is drawn");
 
         assert_eq!(active.bg, theme.tab, "the fifth pane is focused, on tab 2");
+        assert_eq!(
+            active.fg, theme.text,
+            "in the palette's text: the terminal's own may be a light \
+             theme's dark text on the fallback's dark tab"
+        );
         assert!(!active.modifier.contains(Modifier::REVERSED));
         assert_eq!(inactive.fg, theme.faded);
         assert_eq!(inactive.bg, Color::Reset);
+    }
+
+    #[test]
+    fn the_armed_prefix_is_drawn_on_the_tab_colour_in_the_palettes_text() {
+        let mut app = App::new(HarnessRegistry::default());
+        app.handle(
+            &Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Size::new(100, 30),
+        )
+        .expect("a keystroke is handled");
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("the frame is drawn");
+        let badge = terminal
+            .backend()
+            .buffer()
+            .cell((0, 29))
+            .expect("the status row is drawn")
+            .clone();
+        let theme = Theme::fallback();
+
+        assert_eq!(badge.symbol(), "P", "the prefix is armed");
+        assert_eq!(badge.bg, theme.tab);
+        assert_eq!(badge.fg, theme.text);
     }
 
     #[test]

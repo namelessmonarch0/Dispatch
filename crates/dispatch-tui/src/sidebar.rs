@@ -128,6 +128,15 @@ impl<'a> Sidebar<'a> {
         self
     }
 
+    /// A selected or focused row: the tint, and the palette's text on it.
+    ///
+    /// Text in the terminal's own colour would not do: the tint is the
+    /// fallback's when the terminal did not say what its colours are, and a
+    /// light theme's dark text is unreadable on that.
+    fn tinted(&self) -> Style {
+        Style::default().bg(self.theme.tint).fg(self.theme.text)
+    }
+
     /// The mark for the harness running in `pane`.
     fn icon(&self, pane: &Pane) -> &str {
         self.harnesses
@@ -789,9 +798,10 @@ impl Sidebar<'_> {
 
         // The tint runs the full width of the list rather than the width of
         // the name: a highlight that stops where a short name does reads as
-        // part of the name.
+        // part of the name. It sets the text colour too, which everything
+        // written on the row after it keeps.
         if is_selected {
-            fill(buf, area, x, y, Style::default().bg(self.theme.tint));
+            fill(buf, area, x, y, self.tinted());
         }
 
         let has_panes = self
@@ -923,7 +933,7 @@ impl Sidebar<'_> {
 
         let x = area.x + indent;
         if is_focused {
-            fill(buf, area, x, y, Style::default().bg(self.theme.tint));
+            fill(buf, area, x, y, self.tinted());
         }
 
         let has_children = !self.state.children_of(pane.id).is_empty();

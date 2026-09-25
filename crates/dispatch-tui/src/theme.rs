@@ -76,8 +76,9 @@ impl Depth {
 
 /// What Dispatch's chrome is drawn in.
 ///
-/// Ordinary text is not here: it stays the terminal's own foreground. Nor are
-/// the state glyphs' colours, which are ANSI and so already the theme's.
+/// Ordinary text is not here: it stays the terminal's own foreground, and only
+/// what is written over `tint` or `tab` takes `text`. Nor are the state
+/// glyphs' colours, which are ANSI and so already the theme's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     /// Secondary text: branches, the app name, inactive tabs, unfocused
@@ -89,6 +90,13 @@ pub struct Theme {
     pub tab: Color,
     /// The focused pane's border.
     pub accent: Color,
+    /// Text drawn over `tint` or `tab`: the palette's own foreground.
+    ///
+    /// Those two are mixed from the palette, so what is written on them comes
+    /// from it too. When the terminal answered, this is its own text colour;
+    /// when it did not, the tint is the fallback's dark one, and the
+    /// terminal's text on it could be a light theme's dark text.
+    pub text: Color,
 }
 
 impl Theme {
@@ -113,6 +121,7 @@ impl Theme {
             tint: colour(palette.background.mix(palette.foreground, 0.10)),
             tab: colour(palette.background.mix(palette.accent, 0.30)),
             accent,
+            text: colour(palette.foreground),
         }
     }
 

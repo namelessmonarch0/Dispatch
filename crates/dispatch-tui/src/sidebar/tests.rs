@@ -149,6 +149,43 @@ fn the_focused_pane_is_tinted() {
 }
 
 #[test]
+fn a_focused_panes_text_is_the_palettes_foreground() {
+    // The tint is mixed from the palette, which is the fallback's when the
+    // terminal did not say what its own is. Text left in the terminal's
+    // colour could then be a light theme's dark text on a dark tint.
+    let (mut state, alpha, _) = state();
+    spawn(&mut state, alpha, "claude");
+
+    let buf = render(&state, WIDTH, 10);
+    let theme = Theme::fallback();
+
+    assert_eq!(
+        buf.cell((LEFT + PANE + NAME, TOP + 1))
+            .expect("cell exists")
+            .fg,
+        theme.text,
+        "the title"
+    );
+    assert_eq!(
+        buf.cell((WIDTH - 3, TOP + 1)).expect("cell exists").fg,
+        Color::Yellow,
+        "the state glyph keeps its own colour"
+    );
+}
+
+#[test]
+fn a_selected_projects_text_is_the_palettes_foreground() {
+    let (state, _, _) = state();
+
+    let buf = render(&state, WIDTH, 10);
+
+    assert_eq!(
+        buf.cell((LEFT + NAME, TOP)).expect("cell exists").fg,
+        Theme::fallback().text
+    );
+}
+
+#[test]
 fn a_long_name_is_truncated_rather_than_overflowing() {
     let mut state = AppState::new();
     state.add_project(
