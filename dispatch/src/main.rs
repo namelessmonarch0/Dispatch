@@ -157,6 +157,18 @@ fn main() -> Result<ExitCode> {
 
     let config_dir = dispatch_os::paths::config_dir().context("failed to locate the config dir")?;
 
+    // Only `[interface]` is the client's; the daemon reads the rest. Unknown
+    // keys are logged rather than fatal, as the daemon does. Read before
+    // anything is attached to or started, so a malformed file fails here
+    // rather than after a daemon has been spawned and machines dialled.
+    let config_path =
+        dispatch_os::paths::config_file().context("failed to locate the configuration file")?;
+    let loaded = dispatch_config::Config::load_reporting(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    if !loaded.unknown.is_empty() {
+        tracing::warn!(keys = ?loaded.unknown, path = %config_path.display(), "ignoring unknown configuration keys");
+    }
+
     // Read before deciding how to run: any registered machine means the
     // agents belong to daemons, this machine's included.
     let machines = dispatch_config::machines::load(&config_dir)
@@ -265,15 +277,6 @@ fn main() -> Result<ExitCode> {
         app.add_project(root);
     }
 
-    // Only `[interface]` is the client's; the daemon reads the rest. Unknown
-    // keys are logged rather than fatal, as the daemon does.
-    let config_path =
-        dispatch_os::paths::config_file().context("failed to locate the configuration file")?;
-    let loaded = dispatch_config::Config::load_reporting(&config_path)
-        .with_context(|| format!("failed to read {}", config_path.display()))?;
-    if !loaded.unknown.is_empty() {
-        tracing::warn!(keys = ?loaded.unknown, path = %config_path.display(), "ignoring unknown configuration keys");
-    }
     app.set_motion(loaded.config.interface.motion);
 
     // From here on the terminal belongs to Dispatch, so nothing may write to
