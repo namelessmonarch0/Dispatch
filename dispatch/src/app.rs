@@ -1170,6 +1170,9 @@ impl App {
                 let from = self.border_level(new, now);
                 self.animations.stop(Target::Blur(new));
                 self.animations.start(Target::Focus(new), now, EASE, from);
+                // Looked at, it has what it was pulsing for; left running, the
+                // pulse would paint over the focus tint arriving on its row.
+                self.animations.stop(Target::Pulse(new));
             }
             if let Some(old) = self.last_focus {
                 let from = 1.0 - self.border_level(old, now);
@@ -5572,6 +5575,81 @@ mod tests {
                 .linear(Target::Pulse(panes[0]), app.now())
                 .is_some()
         );
+    }
+
+    #[test]
+    fn focusing_a_pulsing_pane_stops_its_pulse() {
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            status: Some(
+                toml::from_str(
+                    r#"
+                    [[rules]]
+                    state = "blocked"
+                    region = "screen"
+                    contains = ["proceed?"]
+                    "#,
+                )
+                .expect("the rules parse"),
+            ),
+            ..dispatch_config::HarnessDef::default()
+        };
+        let (client, daemon, _sent) = Client::for_test();
+        let mut app = App::attached([def].into_iter().collect(), client);
+        let project = Project::new("/tmp/pulse", ProjectSource::LocalDir);
+        let project_id = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("listening");
+        app.poll_daemon();
+        let clock = hand_clock(&mut app);
+        let panes = spawn_several(&mut app, &daemon, project_id, 2);
+        app.state
+            .set_pane_title(panes[0], "asking")
+            .expect("the pane exists");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, panes[0], b"Do you want to proceed?\r\n");
+        assert!(
+            app.animations
+                .linear(Target::Pulse(panes[0]), app.now())
+                .is_some(),
+            "it pulses while out of focus"
+        );
+
+        // Past the focus tint's glide, and well inside the pulse's 1.2 s.
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+        advance(&clock, Duration::from_millis(200));
+        drawn(&mut app, &mut terminal);
+
+        assert!(
+            app.animations
+                .linear(Target::Pulse(panes[0]), app.now())
+                .is_none(),
+            "looked at, it has nothing left to ask"
+        );
+        let text = rendered_text(&terminal);
+        let (y, line) = text
+            .lines()
+            .map(sidebar_column)
+            .enumerate()
+            .find(|(_, line)| line.contains("asking"))
+            .expect("the pane has a sidebar row");
+        let x = column_of(&line, "asking");
+        let cell = terminal
+            .backend()
+            .buffer()
+            .cell((
+                u16::try_from(x).expect("fits"),
+                u16::try_from(y).expect("fits"),
+            ))
+            .expect("the row is on screen");
+        assert_eq!(cell.bg, Theme::fallback().tint, "its row shows the focus");
     }
 
     #[test]
