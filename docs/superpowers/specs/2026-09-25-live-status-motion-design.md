@@ -284,9 +284,12 @@ Attention order: blocked > done > working > idle.
 
 ### The status row
 
-When any pane is blocked and no overlay is open, the status row appends
+When any pane is blocked and no overlay is open, the status row shows
 `N waiting on you`, beside the existing delegation reminder, so a blocked
-pane on another tab or in a folded project is still noticed.
+pane on another tab or in a folded project is still noticed. Both reminders
+come after a disconnect notice or status message and ahead of the key help,
+which alone runs past eighty columns: whatever follows it is cut off on
+common terminal widths.
 
 ## Motion
 

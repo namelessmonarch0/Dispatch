@@ -3905,7 +3905,7 @@ impl App {
         // prompt itself is on screen, since it would only repeat what is
         // already in front of the user.
         //
-        // Appended rather than shown in place of `self.status`: a daemon
+        // Put after `self.status` rather than in its place: a daemon
         // disconnect or an error is worth knowing about more than a queued
         // prompt is, and when the daemon is gone the prompt cannot be acted
         // on anyway, so hiding the disconnect notice behind it would be
@@ -3946,16 +3946,17 @@ impl App {
             // with no explanation.
             "PREFIX".to_string()
         } else {
-            let base = if !unreachable.is_empty() {
+            let (lead, help) = if !unreachable.is_empty() {
                 // Ahead of `self.status`, which may still hold whatever was
                 // happening when the connection went: a user needs to know the
                 // agents are out of reach more than they need the last message.
-                format!(
+                let notice = format!(
                     "waiting for {} — its agents are still running",
                     unreachable.join(", ")
-                )
+                );
+                (Some(notice), None)
             } else if !self.status.is_empty() {
-                self.status.clone()
+                (Some(self.status.clone()), None)
             } else {
                 let panes = self.state.visible_panes().len();
                 let tabs = if self.tab_count() > 1 {
@@ -3972,19 +3973,23 @@ impl App {
                 let where_ = self
                     .device()
                     .map_or_else(String::new, |device| format!("  {device}"));
-                format!(
+                let help = format!(
                     "{panes} pane(s){where_}{tabs}  ^a n new  ^a x close  ^a z zoom  ^a s child  ^a c collapse  ^a q quit"
-                )
+                );
+                (None, Some(help))
             };
 
-            let base = match waiting_reminder {
-                Some(reminder) => format!("{base}  {reminder}"),
-                None => base,
-            };
-            match blocked_reminder {
-                Some(reminder) => format!("{base}  {reminder}"),
-                None => base,
-            }
+            // The reminders ahead of the key help: it alone runs past eighty
+            // columns, and whatever follows it is cut off on the terminals
+            // most people have. The key help is the one thing here that is
+            // the same every time, so it is what can best afford to lose its
+            // end.
+            lead.into_iter()
+                .chain(waiting_reminder)
+                .chain(blocked_reminder)
+                .chain(help)
+                .collect::<Vec<_>>()
+                .join("  ")
         };
 
         // On `tab`, like the active tab, and in the same text colour for the
@@ -5831,6 +5836,38 @@ mod tests {
                 .expect("a row")
                 .contains("2 waiting on you"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn the_reminders_fit_an_eighty_column_status_row() {
+        // The key help alone runs past eighty columns, so a reminder after it
+        // was cut off on the terminals most people have.
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        app.state
+            .set_pane_status(panes[0], PaneStatus::Blocked)
+            .expect("exists");
+        app.pending.push_back(PendingRequest {
+            request: RequestId::new(),
+            parent: panes[1],
+            project,
+            harness: "claude".into(),
+            task: "write the tests".into(),
+            depth: 0,
+        });
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+            .expect("a test backend can be created");
+        drawn(&mut app, &mut terminal);
+        let text = rendered_text(&terminal);
+        let row = text.lines().last().expect("a row");
+
+        assert!(row.contains("1 waiting on you"), "{row:?}");
+        assert!(row.contains("1 delegation(s) waiting — ^a a"), "{row:?}");
+        assert!(
+            row.find("waiting on you") < row.find("pane(s)"),
+            "the key help follows, where being cut costs least: {row:?}"
         );
     }
 
