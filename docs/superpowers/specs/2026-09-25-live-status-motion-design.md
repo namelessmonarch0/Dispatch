@@ -234,6 +234,13 @@ pane — and every pane on a **250 ms** tick, so an idle verdict can confirm
 with nothing arriving. While a pane is scrolled back its screen is not the
 live one, so it is not evaluated: it keeps its last state.
 
+A **subagent** — a pane with a parent — always runs its harness's one-shot
+`[task]` form, whose output says nothing about whether it is still at work:
+`claude -p` prints nothing until its answer, and `codex exec` goes quiet
+between model calls. It is `Running` from adoption until it exits, `Blocked`
+while its rules say so, and never `Idle`, so going quiet never marks it
+done. Its exit is shown as any pane's is.
+
 ### Done, and the startup grace
 
 - A pane whose status goes `Running` → `Idle` while it is not the focused

@@ -1319,6 +1319,19 @@ impl App {
         );
         self.animations.start(Target::Open(id), now, OPEN, 0.0);
 
+        // A subagent runs its harness's one-shot `[task]` form, and nothing
+        // it prints says whether it is still at it: `claude -p` is silent
+        // until its answer, `codex exec` goes quiet between model calls. It
+        // is working from the start until it exits, unless its rules say it
+        // is blocked; see `refresh_activity`.
+        if self
+            .state
+            .pane(id)
+            .is_some_and(|pane| pane.parent.is_some() && pane.status.is_live())
+        {
+            let _ = self.state.set_pane_status(id, PaneStatus::Running);
+        }
+
         Ok(())
     }
 
@@ -2122,7 +2135,11 @@ impl App {
 
         let mut changed = false;
         for (id, verdict, adopted) in verdicts {
-            let Some(before) = self.state.pane(id).map(|pane| pane.status) else {
+            let Some((before, delegated)) = self
+                .state
+                .pane(id)
+                .map(|pane| (pane.status, pane.parent.is_some()))
+            else {
                 continue;
             };
             // An exited pane's last word is its exit; nothing read off its
@@ -2132,9 +2149,14 @@ impl App {
             }
 
             let status = match verdict {
+                Verdict::Blocked => PaneStatus::Blocked,
+                // A subagent's quiet is it thinking, not waiting on the
+                // user: nobody types into a one-shot task, and it is done
+                // only when it exits. So it never goes idle, and is never
+                // marked done for going quiet.
+                Verdict::Working | Verdict::Idle if delegated => PaneStatus::Running,
                 Verdict::Working => PaneStatus::Running,
                 Verdict::Idle => PaneStatus::Idle,
-                Verdict::Blocked => PaneStatus::Blocked,
             };
             if status == before {
                 continue;
@@ -4431,6 +4453,121 @@ mod tests {
         print(&mut app, &daemon, pane, b"Do you want to proceed?\r\n");
 
         assert_eq!(status_of(&app, pane), PaneStatus::Blocked);
+    }
+
+    /// Announces a subagent `parent` delegated to, running `harness`, and
+    /// puts the focus back on the parent, where the user left it.
+    fn delegated(
+        app: &mut App,
+        daemon: &Sender<ServerMessage>,
+        project: ProjectId,
+        parent: PaneId,
+        harness: &str,
+    ) -> PaneId {
+        let child = PaneId::new();
+        daemon
+            .send(spawned(child, project, harness, Some(parent), false))
+            .expect("the app is listening");
+        app.poll_daemon();
+        app.focus_pane(parent);
+        child
+    }
+
+    #[test]
+    fn a_subagent_that_has_said_nothing_yet_is_running() {
+        // `claude -p` prints nothing until its answer. Read by activity alone
+        // it would sit idle — "waiting on you" — for its whole run.
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let parent = spawn_several(&mut app, &daemon, project, 1)[0];
+        let child = delegated(&mut app, &daemon, project, parent, "claude");
+
+        assert_eq!(
+            status_of(&app, child),
+            PaneStatus::Running,
+            "from the moment it is adopted"
+        );
+
+        // Ten seconds of silence: well past the grace and the settling.
+        for _ in 0..40 {
+            advance(&clock, Duration::from_millis(250));
+            app.poll_panes();
+            assert_eq!(status_of(&app, child), PaneStatus::Running);
+        }
+        assert!(!app.state.is_unseen(child));
+    }
+
+    #[test]
+    fn a_subagent_that_goes_quiet_mid_task_is_still_running_and_not_done() {
+        // `codex exec` goes quiet for seconds at a time while the model
+        // thinks; a subagent is not finished until it exits.
+        let (mut app, project, daemon, _sent) = attached_app();
+        let clock = hand_clock(&mut app);
+        let parent = spawn_several(&mut app, &daemon, project, 1)[0];
+        let child = delegated(&mut app, &daemon, project, parent, "codex");
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, child, b"reading the tests\r\n");
+        settle(&mut app, &clock);
+        for _ in 0..20 {
+            advance(&clock, Duration::from_millis(250));
+            app.poll_panes();
+        }
+
+        assert_eq!(status_of(&app, child), PaneStatus::Running);
+        assert!(!app.state.is_unseen(child), "it has not finished");
+        assert!(
+            app.animations
+                .linear(Target::Pulse(child), app.now())
+                .is_none(),
+            "so nothing asks the user to look"
+        );
+    }
+
+    #[test]
+    fn a_subagent_at_a_prompt_is_blocked_and_running_again_once_it_is_answered() {
+        let def = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            status: Some(
+                toml::from_str(
+                    r#"
+                    [[rules]]
+                    state = "blocked"
+                    region = "screen"
+                    contains = ["proceed?"]
+                    "#,
+                )
+                .expect("the rules parse"),
+            ),
+            ..dispatch_config::HarnessDef::default()
+        };
+        let (client, daemon, _sent) = Client::for_test();
+        let mut app = App::attached([def].into_iter().collect(), client);
+        let project = Project::new("/tmp/rules", ProjectSource::LocalDir);
+        let project_id = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("the app is listening");
+        app.poll_daemon();
+        let clock = hand_clock(&mut app);
+        let parent = spawn_several(&mut app, &daemon, project_id, 1)[0];
+        let child = delegated(&mut app, &daemon, project_id, parent, "shell");
+
+        advance(&clock, Duration::from_secs(4));
+        print(&mut app, &daemon, child, b"Do you want to proceed?\r\n");
+        assert_eq!(status_of(&app, child), PaneStatus::Blocked);
+
+        advance(&clock, Duration::from_millis(300));
+        print(&mut app, &daemon, child, b"\x1b[H\x1b[2J");
+        settle(&mut app, &clock);
+
+        assert_eq!(
+            status_of(&app, child),
+            PaneStatus::Running,
+            "answered, it goes back to its task"
+        );
+        assert!(!app.state.is_unseen(child));
     }
 
     #[test]
