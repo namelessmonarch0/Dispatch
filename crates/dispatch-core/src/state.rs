@@ -357,6 +357,8 @@ impl AppState {
             return Err(StateError::NoSuchPane(id));
         }
 
+        self.unseen.remove(&id);
+
         let mut judged = HashSet::new();
         self.close_or_tombstone(id, &mut judged);
 
@@ -1823,5 +1825,24 @@ mod tests {
         state.close_pane(pane).expect("the pane exists");
 
         assert!(!state.is_unseen(pane));
+    }
+
+    #[test]
+    fn closing_a_pane_forgets_its_mark_even_as_a_tombstone() {
+        // A pane with a durable child stays present as a tombstone when closed,
+        // but its unseen mark should still be cleared.
+        let (mut state, parent, _child) = parent_and_child(true);
+
+        state.mark_unseen(parent);
+        state.close_pane(parent).expect("the pane exists");
+
+        let row = state
+            .pane(parent)
+            .expect("the parent row stays as a tombstone");
+        assert!(row.closed, "marked closed");
+        assert!(
+            !state.is_unseen(parent),
+            "the mark is cleared even for a tombstone"
+        );
     }
 }
