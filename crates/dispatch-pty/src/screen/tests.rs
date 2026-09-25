@@ -165,6 +165,15 @@ fn a_wide_character_keeps_its_cluster_together() {
 }
 
 #[test]
+fn a_wide_characters_second_cell_reads_as_a_blank_in_its_line() {
+    // Status rules match against these lines, so a rule for wide text has
+    // to allow for the blank.
+    let screen = default_screen("日本x".as_bytes());
+
+    assert_eq!(screen.text_lines()[0], "日 本 x");
+}
+
+#[test]
 fn combining_marks_stay_in_one_cell() {
     // "e" followed by a combining acute accent is one grapheme cluster and
     // must not be split across two cells.

@@ -1,6 +1,6 @@
 # B — Live status and motion
 
-Status: approved design, not yet implemented.
+Status: approved design, implemented on branch `ui/live-status`.
 Date: 2026-09-25.
 Second of four UI slices: A visual refresh (merged), B this, C user tabs and
 shell windows, D keybindings.
