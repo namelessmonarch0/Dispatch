@@ -6,9 +6,11 @@ pub mod pane;
 pub mod picker;
 pub mod prompt;
 pub mod sidebar;
+pub mod theme;
 
 pub use input::{Action, Direction, InputRouter, Prefix};
 pub use pane::PaneWidget;
 pub use picker::{Item, Picker};
 pub use prompt::{Note, Prompt};
 pub use sidebar::Sidebar;
+pub use theme::Theme;
