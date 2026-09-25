@@ -398,6 +398,15 @@ fn run(app: &mut App, guard: &mut TerminalGuard) -> Result<()> {
         if app.poll_daemon() {
             needs_draw = true;
         }
+
+        // Something on screen is moving: draw its next frame once it is due,
+        // input or not.
+        if app
+            .next_frame(Instant::now())
+            .is_some_and(|every| last_draw.elapsed() >= every)
+        {
+            needs_draw = true;
+        }
     }
 
     Ok(())

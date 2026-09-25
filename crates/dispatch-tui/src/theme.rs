@@ -97,6 +97,11 @@ pub struct Theme {
     /// when it did not, the tint is the fallback's dark one, and the
     /// terminal's text on it could be a light theme's dark text.
     pub text: Color,
+    /// What everything above was mixed from, kept so an animation can blend
+    /// between roles at the theme's own depth rather than carrying the
+    /// palette and depth around separately.
+    palette: Palette,
+    depth: Depth,
 }
 
 impl Theme {
@@ -122,6 +127,8 @@ impl Theme {
             tab: colour(palette.background.mix(palette.accent, 0.30)),
             accent,
             text: colour(palette.foreground),
+            palette,
+            depth,
         }
     }
 
@@ -138,6 +145,53 @@ impl Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self::fallback()
+    }
+}
+
+/// A colour the theme is mixed from, for animations that move between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// The terminal's background.
+    Background,
+    /// Secondary text and unfocused borders.
+    Faded,
+    /// A selected or focused row.
+    Tint,
+    /// The active tab.
+    Tab,
+    /// The focused pane's border.
+    Accent,
+    /// The peak of an attention pulse: the background most of the way to the
+    /// accent.
+    Pulse,
+}
+
+impl Theme {
+    /// The 24-bit colour behind `role`, before it is drawn at the theme's
+    /// depth.
+    #[must_use]
+    pub fn rgb(&self, role: Role) -> Rgb {
+        let p = self.palette;
+        match role {
+            Role::Background => p.background,
+            Role::Faded => p.foreground.mix(p.background, 0.45),
+            Role::Tint => p.background.mix(p.foreground, 0.10),
+            Role::Tab => p.background.mix(p.accent, 0.30),
+            Role::Accent => p.accent,
+            Role::Pulse => p.background.mix(p.accent, 0.55),
+        }
+    }
+
+    /// `from` moved `t` of the way toward `to`, drawn at this theme's depth —
+    /// so a 256-colour terminal steps through the nearest entries rather than
+    /// being sent colours it would misread.
+    #[must_use]
+    pub fn blend(&self, from: Rgb, to: Rgb, t: f32) -> Color {
+        let mixed = from.mix(to, t.clamp(0.0, 1.0));
+        match self.depth {
+            Depth::TrueColor => Color::Rgb(mixed.0, mixed.1, mixed.2),
+            Depth::Indexed => Color::Indexed(nearest_indexed(mixed)),
+        }
     }
 }
 

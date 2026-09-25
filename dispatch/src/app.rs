@@ -29,6 +29,7 @@ use dispatch_tui::input::{
     Action, Direction, Event, InputRouter, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseEventKind,
 };
+use dispatch_tui::motion::{Animations, SPIN_FRAME, TWEEN_FRAME};
 use dispatch_tui::{Item, PaneWidget, Picker, Prompt, Sidebar, Theme, sidebar, truncate};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -385,6 +386,29 @@ enum Mode {
     Attached(Vec<Attachment>),
 }
 
+/// What an animation animates, so a new one on the same thing replaces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(
+    dead_code,
+    reason = "started by the focus, pulse and transition animations"
+)]
+enum Target {
+    /// A pane's border easing toward the accent: it has just been focused.
+    Focus(PaneId),
+    /// A pane's border easing back to faded: focus has just left it.
+    Blur(PaneId),
+    /// The sidebar's focus tint moving to the newly focused row.
+    Glide,
+    /// A pane's sidebar row pulsing for attention.
+    Pulse(PaneId),
+    /// A new pane's border being drawn in.
+    Open(PaneId),
+    /// A closed pane's tile retracting.
+    Close(PaneId),
+    /// The active tab's tint sliding to the newly active tab.
+    Tab,
+}
+
 /// The application.
 pub struct App {
     mode: Mode,
@@ -508,6 +532,8 @@ pub struct App {
     /// When this run started, so every spinner on screen derives its frame
     /// from the clock rather than keeping one of its own.
     started: Instant,
+    /// Running tweens, one per thing on screen that is moving.
+    animations: Animations<Target>,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -563,6 +589,7 @@ impl App {
             clock: Box::new(Instant::now),
             motion: true,
             started: Instant::now(),
+            animations: Animations::new(true),
         }
     }
 
@@ -662,6 +689,7 @@ impl App {
     /// Turns motion on or off: spinners, pulses, easing and transitions.
     pub fn set_motion(&mut self, on: bool) {
         self.motion = on;
+        self.animations.set_enabled(on);
     }
 
     /// The daemons this client is holding, or nothing when it holds none.
@@ -1086,6 +1114,27 @@ impl App {
             let elapsed = self.now().saturating_duration_since(self.started);
             usize::try_from(elapsed.as_millis() / 100).unwrap_or(0) % sidebar::SPINNER.len()
         })
+    }
+
+    /// How long until the next frame something on screen needs: a tween
+    /// running needs about thirty a second, a spinner ten, and nothing
+    /// moving needs none — a still Dispatch draws only when something
+    /// changes.
+    #[must_use]
+    pub fn next_frame(&self, now: Instant) -> Option<Duration> {
+        if self.animations.active(now) {
+            return Some(TWEEN_FRAME);
+        }
+
+        let spinning = self.motion
+            && self
+                .state
+                .projects()
+                .iter()
+                .flat_map(|project| self.state.panes_for(project.id))
+                .any(|pane| !pane.closed && pane.status == PaneStatus::Running);
+
+        spinning.then_some(SPIN_FRAME)
     }
 
     /// Takes on a pane that now exists, wherever its process is.
@@ -3130,6 +3179,8 @@ impl App {
     /// Draws one frame.
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
+        let now = self.now();
+        self.animations.sweep(now);
 
         // One row across the top for the name and the tabs, one along the
         // bottom for status, and everything between for the sidebar and the
@@ -5225,6 +5276,45 @@ mod tests {
 
         app.set_motion(false);
         assert_eq!(app.spinner_frame(), None);
+    }
+
+    #[test]
+    fn a_still_interface_asks_for_no_frames() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        let now = app.now();
+        app.animations.sweep(now + Duration::from_secs(10));
+        app.state
+            .set_pane_status(pane, PaneStatus::Idle)
+            .expect("exists");
+
+        assert_eq!(app.next_frame(now + Duration::from_secs(10)), None);
+    }
+
+    #[test]
+    fn a_spinner_asks_for_a_frame_a_tenth_of_a_second() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+        let later = app.now() + Duration::from_secs(10);
+        app.animations.sweep(later);
+        app.state
+            .set_pane_status(pane, PaneStatus::Running)
+            .expect("exists");
+
+        assert_eq!(app.next_frame(later), Some(Duration::from_millis(100)));
+
+        app.set_motion(false);
+        assert_eq!(app.next_frame(later), None, "a still glyph needs no frames");
+    }
+
+    #[test]
+    fn a_running_tween_asks_for_thirty_frames_a_second() {
+        let (mut app, _, _, _) = attached_app();
+        let now = app.now();
+        app.animations
+            .start(Target::Glide, now, Duration::from_millis(150), 0.0);
+
+        assert_eq!(app.next_frame(now), Some(Duration::from_millis(33)));
     }
 
     #[test]
