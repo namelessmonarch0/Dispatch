@@ -231,7 +231,8 @@ live one, so it is not evaluated: it keeps its last state.
 - A pane whose status goes `Running` → `Idle` while it is not the focused
   pane is marked unseen.
 - A bell from a pane that is not focused marks it unseen, whatever its state.
-- Focusing a pane clears its mark.
+- Focusing a pane clears its mark — on the activity poll that follows, not
+  the keystroke itself, since that poll is what touches the mark.
 - **Grace**: for the first **3 s** after a pane is adopted nothing marks it
   unseen. A reattaching client is replayed every pane's recent output, and
   without the grace every pane would come back "done".
@@ -315,17 +316,20 @@ The loop draws today only after input or pane output. `App` gains:
 pub fn next_frame(&self, now: Instant) -> Option<Duration>;
 ```
 
-— 33 ms while any tween runs, 100 ms while a spinner is on screen, `None`
-otherwise. `main.rs` polls for input no longer than that and draws when it
-passes. A Dispatch with nothing moving still draws nothing.
+— 33 ms while any tween remains in the store, 100 ms while a spinner is on
+screen, `None` otherwise. A tween that has finished but not yet been swept
+up still asks: the frame that sweeps it is the one that shows its end, and
+a closed pane's tile holds the grid until that frame is drawn. `main.rs`
+polls for input no longer than that and draws when it passes. A Dispatch
+with nothing moving still draws nothing.
 
 ### The animations
 
 | Action | Motion | Duration |
 |---|---|---|
 | Working | the spinner glyph (sidebar and tab) advances one braille frame per 100 ms, derived from the clock so all spinners are in step | continuous |
-| Attention (a pane turns blocked, or is marked unseen) | its sidebar row's background pulses three times between the background and a strong accent mix (background 55% toward accent), then settles; the glyph stays | 1.2 s |
-| Focus moves | the new pane's border eases `faded` → `accent`, the old one's `accent` → `faded`; the sidebar's focus tint glides row by row from the old row to the new when both are drawn in one section, and cross-fades (old out, new in) otherwise. A glide replaced mid-way starts from the row the previous one was heading to. | 150 ms |
+| Attention (a pane turns blocked, or is marked unseen) | its sidebar row's background pulses three times between the background and a strong accent mix (background 55% toward accent), then settles; the glyph stays. Only an unfocused pane pulses; focusing it while it pulses stops the pulse at once — it is what the pulse was for. | 1.2 s |
+| Focus moves | the new pane's border eases `faded` → `accent`, the old one's `accent` → `faded`, each starting from what the previous frame showed as focused rather than the state read fresh, so an ease already under way continues instead of restarting; the sidebar's focus tint glides row by row from the old row to the new when both are drawn in one section, and cross-fades (old out, new in) otherwise. A glide replaced mid-way starts from the row the previous one was heading to. | 150 ms |
 | Pane opens | its border is revealed clockwise from the top-left corner | 200 ms |
 | Pane closes or exits the grid | its tile keeps its place, interior cleared, while its border retracts anticlockwise; then the grid reflows | 150 ms |
 | Tab switch | the active tab's tint slides from the old tab's position and width to the new one's | 150 ms |
@@ -335,6 +339,13 @@ and input alike — the other panes keep their tiles, so a click lands where
 the eye sees it — while the closing tile itself takes no input and is gone
 from the pane list. When the tween ends the grid reflows and the remaining
 panes are resized, once.
+
+The hold is stamped with the area its grid was laid out for, not the area
+of whatever frame started it, so a terminal that has since resized is
+noticed: the hold is dropped and the grid reflows at once rather than
+holding tiles that no longer fit. A switch to another project drops the
+hold the same way instead of retracting it — that project's panes going
+off screen is not them closing.
 
 ### Motion off
 
