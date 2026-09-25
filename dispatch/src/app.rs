@@ -418,6 +418,8 @@ pub struct App {
     /// way to pick one of its rows out of the list — this is what a click is
     /// matched against.
     sidebar_area: Rect,
+    /// How far each machine's section of the sidebar is scrolled.
+    sidebar_scroll: sidebar::Scroll,
     /// Subagents the user has opened, so they join the tiled grid.
     ///
     /// Which rows are open is a per-client choice, not a property of the
@@ -513,6 +515,7 @@ impl App {
             frames: Vec::new(),
             layout: Vec::new(),
             sidebar_area: Rect::default(),
+            sidebar_scroll: sidebar::Scroll::new(),
             expanded: HashSet::new(),
             pending: VecDeque::new(),
             answered: HashMap::new(),
@@ -1801,8 +1804,13 @@ impl App {
         // resolved here rather than through the router.
         if let Event::Mouse(mouse) = event
             && matches!(mouse.kind, MouseEventKind::Down(_))
-            && let Some(hit) =
-                sidebar::hit_test(&self.state, self.sidebar_area, mouse.column, mouse.row)
+            && let Some(hit) = sidebar::hit_test(
+                &self.state,
+                self.sidebar_area,
+                &self.sidebar_scroll,
+                mouse.column,
+                mouse.row,
+            )
         {
             match hit {
                 sidebar::Hit::Device(id) => self.state.toggle_device_collapsed(id),
@@ -2949,7 +2957,8 @@ impl App {
         frame.render_widget(
             Sidebar::new(&self.state)
                 .with_harnesses(&self.harnesses)
-                .with_theme(self.theme),
+                .with_theme(self.theme)
+                .with_scroll(&self.sidebar_scroll),
             sidebar_area,
         );
         self.sidebar_area = sidebar_area;

@@ -69,6 +69,11 @@ fn column_of(line: &str, text: &str) -> usize {
     line[..byte].chars().count()
 }
 
+/// What a click at `(x, y)` finds, with nothing scrolled.
+fn hit(state: &AppState, area: Rect, x: u16, y: u16) -> Option<Hit> {
+    hit_test(state, area, &Scroll::new(), x, y)
+}
+
 #[test]
 fn projects_are_listed_in_the_order_they_were_added() {
     let (state, _, _) = state();
@@ -289,10 +294,7 @@ fn a_click_on_a_pane_row_finds_that_pane() {
     let pane = spawn(&mut state, alpha, "claude");
 
     let area = Rect::new(0, 0, WIDTH, 10);
-    assert_eq!(
-        hit_test(&state, area, LEFT + 4, TOP + 1),
-        Some(Hit::Pane(pane))
-    );
+    assert_eq!(hit(&state, area, LEFT + 4, TOP + 1), Some(Hit::Pane(pane)));
 }
 
 #[test]
@@ -306,13 +308,10 @@ fn a_click_on_a_child_row_finds_the_child_rather_than_its_parent() {
     let area = Rect::new(0, 0, WIDTH, 10);
 
     assert_eq!(
-        hit_test(&state, area, LEFT + 6, TOP + 1),
+        hit(&state, area, LEFT + 6, TOP + 1),
         Some(Hit::Pane(parent))
     );
-    assert_eq!(
-        hit_test(&state, area, LEFT + 6, TOP + 2),
-        Some(Hit::Pane(child))
-    );
+    assert_eq!(hit(&state, area, LEFT + 6, TOP + 2), Some(Hit::Pane(child)));
 }
 
 #[test]
@@ -324,11 +323,8 @@ fn a_click_anywhere_on_a_project_heading_finds_the_project() {
 
     let area = Rect::new(0, 0, WIDTH, 10);
 
-    assert_eq!(hit_test(&state, area, LEFT, TOP), Some(Hit::Project(alpha)));
-    assert_eq!(
-        hit_test(&state, area, WIDTH - 2, TOP),
-        Some(Hit::Project(alpha))
-    );
+    assert_eq!(hit(&state, area, LEFT, TOP), Some(Hit::Project(alpha)));
+    assert_eq!(hit(&state, area, WIDTH - 2, TOP), Some(Hit::Project(alpha)));
 }
 
 #[test]
@@ -344,7 +340,7 @@ fn a_click_on_a_closed_panes_tombstone_finds_nothing() {
     state.close_pane(pane).expect("the pane exists");
 
     let area = Rect::new(0, 0, WIDTH, 10);
-    assert_eq!(hit_test(&state, area, LEFT + 8, TOP + 1), None);
+    assert_eq!(hit(&state, area, LEFT + 8, TOP + 1), None);
 }
 
 #[test]
@@ -353,8 +349,8 @@ fn a_click_outside_the_sidebars_area_finds_nothing() {
     spawn(&mut state, alpha, "claude");
 
     let area = Rect::new(0, 0, WIDTH, 10);
-    assert_eq!(hit_test(&state, area, WIDTH + 5, TOP + 1), None);
-    assert_eq!(hit_test(&state, area, LEFT + 4, 20), None);
+    assert_eq!(hit(&state, area, WIDTH + 5, TOP + 1), None);
+    assert_eq!(hit(&state, area, LEFT + 4, 20), None);
 }
 
 #[test]
@@ -585,10 +581,7 @@ fn a_click_lands_on_the_row_below_a_collapsed_project() {
     let area = Rect::new(0, 0, WIDTH, 10);
 
     // alpha, then beta's heading, then codex.
-    assert_eq!(
-        hit_test(&state, area, LEFT + 4, TOP + 2),
-        Some(Hit::Pane(codex))
-    );
+    assert_eq!(hit(&state, area, LEFT + 4, TOP + 2), Some(Hit::Pane(codex)));
 }
 
 #[test]
@@ -603,11 +596,11 @@ fn a_click_on_a_panes_twisty_toggles_it_rather_than_focusing_it() {
 
     // The twisty sits in the row's first column, four in from the list's edge.
     assert_eq!(
-        hit_test(&state, area, LEFT + 4, TOP + 1),
+        hit(&state, area, LEFT + 4, TOP + 1),
         Some(Hit::Twisty(parent))
     );
     assert_eq!(
-        hit_test(&state, area, LEFT + 5, TOP + 1),
+        hit(&state, area, LEFT + 5, TOP + 1),
         Some(Hit::Pane(parent)),
         "the rest of the row still focuses the pane"
     );
@@ -620,10 +613,7 @@ fn a_click_on_a_childless_panes_twisty_column_focuses_it() {
     let pane = spawn(&mut state, alpha, "claude");
 
     let area = Rect::new(0, 0, WIDTH, 10);
-    assert_eq!(
-        hit_test(&state, area, LEFT + 4, TOP + 1),
-        Some(Hit::Pane(pane))
-    );
+    assert_eq!(hit(&state, area, LEFT + 4, TOP + 1), Some(Hit::Pane(pane)));
 }
 
 #[test]
@@ -640,7 +630,7 @@ fn a_tombstones_twisty_still_toggles() {
 
     let area = Rect::new(0, 0, WIDTH, 10);
     assert_eq!(
-        hit_test(&state, area, LEFT + 4, TOP + 1),
+        hit(&state, area, LEFT + 4, TOP + 1),
         Some(Hit::Twisty(parent))
     );
 }
@@ -848,43 +838,136 @@ fn one_machine_draws_no_device_row() {
 }
 
 #[test]
-fn several_machines_each_get_a_row_above_their_projects() {
+fn several_machines_each_get_a_section_named_on_the_line_above_it() {
+    // Ten rows: frame 0 and 9, one divider, seven shared between two equal
+    // weights — two each, then three split 2/1 by largest remainder.
     let (state, _, _) = fleet();
     let lines = render_lines(&state, WIDTH, 10);
 
-    let laptop = lines
-        .iter()
-        .position(|line| line.contains("laptop"))
-        .expect("the first machine has a row");
-    let alpha = lines
-        .iter()
-        .position(|line| line.contains("alpha"))
-        .expect("its project is listed");
-    let tower = lines
-        .iter()
-        .position(|line| line.contains("tower"))
-        .expect("the second machine has a row");
-
-    assert!(laptop < alpha && alpha < tower, "{lines:#?}");
     assert!(
-        column_of(&lines[alpha], "alpha") > column_of(&lines[laptop], "laptop"),
-        "a project is indented under its machine: {lines:#?}"
+        lines[0].starts_with('┌') && lines[0].contains("laptop"),
+        "{lines:#?}"
     );
+    assert!(lines[1].contains("alpha"), "{lines:#?}");
+    assert!(
+        lines[5].starts_with('├') && lines[5].contains("tower") && lines[5].ends_with('┤'),
+        "{lines:#?}"
+    );
+    assert!(lines[6].contains("beta"), "{lines:#?}");
+    assert!(lines[9].starts_with('└'), "{lines:#?}");
 }
 
 #[test]
-fn a_collapsed_device_hides_its_projects() {
+fn a_machine_with_more_open_panes_gets_more_of_the_height() {
+    let (mut state, laptop, _) = fleet();
+    let alpha = state
+        .projects()
+        .iter()
+        .find(|project| project.device == laptop)
+        .expect("the laptop has a project")
+        .id;
+    for _ in 0..3 {
+        spawn(&mut state, alpha, "claude");
+    }
+
+    // Twenty rows: eighteen inside, one divider, seventeen shared by weights
+    // four and one — two each, then thirteen split 10.4/2.6, the spare row
+    // going to the larger remainder: twelve and five.
+    let lines = render_lines(&state, WIDTH, 20);
+    let divider = lines
+        .iter()
+        .position(|line| line.contains("tower"))
+        .expect("the second machine is named");
+
+    assert_eq!(divider, 13, "{lines:#?}");
+}
+
+#[test]
+fn a_folded_machine_keeps_only_the_line_naming_it() {
     let (mut state, laptop, _) = fleet();
 
     state.toggle_device_collapsed(laptop);
-    let text = render_lines(&state, WIDTH, 10).join("\n");
+    let lines = render_lines(&state, WIDTH, 10);
+    let text = lines.join("\n");
 
     assert!(!text.contains("alpha"), "{text}");
-    assert!(text.contains("laptop"), "the machine stays: {text}");
+    assert!(lines[0].contains("laptop"), "the machine stays: {text}");
+    assert!(
+        lines[1].contains("tower"),
+        "its section is only that line: {text}"
+    );
     assert!(
         text.contains("beta"),
         "the other machine is unaffected: {text}"
     );
+}
+
+#[test]
+fn a_click_on_a_machines_name_finds_the_machine() {
+    let (state, laptop, tower) = fleet();
+    let area = Rect::new(0, 0, WIDTH, 10);
+
+    assert_eq!(hit(&state, area, 3, 0), Some(Hit::Device(laptop)));
+    assert_eq!(hit(&state, area, 3, 5), Some(Hit::Device(tower)));
+}
+
+#[test]
+fn one_machines_top_border_is_not_a_control() {
+    let (state, _, _) = state();
+    let area = Rect::new(0, 0, WIDTH, 10);
+
+    assert_eq!(hit(&state, area, 3, 0), None);
+}
+
+#[test]
+fn a_click_in_the_second_section_finds_its_rows() {
+    let (state, _, _) = fleet();
+    let beta = state
+        .projects()
+        .iter()
+        .find(|project| project.name == "beta")
+        .expect("beta is registered")
+        .id;
+    let area = Rect::new(0, 0, WIDTH, 10);
+
+    assert_eq!(hit(&state, area, LEFT + 4, 6), Some(Hit::Project(beta)));
+}
+
+#[test]
+fn several_machines_in_a_very_short_sidebar_still_draw_the_frame() {
+    let mut state = AppState::new();
+    for name in ["one", "two", "three"] {
+        let device = state.add_device(Device::new(name));
+        state.add_project(
+            Project::new(format!("/tmp/{name}"), ProjectSource::LocalDir).with_device(device),
+        );
+    }
+
+    for height in 2..6 {
+        let lines = render_lines(&state, WIDTH, height);
+        let last = &lines[usize::from(height) - 1];
+        assert!(last.starts_with('└'), "height {height}: {lines:#?}");
+    }
+}
+
+#[test]
+fn heights_are_shared_by_weight_after_two_rows_each() {
+    assert_eq!(section_heights(&[1, 1], &[false, false], 10), vec![5, 5]);
+    assert_eq!(section_heights(&[3, 1], &[false, false], 12), vec![8, 4]);
+    assert_eq!(section_heights(&[1, 1, 1], &[false; 3], 10), vec![4, 3, 3]);
+}
+
+#[test]
+fn a_folded_section_gets_no_height() {
+    assert_eq!(section_heights(&[1, 1], &[false, true], 10), vec![10, 0]);
+    assert_eq!(section_heights(&[1, 1], &[true, true], 10), vec![0, 0]);
+}
+
+#[test]
+fn too_little_height_is_handed_out_a_row_at_a_time_in_order() {
+    assert_eq!(section_heights(&[1, 1], &[false, false], 3), vec![2, 1]);
+    assert_eq!(section_heights(&[1, 1], &[false, false], 1), vec![1, 0]);
+    assert_eq!(section_heights(&[1, 1], &[false, false], 0), vec![0, 0]);
 }
 
 #[test]
@@ -926,10 +1009,10 @@ fn an_unreachable_device_with_a_long_name_still_says_so() {
 }
 
 #[test]
-fn a_pending_device_with_no_projects_still_draws_a_row() {
+fn a_pending_device_with_no_projects_still_gets_a_section() {
     // The startup case: a registered machine is drawn before it has answered,
     // and before it has answered it has no projects either -- `roots` only
-    // arrive on first connect. The row must not wait for either.
+    // arrive on first connect. Its section must not wait for either.
     let mut state = AppState::new();
     let laptop = state.add_device(Device::new("laptop"));
     state.add_project(Project::new("/tmp/alpha", ProjectSource::LocalDir).with_device(laptop));
@@ -939,17 +1022,9 @@ fn a_pending_device_with_no_projects_still_draws_a_row() {
     let row = lines
         .iter()
         .find(|line| line.contains("tower"))
-        .expect("the machine has a row despite having no projects");
+        .expect("the machine is named despite having no projects");
 
     assert!(row.contains("unreachable"), "{row:?}");
-}
-
-#[test]
-fn a_click_on_a_device_row_finds_the_device() {
-    let (state, laptop, _) = fleet();
-    let area = Rect::new(0, 0, WIDTH, 10);
-
-    assert_eq!(hit_test(&state, area, LEFT, TOP), Some(Hit::Device(laptop)));
 }
 
 #[test]
@@ -1102,7 +1177,7 @@ fn a_click_on_a_branch_row_is_a_click_on_its_project() {
     let area = Rect::new(0, 0, WIDTH, 6);
 
     assert_eq!(
-        hit_test(&state, area, LEFT + NAME, TOP + 1),
+        hit(&state, area, LEFT + NAME, TOP + 1),
         Some(Hit::Project(project))
     );
 }
