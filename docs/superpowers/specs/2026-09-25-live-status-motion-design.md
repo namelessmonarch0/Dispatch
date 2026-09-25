@@ -195,9 +195,11 @@ A small state machine per pane, in `dispatch-tui/src/activity.rs`:
 pub struct Tracker { /* rules, timings, last signals, current state */ }
 
 impl Tracker {
-    pub fn new(rules: Arc<StatusRules>, now: Instant) -> Self;
-    /// Output arrived; `echo` when within the echo window of our own input.
-    pub fn output(&mut self, now: Instant, echo: bool);
+    pub fn new(rules: Arc<StatusRules>) -> Self;
+    /// We sent the pane a keystroke or paste.
+    pub fn input(&mut self, now: Instant);
+    /// Output arrived; within 150 ms of our own input it is echo and ignored.
+    pub fn output(&mut self, now: Instant);
     pub fn signals(&mut self, signals: &Signals);
     /// Re-evaluates against the live screen; returns a change, if any.
     pub fn evaluate(&mut self, now: Instant, screen: &[String]) -> Option<Verdict>;

@@ -19,3 +19,6 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }

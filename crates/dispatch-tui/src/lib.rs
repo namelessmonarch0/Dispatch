@@ -1,5 +1,6 @@
 //! `dispatch-tui`: rendering, input routing and keymap.
 
+pub mod activity;
 pub mod browser;
 pub mod input;
 pub mod pane;
