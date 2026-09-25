@@ -178,8 +178,8 @@ titles keep the room they had.
 
 Every icon is followed by a blank column. The project row drops its
 open/shut folder icon — the twisty already says whether it is open — and
-shows one icon: the git mark for a repository, a folder for a plain
-directory. Columns, counted from the row's start:
+shows one icon: the git mark for a repository or any project whose branch
+is known, a folder otherwise. Columns, counted from the row's start:
 
 ```
 Project    ▾ ⎇ Dispatch          twisty @0, icon @2, name @4
@@ -214,10 +214,13 @@ its own branch line: that line is part of what the project is.
 
 A subagent is drawn under its parent whatever its own branch: the tree is
 the primary structure, and grouping applies to top-level panes. A project
-with no branch — a plain directory, or a daemon too old to report one —
-draws no branch rows and lists its panes directly beneath, as now. A
-branch row is not a control of its own: a click on one is a click on its
-project.
+draws branch rows whenever its branch is known, and its mark says so: it
+takes the git mark even when it was opened as a plain directory, since one
+opened below a repository's root finds that repository's branch by walking
+up. A project with no branch — outside any repository, or on a daemon too
+old to report one — draws no branch rows and lists its panes directly
+beneath, as now. A branch row is not a control of its own: a click on one is
+a click on its project.
 
 A detached `HEAD` is written `@` plus the first seven hex digits of the
 commit.

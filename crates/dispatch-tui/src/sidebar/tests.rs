@@ -842,6 +842,30 @@ fn a_plain_directory_is_a_folder_and_a_repository_is_marked_as_one() {
     );
 }
 
+#[test]
+fn a_directory_whose_branch_is_known_is_marked_as_a_repository() {
+    // Opened below its repository's root — a directory in a monorepo, or
+    // one `git init` reached later — a project is recorded as a plain
+    // directory, but its branch is found by walking up. The mark follows
+    // the branch, so it never sits above a branch line as a folder.
+    let mut state = AppState::new();
+    state.add_project(
+        Project::new("/tmp/repo/sub", ProjectSource::LocalDir).with_branch(Some("main".into())),
+    );
+
+    let buf = render(&state, WIDTH, 6);
+
+    assert_eq!(
+        buf.cell((LEFT + 2, TOP)).expect("cell exists").symbol(),
+        REPOSITORY
+    );
+    assert_eq!(
+        column_of(&row_text(&buf, TOP + 1), "main"),
+        usize::from(LEFT + NAME),
+        "with its branch beneath"
+    );
+}
+
 /// State with two devices, each holding one project.
 fn fleet() -> (AppState, DeviceId, DeviceId) {
     let mut state = AppState::new();

@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use crate::theme::Theme;
 use dispatch_config::HarnessRegistry;
 use dispatch_config::harness::DEFAULT_ICON;
-use dispatch_core::{AppState, DeviceId, Pane, PaneId, PaneStatus, ProjectId, ProjectSource};
+use dispatch_core::{
+    AppState, DeviceId, Pane, PaneId, PaneStatus, Project, ProjectId, ProjectSource,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -150,10 +152,17 @@ impl<'a> Sidebar<'a> {
 /// One mark rather than a folder with a git mark beside it: the twisty
 /// already says whether the folder is open, and a second glyph there was one
 /// more thing to collide.
-fn source_icon(source: &ProjectSource) -> &'static str {
-    match source {
-        ProjectSource::LocalDir => SHUT_FOLDER,
+///
+/// A known branch makes a project a repository whatever its source says. The
+/// source records only whether the project's own root holds `.git`, while
+/// the branch is found by walking up, so a directory inside a repository —
+/// or one `git init` reached after it was opened — has a branch line under
+/// it, and a folder above that line would contradict it.
+fn source_icon(project: &Project) -> &'static str {
+    match project.source {
         ProjectSource::GitRepo { .. } => REPOSITORY,
+        ProjectSource::LocalDir if project.branch.is_some() => REPOSITORY,
+        ProjectSource::LocalDir => SHUT_FOLDER,
     }
 }
 
@@ -812,7 +821,7 @@ impl Sidebar<'_> {
         let collapsed = self.state.is_project_collapsed(id);
 
         write(buf, area, x, y, twisty(has_panes, collapsed), style);
-        write(buf, area, x + 2, y, source_icon(&project.source), style);
+        write(buf, area, x + 2, y, source_icon(project), style);
 
         let name_x = x + NAME;
         let room = (area.x + area.width).saturating_sub(name_x) as usize;
