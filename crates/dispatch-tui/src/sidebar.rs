@@ -42,6 +42,9 @@ pub const RUNNING: &str = "\u{f04b}";
 /// Waiting on its user.
 pub const IDLE: &str = "\u{f04c}";
 
+/// Waiting on a decision only the user can make.
+pub const BLOCKED: &str = "\u{f071}";
+
 /// Exited cleanly.
 pub const DONE: &str = "\u{f00c}";
 
@@ -245,6 +248,12 @@ fn state_glyph(pane: &Pane, theme: &Theme) -> (&'static str, Style) {
         PaneStatus::Starting => (STARTING, Style::default().fg(Color::Yellow)),
         PaneStatus::Running => (RUNNING, Style::default().fg(Color::Green)),
         PaneStatus::Idle => (IDLE, Style::default().fg(Color::Blue)),
+        PaneStatus::Blocked => (
+            BLOCKED,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         // A pane that exited stays listed until it is closed, so it has to be
         // visibly different from one that is still working.
         PaneStatus::Exited(0) => (DONE, Style::default().fg(theme.faded)),

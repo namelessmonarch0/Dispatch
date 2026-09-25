@@ -47,6 +47,9 @@ pub struct AppState {
     devices: Vec<Device>,
     /// Devices whose projects the sidebar hides.
     collapsed_devices: HashSet<DeviceId>,
+    /// Panes that finished, or rang for attention, while the user was looking
+    /// elsewhere. Client state, like the folds: nothing on the wire.
+    unseen: HashSet<PaneId>,
 }
 
 impl AppState {
@@ -528,6 +531,7 @@ impl AppState {
         };
         let closed = self.panes.remove(index);
         self.collapsed_panes.remove(&id);
+        self.unseen.remove(&id);
 
         if self.zoomed_pane == Some(id) {
             self.zoomed_pane = None;
@@ -635,6 +639,23 @@ impl AppState {
             .ok_or(StateError::NoSuchPane(id))?;
         pane.title = title.into();
         Ok(())
+    }
+
+    /// Marks a pane as finished, or asking for attention, out of the user's
+    /// sight.
+    pub fn mark_unseen(&mut self, id: PaneId) {
+        self.unseen.insert(id);
+    }
+
+    /// Clears that mark: the user is looking at the pane now.
+    pub fn mark_seen(&mut self, id: PaneId) {
+        self.unseen.remove(&id);
+    }
+
+    /// Whether a pane is marked as finished out of sight.
+    #[must_use]
+    pub fn is_unseen(&self, id: PaneId) -> bool {
+        self.unseen.contains(&id)
     }
 
     /// Records which branch a pane is working on.
@@ -1773,5 +1794,34 @@ mod tests {
             state.set_project_branch(missing, None),
             Err(StateError::NoSuchProject(missing))
         );
+    }
+
+    #[test]
+    fn a_pane_can_be_marked_unseen_and_seen_again() {
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let pane = state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+
+        assert!(!state.is_unseen(pane));
+        state.mark_unseen(pane);
+        assert!(state.is_unseen(pane));
+        state.mark_seen(pane);
+        assert!(!state.is_unseen(pane));
+    }
+
+    #[test]
+    fn closing_a_pane_forgets_its_mark() {
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+        let pane = state
+            .spawn_pane(project, HarnessId::new("claude"))
+            .expect("the project exists");
+
+        state.mark_unseen(pane);
+        state.close_pane(pane).expect("the pane exists");
+
+        assert!(!state.is_unseen(pane));
     }
 }

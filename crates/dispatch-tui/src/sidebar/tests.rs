@@ -1483,3 +1483,19 @@ fn a_machines_name_stays_full_strength_while_its_hidden_above_count_is_faded() {
     let up = buf.cell((up_x, y)).expect("cell exists");
     assert_eq!(up.fg, Theme::fallback().faded, "{lines:#?}");
 }
+
+#[test]
+fn a_blocked_pane_says_so_in_yellow() {
+    let (mut state, alpha, _) = state();
+    let pane = spawn(&mut state, alpha, "claude");
+    state
+        .set_pane_status(pane, PaneStatus::Blocked)
+        .expect("pane exists");
+
+    let buf = render(&state, WIDTH, 6);
+    let cell = buf.cell((WIDTH - 3, TOP + 1)).expect("cell exists");
+
+    assert_eq!(cell.symbol(), BLOCKED);
+    assert_eq!(cell.fg, Color::Yellow);
+    assert!(cell.modifier.contains(Modifier::BOLD));
+}
