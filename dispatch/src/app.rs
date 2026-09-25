@@ -134,10 +134,12 @@ const FRAME: Duration = Duration::from_millis(16);
 
 /// How much of a task's opening words becomes a subagent's first title.
 ///
-/// The sidebar is [`sidebar::WIDTH`] columns wide and a child row is indented
-/// four into it, so anything much longer than this could not be read there in
-/// full anyway.
-const TITLE_BUDGET: usize = 22;
+/// All a subagent's row has room for: in a [`sidebar::WIDTH`]-column sidebar,
+/// its title starts ten columns inside the frame, after the indent, the
+/// twisty, the icon and the blank after each, and stops a blank short of the
+/// state glyph two in from the far side. Any longer and the sidebar would cut
+/// again, mid-word, what was cut here between words.
+const TITLE_BUDGET: usize = 19;
 
 /// The opening words of a task, for the row of the subagent running it.
 ///
