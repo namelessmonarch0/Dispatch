@@ -233,11 +233,14 @@ fn state_glyph(pane: &Pane, theme: &Theme) -> (&'static str, Style) {
 
 /// One line of the sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Row {
+enum Row<'a> {
     /// A machine, when there is more than one.
     Device(DeviceId),
     /// A project heading, drawn `indent` columns in from the list's edge.
     Project(ProjectId, u16),
+    /// A branch within a project: the project's own, or one some of its panes
+    /// are working on. Drawn `indent` columns in, like its project.
+    Branch(ProjectId, &'a str, u16),
     /// A pane, drawn `indent` columns in from the list's edge.
     Pane(PaneId, u16),
 }
@@ -259,7 +262,7 @@ enum Row {
 /// has no row here. Drawing an arbitrary depth in a column this narrow needs a
 /// shape nobody has designed yet, so the honest thing is to say where the
 /// drawing stops rather than imply it does not.
-fn rows(state: &AppState) -> Vec<Row> {
+fn rows(state: &AppState) -> Vec<Row<'_>> {
     let mut rows = Vec::new();
 
     // One machine draws no machine row: it would say what the user already
@@ -289,30 +292,79 @@ fn rows(state: &AppState) -> Vec<Row> {
 
             rows.push(Row::Project(project.id, step));
 
-            if state.is_project_collapsed(project.id) {
+            let collapsed = state.is_project_collapsed(project.id);
+            let top: Vec<&Pane> = state
+                .panes_for(project.id)
+                .into_iter()
+                .filter(|pane| pane.parent.is_none())
+                .collect();
+
+            let Some(own) = project.branch.as_deref() else {
+                if !collapsed {
+                    for pane in &top {
+                        push_pane(state, &mut rows, pane, step + 4);
+                    }
+                }
+                continue;
+            };
+
+            // The project's own branch stays when the project is folded: it
+            // is part of what the project is, not one of the things folding
+            // hides.
+            rows.push(Row::Branch(project.id, own, step));
+            if collapsed {
                 continue;
             }
 
-            for pane in state.panes_for(project.id) {
-                if pane.parent.is_some() {
-                    // Drawn under its parent, below, not in its own right.
-                    continue;
+            // A pane whose branch is not known yet is shown with the project
+            // rather than held back until it is.
+            for pane in top
+                .iter()
+                .filter(|pane| pane.branch.as_deref().is_none_or(|branch| branch == own))
+            {
+                push_pane(state, &mut rows, pane, step + 4);
+            }
+
+            // Every other branch, in the order its first pane was opened.
+            let mut others: Vec<&str> = Vec::new();
+            for pane in &top {
+                if let Some(branch) = pane.branch.as_deref()
+                    && branch != own
+                    && !others.contains(&branch)
+                {
+                    others.push(branch);
                 }
+            }
 
-                rows.push(Row::Pane(pane.id, step + 4));
-
-                if state.is_pane_collapsed(pane.id) {
-                    continue;
-                }
-
-                for child in state.children_of(pane.id) {
-                    rows.push(Row::Pane(child.id, step + 6));
+            for branch in others {
+                rows.push(Row::Branch(project.id, branch, step));
+                for pane in top
+                    .iter()
+                    .filter(|pane| pane.branch.as_deref() == Some(branch))
+                {
+                    push_pane(state, &mut rows, pane, step + 4);
                 }
             }
         }
     }
 
     rows
+}
+
+/// A top-level pane's row, and its subagents' beneath it unless it is
+/// folded.
+///
+/// The subagents follow their parent whatever branch they are on: the tree
+/// is what the sidebar is, and grouping is for the panes at its top.
+fn push_pane<'a>(state: &'a AppState, rows: &mut Vec<Row<'a>>, pane: &Pane, indent: u16) {
+    rows.push(Row::Pane(pane.id, indent));
+
+    if state.is_pane_collapsed(pane.id) {
+        return;
+    }
+    for child in state.children_of(pane.id) {
+        rows.push(Row::Pane(child.id, indent + 2));
+    }
 }
 
 impl Widget for Sidebar<'_> {
@@ -344,6 +396,7 @@ impl Widget for Sidebar<'_> {
             match row {
                 Row::Device(id) => self.render_device(buf, area, y, id),
                 Row::Project(id, indent) => self.render_project(buf, area, y, id, indent, selected),
+                Row::Branch(_, branch, indent) => self.render_branch(buf, area, y, branch, indent),
                 Row::Pane(id, indent) => {
                     let pane = self
                         .state
@@ -390,6 +443,7 @@ pub fn hit_test(state: &AppState, area: Rect, x: u16, y: u16) -> Option<Hit> {
     match *rows(state).get(index)? {
         Row::Device(id) => Some(Hit::Device(id)),
         Row::Project(id, _) => Some(Hit::Project(id)),
+        Row::Branch(id, _, _) => Some(Hit::Project(id)),
         Row::Pane(id, indent) => {
             let pane = state.pane(id)?;
 
@@ -455,6 +509,21 @@ impl Sidebar<'_> {
         let name_x = x + NAME;
         let room = (area.x + area.width).saturating_sub(name_x) as usize;
         write(buf, area, name_x, y, &truncate(&project.name, room), style);
+    }
+
+    /// Draws a branch line, faded, where its project's name starts.
+    fn render_branch(&self, buf: &mut Buffer, area: Rect, y: u16, branch: &str, indent: u16) {
+        let x = area.x + indent + NAME;
+        let room = (area.x + area.width).saturating_sub(x) as usize;
+
+        write(
+            buf,
+            area,
+            x,
+            y,
+            &truncate(branch, room),
+            Style::default().fg(self.theme.faded),
+        );
     }
 
     /// Draws one machine's row.

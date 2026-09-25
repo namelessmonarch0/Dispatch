@@ -203,6 +203,9 @@ Only for a project whose `branch` is known. Beneath the project row:
 3. for each other branch, in the order its first pane was created: that
    branch in `faded`, then its top-level panes.
 
+Folding a project hides its panes and every other branch's line, but keeps
+its own branch line: that line is part of what the project is.
+
 A subagent is drawn under its parent whatever its own branch: the tree is
 the primary structure, and grouping applies to top-level panes. A project
 with no branch — a plain directory, or a daemon too old to report one —

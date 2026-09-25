@@ -970,3 +970,158 @@ fn the_git_mark_column_is_reserved_on_every_project_row() {
         column_of(&lines[TOP as usize + 1], "repo")
     );
 }
+
+/// A repository on `main`, selected, with nothing in it yet.
+fn repository() -> (AppState, ProjectId) {
+    let mut state = AppState::new();
+    let project = state.add_project(
+        Project::new("/tmp/repo", ProjectSource::GitRepo { remote: None })
+            .with_branch(Some("main".into())),
+    );
+    (state, project)
+}
+
+/// A pane of `harness` in `project`, on `branch`, titled `title`.
+fn pane_on(state: &mut AppState, project: ProjectId, title: &str, branch: Option<&str>) -> PaneId {
+    let pane = spawn(state, project, "claude");
+    state.set_pane_title(pane, title).expect("the pane exists");
+    state
+        .set_pane_branch(pane, branch.map(str::to_string))
+        .expect("the pane exists");
+    pane
+}
+
+#[test]
+fn a_projects_branch_is_drawn_faded_beneath_its_name() {
+    let (state, _) = repository();
+    let buf = render(&state, WIDTH, 6);
+
+    let line = row_text(&buf, TOP + 1);
+    assert_eq!(
+        column_of(&line, "main"),
+        usize::from(LEFT + NAME),
+        "{line:?}"
+    );
+    assert_eq!(
+        buf.cell((LEFT + NAME, TOP + 1)).expect("cell exists").fg,
+        Theme::fallback().faded
+    );
+}
+
+#[test]
+fn panes_on_the_projects_branch_or_none_sit_beneath_it() {
+    let (mut state, project) = repository();
+    pane_on(&mut state, project, "on-main", Some("main"));
+    pane_on(&mut state, project, "unknown", None);
+
+    let lines = render_lines(&state, WIDTH, 8);
+
+    assert!(lines[TOP as usize + 1].contains("main"), "{lines:#?}");
+    assert!(lines[TOP as usize + 2].contains("on-main"), "{lines:#?}");
+    assert!(lines[TOP as usize + 3].contains("unknown"), "{lines:#?}");
+}
+
+#[test]
+fn panes_on_another_branch_are_gathered_under_it() {
+    let (mut state, project) = repository();
+    pane_on(&mut state, project, "tabs-one", Some("feat/tabs"));
+    pane_on(&mut state, project, "on-main", Some("main"));
+    pane_on(&mut state, project, "tabs-two", Some("feat/tabs"));
+
+    let lines = render_lines(&state, WIDTH, 10);
+    let at = |text: &str| {
+        lines
+            .iter()
+            .position(|line| line.contains(text))
+            .unwrap_or_else(|| panic!("{text:?} is drawn: {lines:#?}"))
+    };
+
+    assert!(at("main") < at("on-main"));
+    assert!(at("on-main") < at("feat/tabs"), "{lines:#?}");
+    assert_eq!(at("tabs-one"), at("feat/tabs") + 1, "{lines:#?}");
+    assert_eq!(at("tabs-two"), at("feat/tabs") + 2, "{lines:#?}");
+    assert_eq!(
+        column_of(&lines[at("feat/tabs")], "feat/tabs"),
+        usize::from(LEFT + NAME),
+        "every branch line sits where the project's does"
+    );
+}
+
+#[test]
+fn a_subagent_stays_under_its_parent_whatever_its_branch() {
+    let (mut state, project) = repository();
+    let parent = pane_on(&mut state, project, "parent", Some("main"));
+    let mut child = Pane::new(project, HarnessId::new("claude"));
+    child.parent = Some(parent);
+    child.title = "child".into();
+    child.branch = Some("feat/elsewhere".into());
+    state.adopt_pane(child).expect("the project exists");
+
+    let lines = render_lines(&state, WIDTH, 8);
+    let parent_row = lines
+        .iter()
+        .position(|l| l.contains("parent"))
+        .expect("drawn");
+
+    assert!(lines[parent_row + 1].contains("child"), "{lines:#?}");
+    assert!(
+        !lines.iter().any(|line| line.contains("feat/elsewhere")),
+        "no group is opened for a subagent: {lines:#?}"
+    );
+}
+
+#[test]
+fn a_project_without_a_branch_draws_no_branch_row() {
+    let (mut state, alpha, _) = state();
+    spawn(&mut state, alpha, "claude");
+
+    let lines = render_lines(&state, WIDTH, 6);
+
+    assert!(lines[TOP as usize + 1].contains("claude"), "{lines:#?}");
+}
+
+#[test]
+fn a_folded_project_keeps_its_own_branch_and_hides_the_rest() {
+    let (mut state, project) = repository();
+    pane_on(&mut state, project, "on-main", Some("main"));
+    pane_on(&mut state, project, "tabs", Some("feat/tabs"));
+
+    state.toggle_project_collapsed(project);
+    let text = render_lines(&state, WIDTH, 8).join("\n");
+
+    assert!(text.contains("main"), "{text}");
+    assert!(
+        !text.contains("on-main") && !text.contains("feat/tabs"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_click_on_a_branch_row_is_a_click_on_its_project() {
+    let (state, project) = repository();
+    let area = Rect::new(0, 0, WIDTH, 6);
+
+    assert_eq!(
+        hit_test(&state, area, LEFT + NAME, TOP + 1),
+        Some(Hit::Project(project))
+    );
+}
+
+#[test]
+fn a_long_branch_name_is_cut_short_inside_the_frame() {
+    let mut state = AppState::new();
+    state.add_project(
+        Project::new("/tmp/repo", ProjectSource::GitRepo { remote: None }).with_branch(Some(
+            "feature/an-extremely-long-branch-name-for-testing".into(),
+        )),
+    );
+
+    let buf = render(&state, WIDTH, 5);
+    let line = row_text(&buf, TOP + 1);
+
+    assert!(
+        line.ends_with('│'),
+        "the frame is not overwritten: {line:?}"
+    );
+    assert!(line.contains('…'), "the cut is visible: {line:?}");
+}
