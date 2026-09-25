@@ -97,9 +97,13 @@ mod imp {
         Ok(polled > 0)
     }
 
-    /// Reads from the descriptor rather than through `Stdin`, whose buffer
-    /// would keep whatever it read past the answer from the event loop that
-    /// reads next.
+    /// Reads from the descriptor rather than through `Stdin`, so nothing is
+    /// left in `Stdin`'s buffer: the event loop that reads next reads the
+    /// descriptor itself, and would never see what was stranded there.
+    ///
+    /// That is all it protects. A key typed while the query is out arrives
+    /// on the same descriptor as the replies, is read as part of the answer,
+    /// and is dropped with it once the colours are taken out.
     fn read_stdin(chunk: &mut [u8]) -> std::io::Result<usize> {
         // SAFETY: the buffer is `chunk`, owned by the caller, and the length
         // passed is its own.

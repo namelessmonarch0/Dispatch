@@ -59,9 +59,9 @@ const LEFT: u16 = 1;
 /// Which column `text` starts in.
 ///
 /// Measured by the text itself rather than by counting leading spaces: a
-/// pane's focus marker and its twisty are both blanks when they have nothing
-/// to say, so leading-whitespace counting cannot tell "no marker" apart from
-/// "less indented".
+/// pane's twisty is a blank when it has nothing to fold, so
+/// leading-whitespace counting cannot tell "no twisty" apart from "less
+/// indented".
 fn column_of(line: &str, text: &str) -> usize {
     let byte = line
         .find(text)
@@ -879,9 +879,9 @@ fn fleet() -> (AppState, DeviceId, DeviceId) {
 }
 
 #[test]
-fn one_machine_draws_no_device_row() {
-    // The ordinary case. A lone row naming this machine costs a line and
-    // indents everything under it to say what the user already knows.
+fn one_machine_draws_no_name_line() {
+    // The ordinary case. A line naming this machine would cost a row to say
+    // what the user already knows.
     let mut state = AppState::new();
     let laptop = state.add_device(Device::new("laptop"));
     state.add_project(Project::new("/tmp/alpha", ProjectSource::LocalDir).with_device(laptop));
@@ -1037,20 +1037,20 @@ fn an_unreachable_device_says_so() {
 
     state.set_device_reachable(tower, false);
     let lines = render_lines(&state, WIDTH, 10);
-    let row = lines
+    let name = lines
         .iter()
         .find(|line| line.contains("tower"))
-        .expect("the machine has a row");
+        .expect("the machine has a name line");
 
-    assert!(row.contains("unreachable"), "{row:?}");
+    assert!(name.contains("unreachable"), "{name:?}");
 }
 
 #[test]
 fn an_unreachable_device_with_a_long_name_still_says_so() {
     // `dispatchd --device` now defaults to the real hostname, which routinely
     // runs long enough that truncating "name — unreachable" as one string
-    // keeps the name and cuts the word this row exists to show. The name has
-    // to give way instead.
+    // keeps the name and cuts the word this line exists to show. The name
+    // has to give way instead.
     let mut state = AppState::new();
     let long = state.add_device(Device::new(
         "Kudays-MacBook-Pro-With-A-Very-Long-Real-Hostname",
@@ -1061,12 +1061,12 @@ fn an_unreachable_device_with_a_long_name_still_says_so() {
 
     state.set_device_reachable(long, false);
     let lines = render_lines(&state, WIDTH, 10);
-    let row = lines
+    let name = lines
         .iter()
         .find(|line| line.contains("Kudays"))
-        .expect("the machine has a row");
+        .expect("the machine has a name line");
 
-    assert!(row.contains("unreachable"), "{row:?}");
+    assert!(name.contains("unreachable"), "{name:?}");
 }
 
 #[test]
@@ -1080,12 +1080,12 @@ fn a_pending_device_with_no_projects_still_gets_a_section() {
     state.add_device(Device::pending("tower"));
 
     let lines = render_lines(&state, WIDTH, 8);
-    let row = lines
+    let name = lines
         .iter()
         .find(|line| line.contains("tower"))
         .expect("the machine is named despite having no projects");
 
-    assert!(row.contains("unreachable"), "{row:?}");
+    assert!(name.contains("unreachable"), "{name:?}");
 }
 
 #[test]
@@ -1116,9 +1116,9 @@ fn a_reachable_machines_name_is_drawn_at_full_strength() {
 }
 
 #[test]
-fn the_git_mark_column_is_reserved_on_every_project_row() {
-    // Reserved rather than inserted, so a repository and a plain directory
-    // line their names up with each other.
+fn every_project_row_draws_its_mark_in_one_shared_column() {
+    // A repository's mark and a plain directory's take the same column, so
+    // their names line up with each other.
     let mut state = AppState::new();
     state.add_project(Project::new("/tmp/plain", ProjectSource::LocalDir));
     state.add_project(Project::new(

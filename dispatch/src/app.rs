@@ -544,8 +544,8 @@ impl App {
     /// Adds a daemon to the fleet, registering the machine it names itself as.
     ///
     /// The device is registered here, before the connection has said anything,
-    /// so every project this daemon announces has a machine's row to be drawn
-    /// under. A project stamped with a device the sidebar does not know is
+    /// so every project this daemon announces has a machine's section to be
+    /// drawn in. A project stamped with a device the sidebar does not know is
     /// drawn nowhere at all.
     pub fn attach(&mut self, client: Client) {
         let device = Device::new(client.device());
@@ -747,9 +747,9 @@ impl App {
     /// only ever proceeds project-then-machine and unfolding always drops
     /// both at once -- there is no third shape a press has to remember its
     /// way through. A remembered direction would be one more thing that has
-    /// to agree with what a click on the project or machine row just did
-    /// behind this key's back; reading the flags fresh each press means
-    /// there is nothing to fall out of sync.
+    /// to agree with what a click on the project row or the machine's name
+    /// line just did behind this key's back; reading the flags fresh each
+    /// press means there is nothing to fall out of sync.
     fn toggle_project_and_device_fold(&mut self, project: ProjectId) {
         let device = self
             .state
@@ -758,7 +758,7 @@ impl App {
             .find(|candidate| candidate.id == project)
             .map(|candidate| candidate.device);
 
-        // On one machine the sidebar draws no device row, so a folded device
+        // On one machine the sidebar draws no name line, so a folded device
         // is invisible: stepping that rung anyway would spend a press on
         // nothing, leaving the second press of `^a f` looking like a no-op
         // and a third one needed to unfold. Dropping the device out of the
@@ -875,7 +875,7 @@ impl App {
         };
 
         // Stamped with this machine, like any other project: the sidebar draws
-        // a project under its machine's row, so one naming a device that was
+        // a project in its machine's section, so one naming a device that was
         // never registered is drawn nowhere at all — open, invisible and
         // unreachable.
         //
@@ -3501,12 +3501,6 @@ mod tests {
         }
     }
 
-    /// The column a row's title starts in, for comparing one row's indentation
-    /// against another's.
-    ///
-    /// Counted in characters rather than bytes: the status dot and the focus
-    /// marker are three bytes each, so a byte offset would make a focused row
-    /// look indented further than an unfocused one at the same depth.
     /// Just the sidebar's columns of one rendered row.
     ///
     /// A pane's border carries its title, so a whole row can name a harness
@@ -3516,6 +3510,12 @@ mod tests {
         line.chars().take(sidebar::WIDTH as usize).collect()
     }
 
+    /// The column `needle` starts in, for comparing one row's indentation
+    /// against another's.
+    ///
+    /// Counted in characters rather than bytes: a twisty is three bytes and
+    /// a leaf's blank is one, so a byte offset would make a pane with
+    /// children look indented further than one without at the same depth.
     fn column_of(line: &str, needle: &str) -> usize {
         let byte = line
             .find(needle)
@@ -5897,7 +5897,7 @@ mod tests {
     #[test]
     fn a_project_from_a_daemon_lands_on_a_machine_the_sidebar_knows() {
         // The invariant the whole slice rests on: the sidebar groups projects
-        // under their machine's row, so a project stamped with a device that
+        // into their machine's section, so a project stamped with a device that
         // was never registered is drawn nowhere at all — open, invisible and
         // unreachable. `attach` registers the machine before its connection
         // can announce anything, which is what makes that impossible.
@@ -6100,7 +6100,7 @@ mod tests {
     fn attaching_takes_down_the_agents_this_process_started() {
         // `attach` is public and a standalone client can have been running
         // agents of its own for an hour before it ever reaches a daemon.
-        // Dropping that machine's rows while keeping its panes would leave a
+        // Dropping that machine's section while keeping its panes would leave a
         // real child process running with nothing on screen pointing at it,
         // nothing reading it and nobody left to stop it.
         let def = dispatch_config::HarnessDef {

@@ -521,6 +521,10 @@ fn section_heights(weights: &[u32], folded: &[bool], height: u16) -> Vec<u16> {
 /// Every row of one machine's projects, or of every project when `device` is
 /// `None`, top to bottom.
 ///
+/// `panes_for` is unfiltered, so a closed pane still appears here when it is
+/// kept as a tombstone for live children below it — the sidebar is where that
+/// row earns its keep.
+///
 /// One level of children, deliberately: at the default `max_depth` of 1 a
 /// subagent cannot delegate, so one level is the whole tree. Raise that cap
 /// and a subagent's own subagent is tracked in state — the daemon owns it,
