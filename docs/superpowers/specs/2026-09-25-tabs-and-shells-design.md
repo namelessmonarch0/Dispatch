@@ -23,8 +23,10 @@ variables, which Dispatch's own emulator does not match.
 
 ### Not in this slice
 
-- **Keybindings.** New commands get provisional `^a` keys; slice D reworks
-  the whole binding system.
+- **The rest of the keybinding system.** This slice adds the tab mode and
+  its direct `Alt` keys. Everything else stays on `^a` until slice D moves
+  panes, scrolling and sessions to the same model and makes keys
+  configurable.
 - **Splits.** A tab tiles its panes with the existing balanced grid
   (`dispatch-layout`). There are no user-drawn splits.
 - **Tabs that outlive the daemon.** Tabs live as long as the panes do.
@@ -47,6 +49,10 @@ variables, which Dispatch's own emulator does not match.
   until you rename the tab.
 - **Operations**: add, rename, move a pane between tabs, close a whole tab
   (after a y/n prompt), reorder tabs, and click the tab row.
+- **Keys follow zellij's model, not one prefix for everything**: `Ctrl t`
+  enters a tab mode, and a few `Alt` keys act directly. That is the user's
+  own zellij setup, and Dispatch will not run inside zellij, so nothing
+  outside Dispatch competes for these keys.
 - **Shells behave the way herdr's do**: `$SHELL`, started as a login shell
   on macOS and an interactive non-login shell elsewhere, with Dispatch's own
   `TERM` in every pane.
@@ -184,9 +190,10 @@ Row 0, right of the `D I S P A T C H` corner:
   or `›` switches to the previous or next tab. The row always scrolls to
   keep the current tab in view, so switching is what reveals the next tab
   rather than a separate scroll position the next frame would undo.
-- **Status row.** It keeps `tab 2/3  ^a 1-9` when there is more than one
-  tab: with no numbers in the row, it says what `^a` + a digit will pick.
-  Its key help gains `^a t tab`.
+- **Status row.** It keeps `tab 2/3` when there is more than one tab:
+  with no numbers in the row, it says what a digit will pick. Its key help
+  gains `Ctrl t tabs`. While tab mode is on, the whole row lists the mode's
+  keys instead (see Keys).
 
 **Which tab is shown** still follows the focus and is per client, as today.
 Choosing a tab (by click, digit or `Tab`) focuses the pane this client last
@@ -194,20 +201,62 @@ focused on it, or else its first member.
 
 ## Keys
 
-These are provisional, behind the existing `^a` prefix, until slice D:
+### Tab mode
+
+`Ctrl t` enters tab mode. The status row then reads
+`TAB  n new  r rename  x close  ←→ switch  [ ] move pane  i o move tab  1-9 go  Esc done`,
+and until the mode ends, keys go to Dispatch, not to the pane:
+
+| Key | Action | Mode afterwards |
+|---|---|---|
+| `n` | new tab: open the picker; the pane opens with `NewAfter(current)` | ends |
+| `r` | rename this tab: a one-line prompt holding the current name. Enter saves, empty means automatic, Esc cancels | ends |
+| `x` | close this tab. It asks first: `Close "fix login bug" and its 3 panes? y/n` | ends |
+| `←` `→`, `h` `l` | previous or next tab | stays, to step through tabs |
+| `[` `]` | move the focused pane to the previous or next tab; `]` on the last tab makes a new one | stays |
+| `i` `o` | move this tab left or right | stays |
+| `1`–`9` | go to that tab by position | ends |
+| `Tab` | the tab this client was on before | ends |
+| `Esc`, `Enter` | leave tab mode | ends |
+| `Ctrl t` | send `Ctrl t` itself to the focused pane, since Claude Code and fzf both use it | ends |
+
+Any other key is ignored and the mode stays on. A mouse click ends the mode,
+and then does what it would have done anyway.
+
+### Direct keys
+
+These work at any time, with no mode:
 
 | Key | Action |
 |---|---|
-| `t` | new tab: open the picker; the pane opens with `NewAfter(current)` |
-| `n` | new pane in this tab: open the picker; the pane opens with `Into(current)` (the key is unchanged) |
-| `,` | rename this tab: a one-line prompt holding the current name. Enter saves, empty means automatic, Esc cancels |
-| `<` / `>` | move the focused pane to the previous or next tab; `>` on the last tab makes a new one |
-| `{` / `}` | move this tab left or right |
-| `X` | close this tab. It asks first: `Close "fix login bug" and its 3 panes? y/n` |
-| `1`–`9`, `Tab` | pick a tab by position, or the next one (unchanged) |
+| `Alt n` | new pane in this tab: open the picker; the pane opens with `Into(current)` |
+| `Alt i` / `Alt o` | move this tab left or right |
+| `Alt ←` `Alt →`, `Alt h` `Alt l` | move focus left or right; at the grid's edge, go to the neighbouring tab as choosing it would (the pane last used there, else its first), and do nothing past the first or last tab |
+| `Alt ↑` `Alt ↓`, `Alt j` `Alt k` | move focus up or down |
 
-None of these keys is bound today. The prompt and the confirmation reuse
-the existing prompt widget (`dispatch-tui/src/prompt.rs`).
+### Unchanged
+
+`^a n` (new pane in this tab), `^a 1`–`9` and `^a Tab` keep working as
+today, and so do the other `^a` commands. Slice D decides what happens to
+them.
+
+### What it costs
+
+A key Dispatch takes never reaches the program in the pane. The shells'
+defaults lose `Alt h` (zsh `run-help`), `Alt l` (lowercase word), `Alt n`
+(history search) and `Alt ←`/`Alt →` (word motion in some setups); the
+user's zellij already takes them. `Ctrl t` is still reachable by pressing
+it twice. None of these needs the kitty keyboard protocol: `Ctrl t`
+arrives as 0x14, `Alt` + a letter arrives as `ESC` + the letter, and `Alt`
++ an arrow arrives as `CSI 1;3 D`-style, all of which crossterm already
+decodes.
+
+The router in `dispatch-tui/src/input.rs` gains the mode: today it knows
+"prefix armed" or not, and it adds "tab mode". `Action` gains the new tab
+commands.
+
+The prompt and the confirmation reuse the existing prompt widget
+(`dispatch-tui/src/prompt.rs`).
 
 ## Motion
 
@@ -307,8 +356,9 @@ elsewhere:
 - `dispatch-os/src/shell.rs`: shell resolution and the login rule.
 - `dispatch-config`: `ShellConfig` and the built-in `shell` harness.
 - `dispatch-pty/src/session.rs`: the pane environment.
+- `dispatch-tui/src/input.rs`: tab mode and the direct `Alt` keys.
 - `dispatch/src/tabs.rs`: drawing the tab row, hit-testing it, and turning
-  keys and clicks into tab commands.
+  its clicks into tab commands.
 
 `app.rs` then only wires these in: `tab_count`, `current_tab`,
 `panes_on_tab` and `select_tab` read `ProjectTabs` instead of chunking,
@@ -320,7 +370,7 @@ with the chunking kept only for the old-daemon fallback.
 |---|---|
 | The shell command is missing or not executable | The spawn fails like any harness's: `failed to start shell: …` in the status row |
 | `-l` given to a shell that rejects it | The pane exits at once with the shell's own error; `login = "never"` fixes it |
-| `<` on the first tab | Refused: `no tab to the left` |
+| `[` in tab mode on the first tab | Refused: `no tab to the left` |
 | Moving a pane into a full tab | Refused in the client, with `that tab is full (4 panes)`; the daemon refuses too, so two clients racing for the last slot cannot both win |
 | A tab command on a project whose daemon is older | `this machine's Dispatch needs upgrading for tabs`; nothing is sent |
 | An operation names a tab or pane another client just removed | The daemon replies with an error; the client shows it once and carries on |
@@ -350,7 +400,11 @@ with the chunking kept only for the old-daemon fallback.
 - **Client (`dispatch`).**
   - Labels show names with no numbers.
   - Clicking `+`, a tab, `‹` and `›`.
-  - Every new key.
+  - Tab mode: each key's action, which keys keep the mode on and which
+    end it, other keys ignored, `Ctrl t` twice sending `Ctrl t` to the
+    pane, a click ending the mode, and the status row listing the keys.
+  - The direct `Alt` keys, including focus crossing to the neighbouring
+    tab at the grid's edge and stopping at the first and last tab.
   - The rename prompt (save, clear, cancel) and the close confirmation
     (y, n).
   - Scrolling on overflow keeps the current tab visible.
@@ -372,7 +426,7 @@ The README gains:
 
 - tabs: adding, naming, moving, closing and reordering them, and the
   cap of four;
-- the new keys;
+- tab mode and the direct `Alt` keys, and how to send `Ctrl t` to a pane;
 - shell panes and the `[shell]` section;
 - the pane environment.
 
