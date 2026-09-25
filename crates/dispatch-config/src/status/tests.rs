@@ -256,6 +256,238 @@ fn an_unknown_harness_with_no_section_has_no_rules() {
     assert!(StatusRules::for_harness("never-heard-of-it", None).is_empty());
 }
 
+fn builtin(id: &str) -> StatusRules {
+    let rules = StatusRules::for_harness(id, None);
+    assert!(!rules.is_empty(), "{id} has built-in rules");
+    rules
+}
+
+fn verdict(rules: &StatusRules, title: &str, progress: &str, screen: &[&str]) -> Option<RuleState> {
+    let screen = lines(screen);
+    rules.evaluate(&StatusInput {
+        title,
+        progress,
+        screen: &screen,
+    })
+}
+
+#[test]
+fn claude_is_working_while_its_title_spins() {
+    let claude = builtin("claude");
+
+    assert_eq!(
+        verdict(&claude, "\u{2802} Refactor the sidebar", "", &["> "]),
+        Some(RuleState::Working)
+    );
+    assert_eq!(
+        verdict(&claude, "\u{25d0} Refactor the sidebar", "", &["> "]),
+        Some(RuleState::Working),
+        "the newer half-circle spinner too"
+    );
+}
+
+#[test]
+fn claude_is_working_while_its_turn_footer_shows() {
+    assert_eq!(
+        verdict(
+            &builtin("claude"),
+            "",
+            "",
+            &[
+                "✻ Thinking… (12s · ↑ 1.2k tokens)",
+                "",
+                "⏵⏵ accept edits on · esc to interrupt"
+            ]
+        ),
+        Some(RuleState::Working)
+    );
+}
+
+#[test]
+fn claude_is_blocked_on_a_permission_prompt() {
+    assert_eq!(
+        verdict(
+            &builtin("claude"),
+            "\u{2733} Claude Code",
+            "",
+            &[
+                "Bash command",
+                "  rm -rf target",
+                "Do you want to proceed?",
+                "❯ 1. Yes",
+                "  2. No, and tell Claude what to do differently (esc)",
+            ]
+        ),
+        Some(RuleState::Blocked)
+    );
+}
+
+#[test]
+fn claude_is_blocked_on_a_choice_form() {
+    assert_eq!(
+        verdict(
+            &builtin("claude"),
+            "",
+            "",
+            &[
+                "Which approach?",
+                "❯ 1. Fast",
+                "  2. Thorough",
+                "Enter to select · ↑/↓ to navigate · Esc to cancel"
+            ]
+        ),
+        Some(RuleState::Blocked)
+    );
+}
+
+#[test]
+fn claude_is_idle_at_rest() {
+    let claude = builtin("claude");
+
+    assert_eq!(
+        verdict(
+            &claude,
+            "\u{2733} Claude Code",
+            "",
+            &["╭────╮", "│ >  │", "╰────╯"]
+        ),
+        Some(RuleState::Idle)
+    );
+    assert_eq!(verdict(&claude, "", "4;0", &[">"]), Some(RuleState::Idle));
+}
+
+#[test]
+fn codex_reads_its_title() {
+    let codex = builtin("codex");
+
+    assert_eq!(
+        verdict(&codex, "\u{280b} dispatch", "", &[]),
+        Some(RuleState::Working)
+    );
+    assert_eq!(
+        verdict(&codex, "Action Required", "", &[]),
+        Some(RuleState::Blocked)
+    );
+}
+
+#[test]
+fn codex_is_blocked_on_its_prompts() {
+    let codex = builtin("codex");
+
+    assert_eq!(
+        verdict(&codex, "", "", &["Run `cargo test`? [y/n]"]),
+        Some(RuleState::Blocked)
+    );
+    assert_eq!(
+        verdict(
+            &codex,
+            "",
+            "",
+            &[
+                "Allow command?",
+                "  cargo build",
+                "Press enter to confirm or esc to cancel"
+            ]
+        ),
+        Some(RuleState::Blocked)
+    );
+    assert_eq!(
+        verdict(
+            &codex,
+            "",
+            "",
+            &[
+                "> You are in /home/me/app",
+                "Do you trust the contents of this directory?"
+            ]
+        ),
+        Some(RuleState::Blocked)
+    );
+}
+
+#[test]
+fn codex_is_working_while_its_timer_runs() {
+    assert_eq!(
+        verdict(
+            &builtin("codex"),
+            "",
+            "",
+            &["• Working (12s • esc to interrupt)"]
+        ),
+        Some(RuleState::Working)
+    );
+}
+
+#[test]
+fn opencode_reads_its_screen() {
+    let opencode = builtin("opencode");
+
+    assert_eq!(
+        verdict(
+            &opencode,
+            "",
+            "",
+            &["△ Permission required", "  edit src/main.rs"]
+        ),
+        Some(RuleState::Blocked)
+    );
+    assert_eq!(
+        verdict(&opencode, "", "", &["Building… esc to interrupt"]),
+        Some(RuleState::Working)
+    );
+    assert_eq!(
+        verdict(&opencode, "", "", &["■■■■⬝⬝⬝⬝"]),
+        Some(RuleState::Working)
+    );
+}
+
+#[test]
+fn agy_reads_its_screen() {
+    let agy = builtin("agy");
+
+    assert_eq!(
+        verdict(
+            &agy,
+            "",
+            "",
+            &[
+                "Agent is requesting permission for:",
+                "  npm install",
+                "Do you want to proceed?"
+            ]
+        ),
+        Some(RuleState::Blocked)
+    );
+    assert_eq!(
+        verdict(&agy, "", "", &["⠙ Searching the codebase"]),
+        Some(RuleState::Working)
+    );
+}
+
+#[test]
+fn a_harness_files_own_section_replaces_the_built_ins() {
+    let own: StatusDef = toml::from_str(
+        r#"
+        [[rules]]
+        state = "working"
+        region = "screen"
+        contains = ["my marker"]
+        "#,
+    )
+    .expect("the section parses");
+    let rules = StatusRules::for_harness("claude", Some(&own));
+
+    assert_eq!(
+        verdict(&rules, "\u{2733} Claude Code", "", &[]),
+        None,
+        "the built-in idle rule is gone"
+    );
+    assert_eq!(
+        verdict(&rules, "", "", &["my marker"]),
+        Some(RuleState::Working)
+    );
+}
+
 #[test]
 fn the_registry_hands_out_each_harnesss_rules() {
     let def: crate::HarnessDef = toml::from_str(
