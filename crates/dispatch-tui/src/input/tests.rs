@@ -356,6 +356,20 @@ fn any_other_key_in_tab_mode_is_ignored_and_the_mode_stays() {
 }
 
 #[test]
+fn a_paste_in_tab_mode_ends_it_and_goes_to_the_pane() {
+    // A paste is text for the pane; left in tab mode, the user's next key
+    // would be read as a tab command they never meant.
+    let mut router = router();
+    router.handle(&ctrl_t(), &[]);
+
+    assert_eq!(
+        router.handle(&Event::Paste("hi".into()), &[]),
+        Action::Paste("hi".into())
+    );
+    assert_eq!(router.key_mode(), KeyMode::Normal);
+}
+
+#[test]
 fn ctrl_t_twice_sends_ctrl_t_to_the_pane() {
     // Claude Code's task list and a shell's fzf both use it.
     let mut router = router();

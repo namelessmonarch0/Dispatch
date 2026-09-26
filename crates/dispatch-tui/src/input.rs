@@ -210,7 +210,12 @@ impl InputRouter {
                 }
                 self.handle_mouse(mouse, panes)
             }
-            Event::Paste(text) => Action::Paste(text.clone()),
+            Event::Paste(text) => {
+                // Text for the pane, not a tab command. The mode ends too,
+                // or the next key would be read as one the user never meant.
+                self.leave_mode();
+                Action::Paste(text.clone())
+            }
             _ => Action::None,
         }
     }
