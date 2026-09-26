@@ -1,6 +1,6 @@
 # C — Tabs you own, and shell panes
 
-Status: approved design, not yet implemented.
+Status: implemented on branch `ui/tabs-shells`.
 Date: 2026-09-25.
 Third of four UI slices: A visual refresh (merged), B live status and motion
 (merged), C this, D keybindings.
@@ -113,7 +113,11 @@ The rules:
    that tab. Moving past the last tab creates a new tab at the end. Moving
    into a full tab is refused (`TabError::Full`). The first tab has no
    previous tab, so moving left from it is refused too
-   (`TabError::NoSuchTab`).
+   (`TabError::NoSuchTab`). A pane alone on its tab that is asked to move
+   past the last tab, and is already on the last tab, stays where it is
+   rather than trading one tab of its own for another; asked to go after a
+   different tab, or asked to go past the last tab while it is not already
+   there, it moves.
 6. **Closing a tab** closes every running member. The tab then leaves by
    rule 3.
 7. **Reordering** moves a tab to an index, clamped to the row.
@@ -174,7 +178,9 @@ read only that, so they cannot tell the two cases apart.
   connection does not have tabs. For that machine's projects the client
   keeps today's derived four-per-tab chunking. A tab command there puts
   "this machine's Dispatch needs upgrading for tabs" in the status row and
-  sends nothing.
+  sends nothing — including a new-tab command, which checks this directly
+  rather than through the tab on screen, since a project with no tabs kept
+  has none to check there.
 - **An old client with a new daemon.** It decodes `Tabs` as `Unknown` and
   ignores it, and keeps chunking. `SpawnPane` without `place` means `Auto`.
 
@@ -190,8 +196,10 @@ Row 0, right of the `D I S P A T C H` corner:
   sliding tint.
 - **`+`.** A faded ` + ` follows the last tab.
 - **Overflow.** When the labels do not fit, the row scrolls so the current
-  tab is fully visible. `‹` or `›` marks a clipped end, and `+` stays pinned
-  at the right edge.
+  tab is fully visible. `‹` or `›` marks a clipped end. On a narrow row the
+  `+` is pinned to the right edge rather than following the last label, and
+  the tabs and marks draw only up to it, so it can never be overwritten; a
+  row too narrow even for ` + ` draws no `+` at all.
 - **Clicks.** A click on a tab focuses it, as selecting it does. A click on
   `+` opens the picker for a new tab after the current one. A click on `‹`
   or `›` switches to the previous or next tab. The row always scrolls to
@@ -424,8 +432,11 @@ with the chunking kept only for the old-daemon fallback.
   - `[shell]` parsing and unknown keys.
   - A Unix pty test runs `env` and checks that `TERM` and `COLORTERM` are
     set, the identity variables are gone, and a harness's own `env` wins.
-- **End to end.** Standalone Dispatch opens a shell pane with
-  `[shell] command = "/bin/sh"`, types `echo hi`, and sees `hi` drawn.
+- **End to end.** Standalone Dispatch opens a shell pane, types a command,
+  and sees its output drawn. The picker's shared helper picks the
+  `aaashell` test harness rather than the built-in `Shell`, because the
+  built-in `Shell` has no `[task]` form and the same file's delegation
+  tests need one that does.
 
 ## Documentation
 
