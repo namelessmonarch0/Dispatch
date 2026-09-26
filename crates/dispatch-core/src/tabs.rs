@@ -210,8 +210,18 @@ impl ProjectTabs {
             Placement::NewAfter { tab: Some(tab) } if self.position(tab).is_none() => {
                 return Err(TabError::NoSuchTab);
             }
-            // Alone on its tab already: a new tab of its own is the one it has.
-            Placement::NewAfter { .. } if alone => return Ok(from),
+            // Alone on its tab already, asked to go where it already is: a new tab
+            // of its own is the one it has.
+            Placement::NewAfter { tab }
+                if alone
+                    && (tab == Some(from)
+                        || (tab.is_none()
+                            && self
+                                .position(from)
+                                .is_some_and(|pos| pos == self.tabs.len() - 1))) =>
+            {
+                return Ok(from);
+            }
             Placement::NewAfter { tab } => Slot::New(tab),
             Placement::Auto | Placement::Unknown => match self.auto() {
                 Slot::Existing(tab) if tab == from => return Ok(from),

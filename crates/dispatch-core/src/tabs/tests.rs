@@ -338,3 +338,32 @@ fn a_tab_that_is_gone_has_no_room() {
 fn the_default_placement_is_auto() {
     assert_eq!(Placement::default(), Placement::Auto);
 }
+
+#[test]
+fn a_pane_alone_on_its_tab_moves_after_another_tab_when_asked() {
+    let ids = panes(3);
+    let mut tabs = tabs_of(&[&ids[..1], &ids[1..2], &ids[2..]]);
+    let third = tabs.tabs()[2].id;
+
+    tabs.move_pane(ids[0], Placement::NewAfter { tab: Some(third) })
+        .expect("the move is allowed");
+
+    assert_eq!(
+        layout(&tabs),
+        vec![vec![ids[1]], vec![ids[2]], vec![ids[0]]]
+    );
+}
+
+#[test]
+fn a_pane_alone_on_a_middle_tab_moves_to_the_end_when_asked() {
+    let ids = panes(3);
+    let mut tabs = tabs_of(&[&ids[..1], &ids[1..2], &ids[2..]]);
+
+    tabs.move_pane(ids[1], Placement::NewAfter { tab: None })
+        .expect("the move is allowed");
+
+    assert_eq!(
+        layout(&tabs),
+        vec![vec![ids[0]], vec![ids[2]], vec![ids[1]]]
+    );
+}
