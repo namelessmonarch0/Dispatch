@@ -11,6 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
+use dispatch_core::Placement;
 use dispatch_os::ipc::Connection;
 use dispatch_proto::{ClientMessage, Frame, ServerMessage};
 
@@ -488,6 +489,7 @@ fn a_second_connection_is_replayed_what_a_pane_printed() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     )
     .expect("writing succeeds");
@@ -580,6 +582,7 @@ fn a_client_drives_a_pane_through_the_socket() {
             project: project.id,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     )
     .expect("writing succeeds");
@@ -655,6 +658,7 @@ fn a_delegate_caller_and_an_interface_client_share_one_daemon() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     )
     .expect("writing succeeds");

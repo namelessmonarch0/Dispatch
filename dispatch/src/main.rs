@@ -6,6 +6,7 @@ mod approval;
 mod backend;
 mod delegate;
 mod machine;
+mod tabs;
 mod terminal;
 
 use std::path::PathBuf;
@@ -168,6 +169,10 @@ fn main() -> Result<ExitCode> {
     if !loaded.unknown.is_empty() {
         tracing::warn!(keys = ?loaded.unknown, path = %config_path.display(), "ignoring unknown configuration keys");
     }
+
+    // The `shell` harness runs whatever this machine and `[shell]` resolve to,
+    // built in rather than written to the harnesses directory.
+    let harnesses = harnesses.with_shell(&loaded.config.shell);
 
     // Read before deciding how to run: any registered machine means the
     // agents belong to daemons, this machine's included.

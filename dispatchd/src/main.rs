@@ -105,6 +105,10 @@ fn main() -> Result<()> {
         "delegation limits"
     );
 
+    // The `shell` harness runs whatever this machine and `[shell]` resolve to,
+    // built in rather than written to the harnesses directory.
+    let harnesses = harnesses.with_shell(&loaded.config.shell);
+
     let mut daemon = Daemon::with_limits(harnesses, args.device.clone(), loaded.config.delegation);
 
     let projects = if args.projects.is_empty() {

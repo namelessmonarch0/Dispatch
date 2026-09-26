@@ -394,3 +394,70 @@ fn a_finished_pty_is_one_whose_output_is_complete() {
         String::from_utf8_lossy(&output)
     );
 }
+
+#[test]
+fn a_pane_is_told_about_dispatchs_terminal_not_the_one_outside() {
+    // Dispatch draws the pane with its own emulator. A program told it is in
+    // kitty would send kitty's private sequences through, and over SSH a
+    // remote side without that terminfo mis-draws.
+    let mut command = CommandBuilder::new("true");
+    command.env("TERM", "xterm-kitty");
+    command.env("KITTY_WINDOW_ID", "7");
+    command.env("GHOSTTY_RESOURCES_DIR", "/usr/share/ghostty");
+    // A multiplexer outside counts too: a program that sees `TMUX` wraps its
+    // sequences for a tmux that is not the one drawing it.
+    command.env("TMUX", "/tmp/tmux-1000/default,1234,0");
+
+    apply_pane_env(&mut command);
+
+    assert_eq!(
+        command.get_env("TERM"),
+        Some(std::ffi::OsStr::new("xterm-256color"))
+    );
+    assert_eq!(
+        command.get_env("COLORTERM"),
+        Some(std::ffi::OsStr::new("truecolor"))
+    );
+    assert_eq!(
+        command.get_env("TERM_PROGRAM"),
+        Some(std::ffi::OsStr::new("dispatch"))
+    );
+    assert_eq!(
+        command.get_env("TERM_PROGRAM_VERSION"),
+        Some(std::ffi::OsStr::new(env!("CARGO_PKG_VERSION")))
+    );
+    assert_eq!(command.get_env("KITTY_WINDOW_ID"), None);
+    assert_eq!(command.get_env("GHOSTTY_RESOURCES_DIR"), None);
+    assert_eq!(command.get_env("TMUX"), None);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_child_sees_dispatchs_terminal() {
+    let mut session = PtySession::spawn(
+        &shell("echo T=$TERM C=$COLORTERM P=$TERM_PROGRAM"),
+        &cwd(),
+        Size::new(80, 24),
+    )
+    .expect("the shell starts");
+
+    assert!(wait_until(&mut session, TIMEOUT, |session| {
+        visible(session)
+            .iter()
+            .any(|line| line.contains("T=xterm-256color C=truecolor P=dispatch"))
+    }));
+}
+
+#[test]
+#[cfg(unix)]
+fn a_harnesss_own_environment_still_wins() {
+    let mut launch = shell("echo T=$TERM");
+    launch.env.insert("TERM".into(), "vt100".into());
+
+    let mut session =
+        PtySession::spawn(&launch, &cwd(), Size::new(80, 24)).expect("the shell starts");
+
+    assert!(wait_until(&mut session, TIMEOUT, |session| {
+        visible(session).iter().any(|line| line.contains("T=vt100"))
+    }));
+}

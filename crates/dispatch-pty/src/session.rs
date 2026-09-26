@@ -93,6 +93,64 @@ impl std::fmt::Debug for Pty {
     }
 }
 
+/// What every pane is told about the terminal it is in.
+///
+/// Dispatch draws each pane with its own emulator, not the terminal it was
+/// started from, so a program has to be told about this one: xterm's
+/// terminfo, which every machine a pane might SSH to has, and 24-bit colour,
+/// which the emulator draws.
+const PANE_TERMINAL: [(&str, &str); 3] = [
+    ("TERM", "xterm-256color"),
+    ("COLORTERM", "truecolor"),
+    ("TERM_PROGRAM", "dispatch"),
+];
+
+/// Variables naming the terminal Dispatch was started from, and any
+/// multiplexer it was started inside.
+///
+/// Left in, they send a program's kitty- or iTerm-only tricks through an
+/// emulator that is neither, or wrap its sequences for a tmux, screen or
+/// zellij that is not the one drawing it.
+const HOST_TERMINAL: [&str; 26] = [
+    "TERM_SESSION_ID",
+    "ITERM_SESSION_ID",
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
+    "KITTY_LISTEN_ON",
+    "WEZTERM_PANE",
+    "WEZTERM_UNIX_SOCKET",
+    "ALACRITTY_WINDOW_ID",
+    "ALACRITTY_SOCKET",
+    "WT_SESSION",
+    "WT_PROFILE_ID",
+    "VTE_VERSION",
+    "KONSOLE_VERSION",
+    "KONSOLE_DBUS_SESSION",
+    "GHOSTTY_RESOURCES_DIR",
+    "GHOSTTY_BIN_DIR",
+    "TMUX",
+    "TMUX_PANE",
+    "STY",
+    "ZELLIJ",
+    "ZELLIJ_SESSION_NAME",
+    "ZELLIJ_PANE_ID",
+    "KITTY_INSTALLATION_DIR",
+    "WEZTERM_EXECUTABLE",
+];
+
+/// Tells `command` it runs in Dispatch's terminal, not the one outside.
+fn apply_pane_env(command: &mut CommandBuilder) {
+    for key in HOST_TERMINAL {
+        command.env_remove(key);
+    }
+    for (key, value) in PANE_TERMINAL {
+        command.env(key, value);
+    }
+    command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+}
+
 impl Pty {
     /// Starts `launch` in a new pseudoterminal rooted at `cwd`.
     pub fn spawn(launch: &Launch, cwd: &Path, size: Size) -> Result<Self, PtyError> {
@@ -115,6 +173,7 @@ impl Pty {
         let mut command = CommandBuilder::new(&launch.command);
         command.args(&launch.args);
         command.cwd(cwd);
+        apply_pane_env(&mut command);
         for (key, value) in &launch.env {
             command.env(key, value);
         }

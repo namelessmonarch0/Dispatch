@@ -30,6 +30,17 @@ pub enum Direction {
     Right,
 }
 
+/// Which keys the router is reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyMode {
+    /// Keys go to the focused pane. The prefix and a few `Alt` keys reach
+    /// Dispatch.
+    #[default]
+    Normal,
+    /// Keys are tab commands, until one of them ends the mode.
+    Tabs,
+}
+
 /// What an input event should cause.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -64,6 +75,27 @@ pub enum Action {
     SelectTab(usize),
     /// Move to the next tab, wrapping.
     NextTab,
+    /// Show the tab to the left, wrapping to the last.
+    PreviousTab,
+    /// Show the tab this client was on before this one.
+    LastTab,
+    /// Open the picker for a pane on a new tab, straight after this one.
+    NewTab,
+    /// Rename the tab on screen.
+    RenameTab,
+    /// Close every pane on the tab on screen, once the user says yes.
+    CloseTab,
+    /// Move the focused pane to the previous tab.
+    MovePaneLeft,
+    /// Move the focused pane to the next tab, or a new one past the last.
+    MovePaneRight,
+    /// Move the tab on screen one place left.
+    MoveTabLeft,
+    /// Move the tab on screen one place right.
+    MoveTabRight,
+    /// Move focus left or right, going on to the neighbouring tab at the
+    /// grid's edge.
+    FocusOrTab(Direction),
     /// Enter scrollback mode.
     Scrollback,
     /// Reopen the approval prompt for whatever delegation requests are queued.
@@ -123,6 +155,8 @@ pub struct InputRouter {
     prefix: Prefix,
     /// Whether the prefix was the previous key, so this one is a command.
     armed: bool,
+    /// Which keys it is reading.
+    mode: KeyMode,
 }
 
 impl InputRouter {
@@ -138,6 +172,7 @@ impl InputRouter {
         Self {
             prefix,
             armed: false,
+            mode: KeyMode::Normal,
         }
     }
 
@@ -150,6 +185,17 @@ impl InputRouter {
         self.armed
     }
 
+    /// Which keys the router is reading, for the status row to say.
+    #[must_use]
+    pub fn key_mode(&self) -> KeyMode {
+        self.mode
+    }
+
+    /// Leaves tab mode, for a click the router itself never sees.
+    pub fn leave_mode(&mut self) {
+        self.mode = KeyMode::Normal;
+    }
+
     /// Decides what an event means.
     ///
     /// `panes` gives the on-screen rectangle of each pane, used to resolve
@@ -157,8 +203,19 @@ impl InputRouter {
     pub fn handle(&mut self, event: &Event, panes: &[(PaneId, Rect)]) -> Action {
         match event {
             Event::Key(key) => self.handle_key(key),
-            Event::Mouse(mouse) => self.handle_mouse(mouse, panes),
-            Event::Paste(text) => Action::Paste(text.clone()),
+            Event::Mouse(mouse) => {
+                // A click ends tab mode, then does what it would have anyway.
+                if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                    self.leave_mode();
+                }
+                self.handle_mouse(mouse, panes)
+            }
+            Event::Paste(text) => {
+                // Text for the pane, not a tab command. The mode ends too,
+                // or the next key would be read as one the user never meant.
+                self.leave_mode();
+                Action::Paste(text.clone())
+            }
             _ => Action::None,
         }
     }
@@ -168,6 +225,10 @@ impl InputRouter {
         // should act, or every keystroke would fire twice.
         if event.kind != KeyEventKind::Press {
             return Action::None;
+        }
+
+        if self.mode == KeyMode::Tabs {
+            return self.tab_key(event);
         }
 
         if self.armed {
@@ -190,10 +251,64 @@ impl InputRouter {
             return Action::None;
         }
 
+        if is_tab_mode_key(event) {
+            self.mode = KeyMode::Tabs;
+            return Action::None;
+        }
+
+        if let Some(action) = direct(event) {
+            return action;
+        }
+
         match translate(event) {
             Some((key, mods)) => Action::SendKey(key, mods),
             None => Action::None,
         }
+    }
+
+    /// What a key means in tab mode, and whether the mode stays on after it.
+    ///
+    /// Stepping keys keep it on, so a tab or a pane can be walked several
+    /// places along; keys that open something or jump somewhere end it.
+    fn tab_key(&mut self, event: &KeyEvent) -> Action {
+        // Twice sends it through, the way the prefix does: Claude Code and a
+        // shell's fzf both use Ctrl t, and this is how they still get it.
+        if is_tab_mode_key(event) {
+            self.mode = KeyMode::Normal;
+            return Action::SendKey(Key::Char('t'), modifiers_of(KeyModifiers::CONTROL));
+        }
+
+        // Shift is allowed through: some terminals report it for `[` and `]`.
+        if !(event.modifiers - KeyModifiers::SHIFT).is_empty() {
+            return Action::None;
+        }
+
+        let (action, stays) = match event.code {
+            KeyCode::Char('n') => (Action::NewTab, false),
+            KeyCode::Char('r') => (Action::RenameTab, false),
+            KeyCode::Char('x') => (Action::CloseTab, false),
+            KeyCode::Left | KeyCode::Char('h') => (Action::PreviousTab, true),
+            KeyCode::Right | KeyCode::Char('l') => (Action::NextTab, true),
+            KeyCode::Char('[') => (Action::MovePaneLeft, true),
+            KeyCode::Char(']') => (Action::MovePaneRight, true),
+            KeyCode::Char('i') => (Action::MoveTabLeft, true),
+            KeyCode::Char('o') => (Action::MoveTabRight, true),
+            KeyCode::Char(digit @ '1'..='9') => (
+                Action::SelectTab(digit.to_digit(10).unwrap_or(1) as usize - 1),
+                false,
+            ),
+            KeyCode::Tab => (Action::LastTab, false),
+            KeyCode::Esc | KeyCode::Enter => (Action::None, false),
+            // Anything else is ignored and the mode stays on: a stray key must
+            // neither reach a pane nor drop the user out of what they were
+            // doing.
+            _ => return Action::None,
+        };
+
+        if !stays {
+            self.mode = KeyMode::Normal;
+        }
+        action
     }
 
     fn handle_mouse(&mut self, event: &MouseEvent, panes: &[(PaneId, Rect)]) -> Action {
@@ -283,6 +398,30 @@ fn command_for(event: &KeyEvent) -> Action {
         // the pane, so a mistyped command cannot run something in an agent.
         _ => Action::None,
     }
+}
+
+/// `Ctrl t`, the key that enters tab mode, as it does in zellij.
+fn is_tab_mode_key(event: &KeyEvent) -> bool {
+    event.code == KeyCode::Char('t') && event.modifiers == KeyModifiers::CONTROL
+}
+
+/// The keys that reach Dispatch with no mode and no prefix, as zellij's `Alt`
+/// keys do. `Alt` with anything else held still goes to the pane.
+fn direct(event: &KeyEvent) -> Option<Action> {
+    if event.modifiers != KeyModifiers::ALT {
+        return None;
+    }
+
+    Some(match event.code {
+        KeyCode::Char('n') => Action::NewPane,
+        KeyCode::Char('i') => Action::MoveTabLeft,
+        KeyCode::Char('o') => Action::MoveTabRight,
+        KeyCode::Left | KeyCode::Char('h') => Action::FocusOrTab(Direction::Left),
+        KeyCode::Right | KeyCode::Char('l') => Action::FocusOrTab(Direction::Right),
+        KeyCode::Up | KeyCode::Char('k') => Action::FocusDirection(Direction::Up),
+        KeyCode::Down | KeyCode::Char('j') => Action::FocusDirection(Direction::Down),
+        _ => return None,
+    })
 }
 
 /// Converts a crossterm button into the encoder's.

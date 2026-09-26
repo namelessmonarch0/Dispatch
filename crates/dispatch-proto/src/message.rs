@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use dispatch_core::{PaneId, PaneStatus, Project, ProjectId, RequestId};
+use dispatch_core::{PaneId, PaneStatus, Placement, Project, ProjectId, RequestId, Tab, TabId};
 use serde::{Deserialize, Serialize};
 
 /// A protocol version.
@@ -176,6 +176,10 @@ pub enum ClientMessage {
         harness: String,
         /// Initial size in cells.
         size: (u16, u16),
+        /// Which tab it goes on. An older client says nothing, which is
+        /// [`Placement::Auto`].
+        #[serde(default)]
+        place: Placement,
     },
 
     /// Sends already-encoded bytes to a pane.
@@ -236,6 +240,36 @@ pub enum ClientMessage {
         /// as long as this daemon runs.
         #[serde(default)]
         blanket: bool,
+    },
+
+    /// Moves a top-level pane to another tab, or onto a new one.
+    MovePane {
+        /// Which pane.
+        pane: PaneId,
+        /// Where it goes.
+        to: Placement,
+    },
+
+    /// Names a tab. A name with nothing in it goes back to the automatic one.
+    RenameTab {
+        /// Which tab.
+        tab: TabId,
+        /// The name, as typed.
+        name: String,
+    },
+
+    /// Closes every pane on a tab. The tab goes with its last pane.
+    CloseTab {
+        /// Which tab.
+        tab: TabId,
+    },
+
+    /// Moves a tab to another place in its project's row.
+    MoveTab {
+        /// Which tab.
+        tab: TabId,
+        /// Where it goes, counted from the left; past the end means the end.
+        index: usize,
     },
 
     /// A message this build does not know.
@@ -418,6 +452,18 @@ pub enum ServerMessage {
         /// The tail of what it printed, for the caller to hand to its agent.
         #[serde(with = "serde_bytes_compat")]
         tail: Vec<u8>,
+    },
+
+    /// What a project's tabs are now.
+    ///
+    /// The whole project's, after any change to them and to every subscriber,
+    /// so a client never has to reconcile a sequence of edits: whatever it
+    /// held before, this is the truth. Sent after the panes it names.
+    Tabs {
+        /// Whose tabs.
+        project: ProjectId,
+        /// Every tab, in row order.
+        tabs: Vec<Tab>,
     },
 
     /// A message this build does not know.

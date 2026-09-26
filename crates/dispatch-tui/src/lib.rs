@@ -10,7 +10,7 @@ pub mod prompt;
 pub mod sidebar;
 pub mod theme;
 
-pub use input::{Action, Direction, InputRouter, Prefix};
+pub use input::{Action, Direction, InputRouter, KeyMode, Prefix};
 pub use pane::PaneWidget;
 pub use picker::{Item, Picker};
 pub use prompt::{Note, Prompt};
