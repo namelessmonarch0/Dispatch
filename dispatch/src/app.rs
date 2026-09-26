@@ -47,6 +47,10 @@ const APP_NAME: &str = "D I S P A T C H";
 /// How many columns of a pane's title a tab shows.
 const TAB_TITLE: usize = 16;
 
+/// What a tab command says on a project whose daemon keeps no tabs.
+#[allow(dead_code)] // wired to keys in the next change
+const NEEDS_UPGRADE: &str = "this machine's Dispatch needs upgrading for tabs";
+
 /// The border drawn around one pane, in `colour`, its title bold when
 /// `focused`.
 ///
@@ -295,6 +299,22 @@ enum Overlay {
         /// What has been typed.
         prompt: Prompt,
     },
+    /// A new name for a tab being typed.
+    #[allow(dead_code)] // constructed once open_rename_tab is wired to a key
+    RenameTab {
+        /// The tab being renamed.
+        tab: TabId,
+        /// What has been typed.
+        prompt: Prompt,
+    },
+    /// Closing a tab, and every pane on it, waiting on a yes.
+    #[allow(dead_code)] // constructed once open_close_tab is wired to a key
+    CloseTab {
+        /// The tab to close.
+        tab: TabId,
+        /// The question, as a prompt with nothing to type.
+        prompt: Prompt,
+    },
     /// A delegation request, shown from the front of `App::pending`.
     Approval {
         /// First line of the task text on screen, for a long one.
@@ -313,6 +333,8 @@ impl Overlay {
             Overlay::Browse(_)
             | Overlay::AddMachine(_)
             | Overlay::OpenOn { .. }
+            | Overlay::RenameTab { .. }
+            | Overlay::CloseTab { .. }
             | Overlay::Approval { .. } => None,
         }
     }
@@ -327,6 +349,8 @@ impl Overlay {
             Overlay::Browse(_)
             | Overlay::AddMachine(_)
             | Overlay::OpenOn { .. }
+            | Overlay::RenameTab { .. }
+            | Overlay::CloseTab { .. }
             | Overlay::Approval { .. } => None,
         }
     }
@@ -342,6 +366,8 @@ impl Overlay {
             Overlay::Browse(_)
             | Overlay::AddMachine(_)
             | Overlay::OpenOn { .. }
+            | Overlay::RenameTab { .. }
+            | Overlay::CloseTab { .. }
             | Overlay::Approval { .. } => None,
         }
     }
@@ -355,6 +381,9 @@ impl Overlay {
             | Overlay::Machine(picker) => picker.set_border(style),
             Overlay::Browse(browser) => browser.set_border(style),
             Overlay::OpenOn { prompt, .. } => prompt.set_border(style),
+            Overlay::RenameTab { prompt, .. } | Overlay::CloseTab { prompt, .. } => {
+                prompt.set_border(style)
+            }
             Overlay::AddMachine(add) => add.prompt_mut().set_border(style),
             // Built fresh each frame, with the theme's border already on it.
             Overlay::Approval { .. } => {}
@@ -606,6 +635,10 @@ pub struct App {
     /// The pane this client last focused on each tab, so coming back to a
     /// tab lands where the user left it.
     tab_focus: HashMap<TabId, PaneId>,
+    /// The tab on screen at the last frame, and the one before it, for
+    /// going back to the tab the user came from.
+    tab_shown: Option<TabId>,
+    tab_back: Option<TabId>,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -673,6 +706,8 @@ impl App {
             tab_from: 0,
             placing: Placement::Auto,
             tab_focus: HashMap::new(),
+            tab_shown: None,
+            tab_back: None,
         }
     }
 
@@ -2421,7 +2456,7 @@ impl App {
         // ends with must not make it for the user.
         if let Event::Paste(text) = event {
             match &mut self.overlay {
-                Some(Overlay::OpenOn { prompt, .. }) => text
+                Some(Overlay::OpenOn { prompt, .. } | Overlay::RenameTab { prompt, .. }) => text
                     .chars()
                     .filter(|c| !matches!(c, '\r' | '\n'))
                     .for_each(|c| prompt.push(c)),
@@ -2454,6 +2489,16 @@ impl App {
         // Plain letters are what is being typed, so this takes every key.
         if matches!(self.overlay, Some(Overlay::OpenOn { .. })) {
             self.handle_open_on_key(key);
+            return Ok(());
+        }
+
+        if matches!(self.overlay, Some(Overlay::RenameTab { .. })) {
+            self.handle_rename_tab_key(key);
+            return Ok(());
+        }
+
+        if matches!(self.overlay, Some(Overlay::CloseTab { .. })) {
+            self.handle_close_tab_key(key);
             return Ok(());
         }
 
@@ -3382,7 +3427,11 @@ impl App {
         let Some(id) = self.state.focused_pane() else {
             return;
         };
+        self.close_pane(id);
+    }
 
+    /// Closes one pane, terminating its process.
+    fn close_pane(&mut self, id: PaneId) {
         // Refused rather than done locally: the machine still has the process,
         // and a row taken off this client's screen is a running agent nobody
         // can find again.
@@ -3491,6 +3540,11 @@ impl App {
             self.animations.start(Target::Tab, now, SLIDE, 0.0);
             self.last_tab = tab;
         }
+        let shown = self.current_tab_id();
+        if shown != self.tab_shown {
+            self.tab_back = self.tab_shown;
+            self.tab_shown = shown;
+        }
         self.draw_tabs(
             frame,
             Rect::new(panes_area.x, top.y, panes_area.width, top.height),
@@ -3530,7 +3584,10 @@ impl App {
             return;
         }
 
-        if let Overlay::OpenOn { prompt, .. } = overlay {
+        if let Overlay::OpenOn { prompt, .. }
+        | Overlay::RenameTab { prompt, .. }
+        | Overlay::CloseTab { prompt, .. } = overlay
+        {
             frame.render_widget(prompt, panes_area);
             return;
         }
@@ -3681,6 +3738,285 @@ impl App {
             .nth(self.current_tab())
             .map(|view| view.panes)
             .unwrap_or_default()
+    }
+
+    /// The tab on screen, when its project keeps tabs; otherwise says why
+    /// nothing can be done with it, and gives `None`.
+    #[allow(dead_code)] // wired to keys in the next change
+    fn tab_to_change(&mut self) -> Option<TabId> {
+        let keeps_tabs = self
+            .state
+            .selected_project()
+            .is_some_and(|project| self.state.project_tabs(project).is_some());
+        if !keeps_tabs {
+            self.status = NEEDS_UPGRADE.into();
+            return None;
+        }
+        self.current_tab_id()
+    }
+
+    /// Makes a change to the selected project's tabs: here for a project this
+    /// client runs itself, by asking its daemon otherwise.
+    ///
+    /// The change is the message a daemon would be sent either way, so the
+    /// two paths cannot drift apart in what they mean.
+    fn change_tabs(&mut self, change: ClientMessage) {
+        let Some(project) = self.state.selected_project() else {
+            return;
+        };
+
+        if matches!(self.mode, Mode::Standalone) {
+            self.apply_tab_change(project, change);
+            return;
+        }
+
+        if let Some(daemon) = self
+            .reachable_for_project(project)
+            .map(|attachment| attachment.client.handle())
+        {
+            daemon.send(change);
+        }
+    }
+
+    /// Makes a tab change to a project this client runs: what the daemon does
+    /// for its own.
+    fn apply_tab_change(&mut self, project: ProjectId, change: ClientMessage) {
+        if let ClientMessage::CloseTab { tab } = change {
+            let members = self
+                .state
+                .project_tabs(project)
+                .and_then(|tabs| tabs.members(tab).ok())
+                .unwrap_or_default();
+            for pane in members {
+                self.close_pane(pane);
+            }
+            return;
+        }
+
+        let Some(tabs) = self.state.project_tabs_mut(project) else {
+            return;
+        };
+        let changed = match change {
+            ClientMessage::MovePane { pane, to } => tabs.move_pane(pane, to).map(|_| ()),
+            ClientMessage::RenameTab { tab, name } => tabs.rename(tab, &name),
+            ClientMessage::MoveTab { tab, index } => tabs.move_tab(tab, index),
+            // Only tab changes are made here.
+            _ => Ok(()),
+        };
+        if let Err(error) = changed {
+            self.status = error.to_string();
+        }
+    }
+
+    /// Opens the picker for a pane on a new tab, straight after the one on
+    /// screen.
+    #[allow(dead_code)] // wired to keys in the next change
+    fn open_new_tab_picker(&mut self) {
+        self.open_picker_placing(Placement::NewAfter {
+            tab: self.current_tab_id(),
+        });
+    }
+
+    /// Moves the focused pane to the tab `step` away: `-1` the previous, `1`
+    /// the next, or a new one past the last.
+    ///
+    /// Refused here, with the reason, when the answer is already known, so a
+    /// round trip to the daemon is not what tells the user a tab is full.
+    #[allow(dead_code)] // wired to keys in the next change
+    fn move_focused_pane(&mut self, step: isize) {
+        let Some(pane) = self.state.focused_pane() else {
+            return;
+        };
+        if self
+            .state
+            .pane(pane)
+            .is_some_and(|pane| pane.parent.is_some())
+        {
+            self.status = "a subagent stays beside the pane that asked for it".into();
+            return;
+        }
+        let Some(current) = self.tab_to_change() else {
+            return;
+        };
+
+        let views = self.tab_views();
+        let here = self.current_tab();
+        let to = match here.checked_add_signed(step) {
+            None => {
+                self.status = "no tab to the left".into();
+                return;
+            }
+            Some(index) if index >= views.len() => Placement::NewAfter { tab: Some(current) },
+            Some(index) => {
+                let Some(tab) = views[index].id else {
+                    return;
+                };
+                let full = self
+                    .state
+                    .selected_project()
+                    .and_then(|project| self.state.project_tabs(project))
+                    .is_some_and(|tabs| tabs.is_full(tab));
+                if full {
+                    self.status = dispatch_core::TabError::Full.to_string();
+                    return;
+                }
+                Placement::Into { tab }
+            }
+        };
+
+        self.change_tabs(ClientMessage::MovePane { pane, to });
+    }
+
+    /// Moves the tab on screen `step` places along the row. Past either end
+    /// it stays where it is.
+    #[allow(dead_code)] // wired to keys in the next change
+    fn move_current_tab(&mut self, step: isize) {
+        let Some(tab) = self.tab_to_change() else {
+            return;
+        };
+        let Some(index) = self.current_tab().checked_add_signed(step) else {
+            return;
+        };
+        if index >= self.tab_count() {
+            return;
+        }
+        self.change_tabs(ClientMessage::MoveTab { tab, index });
+    }
+
+    /// Opens the prompt that renames the tab on screen, holding its name.
+    #[allow(dead_code)] // wired to keys in the next change
+    fn open_rename_tab(&mut self) {
+        let Some(tab) = self.tab_to_change() else {
+            return;
+        };
+        let current = self
+            .tab_views()
+            .into_iter()
+            .find(|view| view.id == Some(tab))
+            .and_then(|view| view.name)
+            .unwrap_or_default();
+
+        self.overlay = Some(Overlay::RenameTab {
+            tab,
+            prompt: Prompt::new("Rename tab", "empty goes back to the first pane's title")
+                .with_input(current),
+        });
+    }
+
+    /// Acts on one key while a tab's new name is being typed.
+    fn handle_rename_tab_key(&mut self, key: &KeyEvent) {
+        let Some(Overlay::RenameTab { tab, prompt }) = &mut self.overlay else {
+            return;
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        match key.code {
+            KeyCode::Esc => self.overlay = None,
+            KeyCode::Backspace => prompt.backspace(),
+            // Enter on nothing is a choice here, unlike a path: it clears the
+            // name, and the tab goes back to its first pane's title.
+            KeyCode::Enter => {
+                let change = ClientMessage::RenameTab {
+                    tab: *tab,
+                    name: prompt.input().to_string(),
+                };
+                self.overlay = None;
+                self.change_tabs(change);
+            }
+            KeyCode::Char(c) if !ctrl => prompt.push(c),
+            _ => {}
+        }
+    }
+
+    /// Asks before closing the tab on screen: it can stop running agents.
+    #[allow(dead_code)] // wired to keys in the next change
+    fn open_close_tab(&mut self) {
+        let Some(tab) = self.tab_to_change() else {
+            return;
+        };
+        let Some(view) = self
+            .tab_views()
+            .into_iter()
+            .find(|view| view.id == Some(tab))
+        else {
+            return;
+        };
+        let count = self
+            .state
+            .selected_project()
+            .and_then(|project| self.state.project_tabs(project))
+            .and_then(|tabs| tabs.members(tab).ok())
+            .map_or(0, |members| members.len());
+        let noun = if count == 1 { "pane" } else { "panes" };
+        let name = tabs::name(&self.state, &view);
+
+        self.overlay = Some(Overlay::CloseTab {
+            tab,
+            prompt: Prompt::new(
+                format!("Close \"{name}\" and its {count} {noun}? y/n"),
+                "y closes them, n keeps them",
+            ),
+        });
+    }
+
+    /// Acts on one key while closing a tab waits on an answer.
+    fn handle_close_tab_key(&mut self, key: &KeyEvent) {
+        let Some(Overlay::CloseTab { tab, .. }) = &self.overlay else {
+            return;
+        };
+        let tab = *tab;
+
+        match key.code {
+            KeyCode::Char('y') => {
+                self.overlay = None;
+                self.change_tabs(ClientMessage::CloseTab { tab });
+            }
+            KeyCode::Char('n') | KeyCode::Esc => self.overlay = None,
+            _ => {}
+        }
+    }
+
+    /// Shows the tab to the left, wrapping to the last.
+    #[allow(dead_code)] // wired to keys in the next change
+    fn select_previous_tab(&mut self) {
+        let count = self.tab_count();
+        self.select_tab((self.current_tab() + count - 1) % count);
+    }
+
+    /// Shows the tab this client was on before the one on screen.
+    #[allow(dead_code)] // wired to keys in the next change
+    fn select_last_tab(&mut self) {
+        let Some(back) = self.tab_back else {
+            return;
+        };
+        if let Some(index) = self
+            .tab_views()
+            .iter()
+            .position(|view| view.id == Some(back))
+        {
+            self.select_tab(index);
+        }
+    }
+
+    /// Moves focus left or right, going on to the neighbouring tab at the
+    /// grid's edge, and staying put past the first or last tab.
+    #[allow(dead_code)] // wired to keys in the next change
+    fn focus_or_tab(&mut self, direction: Direction) {
+        let before = self.state.focused_pane();
+        self.focus_direction(direction);
+        if self.state.focused_pane() != before {
+            return;
+        }
+
+        let current = self.current_tab();
+        let next = match direction {
+            Direction::Left => current.checked_sub(1),
+            Direction::Right => Some(current + 1).filter(|index| *index < self.tab_count()),
+            Direction::Up | Direction::Down => None,
+        };
+        if let Some(index) = next {
+            self.select_tab(index);
+        }
     }
 
     /// Which tile each visible pane gets this frame, border included.
@@ -9061,5 +9397,294 @@ mod tests {
         let text = rendered_text(&terminal);
         let first = sidebar_column(text.lines().nth(2).expect("the frame has rows"));
         assert!(first.contains(" p1 "), "{text}");
+    }
+
+    /// Every tab command the app has sent its daemon.
+    fn tab_commands(sent: &Receiver<ClientMessage>) -> Vec<ClientMessage> {
+        sent.try_iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    ClientMessage::MovePane { .. }
+                        | ClientMessage::RenameTab { .. }
+                        | ClientMessage::CloseTab { .. }
+                        | ClientMessage::MoveTab { .. }
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn moving_a_pane_to_the_next_tab_asks_the_daemon() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        app.focus_pane(panes[0]);
+
+        app.move_focused_pane(1);
+
+        assert_eq!(
+            tab_commands(&sent),
+            vec![ClientMessage::MovePane {
+                pane: panes[0],
+                to: Placement::Into { tab: tabs[1] },
+            }]
+        );
+    }
+
+    #[test]
+    fn moving_past_the_last_tab_asks_for_a_new_one() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        app.focus_pane(panes[1]);
+
+        app.move_focused_pane(1);
+
+        assert_eq!(
+            tab_commands(&sent),
+            vec![ClientMessage::MovePane {
+                pane: panes[1],
+                to: Placement::NewAfter { tab: Some(tabs[1]) },
+            }]
+        );
+    }
+
+    #[test]
+    fn moving_left_from_the_first_tab_is_refused_here() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        send_tabs(&mut app, &daemon, project, &[&panes]);
+        app.focus_pane(panes[0]);
+
+        app.move_focused_pane(-1);
+
+        assert_eq!(app.status, "no tab to the left");
+        assert!(tab_commands(&sent).is_empty());
+    }
+
+    #[test]
+    fn moving_into_a_full_tab_is_refused_here() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 5);
+        send_tabs(&mut app, &daemon, project, &[&panes[..4], &panes[4..]]);
+        app.focus_pane(panes[4]);
+
+        app.move_focused_pane(-1);
+
+        assert_eq!(app.status, "that tab is full (4 panes)");
+        assert!(tab_commands(&sent).is_empty());
+    }
+
+    #[test]
+    fn a_subagent_is_not_moved_between_tabs() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let parent = spawn_several(&mut app, &daemon, project, 1)[0];
+        send_tabs(&mut app, &daemon, project, &[&[parent]]);
+        let kid = PaneId::new();
+        daemon
+            .send(spawned(kid, project, "shell", Some(parent), false))
+            .expect("the app is listening");
+        app.poll_daemon();
+        app.focus_pane(kid);
+
+        app.move_focused_pane(1);
+
+        assert_eq!(
+            app.status,
+            "a subagent stays beside the pane that asked for it"
+        );
+        assert!(tab_commands(&sent).is_empty());
+    }
+
+    #[test]
+    fn a_daemon_too_old_for_tabs_is_asked_nothing() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        app.focus_pane(panes[0]);
+
+        app.move_focused_pane(1);
+        assert_eq!(app.status, NEEDS_UPGRADE);
+        app.status.clear();
+        app.open_rename_tab();
+        assert_eq!(app.status, NEEDS_UPGRADE);
+        app.status.clear();
+        app.open_close_tab();
+        assert_eq!(app.status, NEEDS_UPGRADE);
+        app.status.clear();
+        app.move_current_tab(1);
+        assert_eq!(app.status, NEEDS_UPGRADE);
+
+        assert!(app.overlay.is_none());
+        assert!(tab_commands(&sent).is_empty());
+    }
+
+    #[test]
+    fn renaming_asks_the_daemon_with_what_was_typed() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes]);
+        app.focus_pane(panes[0]);
+
+        app.open_rename_tab();
+        for c in "work".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            tab_commands(&sent),
+            vec![ClientMessage::RenameTab {
+                tab: tabs[0],
+                name: "work".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_rename_changes_nothing() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        send_tabs(&mut app, &daemon, project, &[&panes]);
+        app.focus_pane(panes[0]);
+
+        app.open_rename_tab();
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Esc);
+
+        assert!(app.overlay.is_none());
+        assert!(tab_commands(&sent).is_empty());
+    }
+
+    #[test]
+    fn closing_a_tab_asks_first() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes]);
+        app.rename(panes[0], "fix login");
+        app.focus_pane(panes[0]);
+
+        app.open_close_tab();
+        let Some(Overlay::CloseTab { prompt, .. }) = &app.overlay else {
+            panic!("the confirmation is open");
+        };
+        assert_eq!(prompt.title(), "Close \"fix login\" and its 2 panes? y/n");
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.overlay.is_none());
+        assert!(tab_commands(&sent).is_empty());
+
+        app.open_close_tab();
+        press(&mut app, KeyCode::Char('y'));
+
+        assert_eq!(
+            tab_commands(&sent),
+            vec![ClientMessage::CloseTab { tab: tabs[0] }]
+        );
+    }
+
+    #[test]
+    fn reordering_asks_for_the_new_position_and_stops_at_the_ends() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        app.focus_pane(panes[0]);
+
+        app.move_current_tab(-1);
+        app.move_current_tab(1);
+
+        assert_eq!(
+            tab_commands(&sent),
+            vec![ClientMessage::MoveTab {
+                tab: tabs[0],
+                index: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_standalone_client_changes_its_own_tabs() {
+        let mut app = App::new(HarnessRegistry::default());
+        let project = app
+            .state
+            .add_project(Project::new("/tmp/standalone", ProjectSource::LocalDir));
+        app.state.set_project_tabs(project, ProjectTabs::new());
+        let panes: Vec<PaneId> = (0..2)
+            .map(|_| {
+                let id = app
+                    .state
+                    .spawn_pane(project, HarnessId::new("shell"))
+                    .expect("the project exists");
+                app.state.place_pane(id, Placement::Auto);
+                id
+            })
+            .collect();
+        app.focus_pane(panes[1]);
+
+        app.move_focused_pane(1);
+        assert_eq!(app.tab_count(), 2, "the pane moved onto a tab of its own");
+
+        app.open_rename_tab();
+        for c in "work".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.tab_views()[app.current_tab()].name.as_deref(),
+            Some("work")
+        );
+
+        app.open_close_tab();
+        press(&mut app, KeyCode::Char('y'));
+        assert!(
+            app.state.pane(panes[1]).is_none(),
+            "closing the tab closed its pane"
+        );
+        assert_eq!(app.tab_count(), 1);
+    }
+
+    #[test]
+    fn the_previous_tab_wraps_and_the_last_tab_is_the_one_before() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        send_tabs(
+            &mut app,
+            &daemon,
+            project,
+            &[&panes[..1], &panes[1..2], &panes[2..]],
+        );
+        let mut terminal = a_terminal();
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+
+        app.select_previous_tab();
+        assert_eq!(app.current_tab(), 2, "left of the first is the last");
+        drawn(&mut app, &mut terminal);
+
+        app.select_last_tab();
+        assert_eq!(app.current_tab(), 0, "back to the tab it came from");
+    }
+
+    #[test]
+    fn focus_crosses_to_the_next_tab_at_the_grids_edge_and_stops_at_the_last() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        let mut terminal = a_terminal();
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+
+        app.focus_or_tab(Direction::Right);
+        assert_eq!(app.state.focused_pane(), Some(panes[1]));
+        drawn(&mut app, &mut terminal);
+
+        app.focus_or_tab(Direction::Right);
+        assert_eq!(
+            app.state.focused_pane(),
+            Some(panes[1]),
+            "no tab past the last"
+        );
+
+        app.focus_or_tab(Direction::Left);
+        assert_eq!(app.state.focused_pane(), Some(panes[0]));
     }
 }

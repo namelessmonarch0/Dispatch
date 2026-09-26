@@ -111,5 +111,19 @@ fn kept(state: &AppState, tabs: &ProjectTabs, tileable: &[PaneId]) -> Vec<TabVie
     views
 }
 
+/// What a tab is called: the name it was given, else its first pane's title.
+#[allow(dead_code)] // used once open_close_tab is wired to a key
+pub fn name(state: &AppState, view: &TabView) -> String {
+    view.name
+        .clone()
+        .or_else(|| {
+            view.panes
+                .first()
+                .and_then(|id| state.pane(*id))
+                .map(|pane| pane.title.clone())
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests;

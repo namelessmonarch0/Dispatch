@@ -109,3 +109,22 @@ fn a_project_with_nothing_to_tile_still_has_a_tab() {
     assert_eq!(views(&state, Some(project), &[]).len(), 1);
     assert_eq!(views(&state, None, &[]).len(), 1);
 }
+
+#[test]
+fn a_tab_is_called_by_its_name_or_else_its_first_panes_title() {
+    let (mut state, project) = state();
+    let pane = top(&mut state, project);
+    state
+        .set_pane_title(pane, "fix login")
+        .expect("the pane exists");
+    let mut view = TabView {
+        id: None,
+        name: None,
+        panes: vec![pane],
+    };
+
+    assert_eq!(name(&state, &view), "fix login");
+
+    view.name = Some("work".into());
+    assert_eq!(name(&state, &view), "work");
+}
