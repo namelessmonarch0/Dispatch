@@ -428,6 +428,7 @@ impl Daemon {
                 project,
                 harness,
                 size,
+                ..
             } => self.spawn_pane(id, project, &harness, Size::new(size.0, size.1)),
 
             ClientMessage::WritePane { pane, bytes } => {
@@ -522,6 +523,13 @@ impl Daemon {
                     blanket,
                 );
             }
+
+            // Tabs arrive in the next change to this file; until then, a
+            // client asking is answered the way an older daemon would answer.
+            ClientMessage::MovePane { .. }
+            | ClientMessage::RenameTab { .. }
+            | ClientMessage::CloseTab { .. }
+            | ClientMessage::MoveTab { .. } => {}
 
             ClientMessage::Unknown => {
                 tracing::debug!(

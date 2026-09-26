@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use dispatch_client::Client;
 use dispatch_config::{HarnessRegistry, Launch};
 use dispatch_core::{
-    AppState, Device, DeviceId, HarnessId, Pane as CorePane, PaneId, PaneStatus, Project,
-    ProjectId, ProjectSource, RequestId,
+    AppState, Device, DeviceId, HarnessId, Pane as CorePane, PaneId, PaneStatus, Placement,
+    Project, ProjectId, ProjectSource, RequestId,
 };
 use dispatch_layout::{tile, tile_zoomed};
 use dispatch_proto::{ClientMessage, DelegateOutcome, PaneUpdate, ProjectUpdate, ServerMessage};
@@ -1158,6 +1158,7 @@ impl App {
                 project: project_id,
                 harness: harness.to_string(),
                 size: (area.cols, area.rows),
+                place: Placement::Auto,
             });
             self.status = format!("starting {display_name}…");
             return Ok(());
@@ -1878,10 +1879,12 @@ impl App {
 
             // The handshake is done by the client, and nothing here pings.
             // `DelegateFinished` is for the delegate caller, not interface
-            // clients. Unknown messages from newer peers are ignored.
+            // clients. `Tabs` is handled starting in a later change. Unknown
+            // messages from newer peers are ignored.
             ServerMessage::Welcome { .. }
             | ServerMessage::Pong { .. }
             | ServerMessage::DelegateFinished { .. }
+            | ServerMessage::Tabs { .. }
             | ServerMessage::Unknown => false,
         }
     }

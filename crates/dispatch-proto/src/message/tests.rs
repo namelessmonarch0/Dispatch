@@ -7,9 +7,10 @@
 
 use super::*;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::Frame;
+use dispatch_core::{Placement, Tab, TabId};
 
 fn round_trip<T>(message: &T) -> T
 where
@@ -36,6 +37,20 @@ fn every_client_message_round_trips() {
             project: ProjectId::new(),
             harness: "claude".into(),
             size: (80, 24),
+            place: Placement::Into { tab: TabId::new() },
+        },
+        ClientMessage::MovePane {
+            pane: PaneId::new(),
+            to: Placement::NewAfter { tab: None },
+        },
+        ClientMessage::RenameTab {
+            tab: TabId::new(),
+            name: "work".into(),
+        },
+        ClientMessage::CloseTab { tab: TabId::new() },
+        ClientMessage::MoveTab {
+            tab: TabId::new(),
+            index: 2,
         },
         ClientMessage::WritePane {
             pane: PaneId::new(),
@@ -101,6 +116,14 @@ fn every_server_message_round_trips() {
             pane: PaneId::new(),
         },
         ServerMessage::Pong { token: 7 },
+        ServerMessage::Tabs {
+            project: ProjectId::new(),
+            tabs: vec![Tab {
+                id: TabId::new(),
+                name: Some("work".into()),
+                panes: vec![PaneId::new(), PaneId::new()],
+            }],
+        },
     ];
 
     for message in messages {
@@ -696,4 +719,122 @@ fn a_project_from_an_older_daemon_has_no_branch() {
 
     assert_eq!(project.id, id);
     assert_eq!(project.branch, None);
+}
+
+#[test]
+fn a_spawn_from_an_older_client_is_placed_automatically() {
+    // An older client knows nothing of tabs and says nothing about where a
+    // pane goes; the daemon must still place it rather than refuse it.
+    #[derive(Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum Older {
+        SpawnPane {
+            project: ProjectId,
+            harness: String,
+            size: (u16, u16),
+        },
+    }
+
+    let project = ProjectId::new();
+    let mut buf = Vec::new();
+    Frame::write(
+        &mut buf,
+        &Older::SpawnPane {
+            project,
+            harness: "claude".into(),
+            size: (80, 24),
+        },
+    )
+    .expect("writing succeeds");
+
+    let read: ClientMessage = Frame::read(&mut buf.as_slice()).expect("reading succeeds");
+
+    assert_eq!(
+        read,
+        ClientMessage::SpawnPane {
+            project,
+            harness: "claude".into(),
+            size: (80, 24),
+            place: Placement::Auto,
+        }
+    );
+}
+
+#[test]
+fn a_placement_from_a_newer_client_is_read_as_unknown() {
+    // Rather than failing the whole frame, which would drop the connection
+    // and the spawn with it.
+    #[derive(Serialize)]
+    struct Somewhere {
+        #[serde(rename = "type")]
+        kind: &'static str,
+    }
+    #[derive(Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum Newer {
+        SpawnPane {
+            project: ProjectId,
+            harness: String,
+            size: (u16, u16),
+            place: Somewhere,
+        },
+    }
+
+    let mut buf = Vec::new();
+    Frame::write(
+        &mut buf,
+        &Newer::SpawnPane {
+            project: ProjectId::new(),
+            harness: "claude".into(),
+            size: (80, 24),
+            place: Somewhere {
+                kind: "beside_the_window",
+            },
+        },
+    )
+    .expect("writing succeeds");
+
+    let read: ClientMessage = Frame::read(&mut buf.as_slice()).expect("reading succeeds");
+
+    assert!(
+        matches!(
+            read,
+            ClientMessage::SpawnPane {
+                place: Placement::Unknown,
+                ..
+            }
+        ),
+        "got {read:?}"
+    );
+}
+
+#[test]
+fn an_older_client_skips_a_tabs_snapshot() {
+    // A client from before tabs meets a daemon that sends them whenever one
+    // is on a machine that was upgraded first.
+    #[derive(Debug, PartialEq, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum OlderServerMessage {
+        PaneClosed {
+            pane: PaneId,
+        },
+        #[serde(other)]
+        Unknown,
+    }
+
+    let tabs = ServerMessage::Tabs {
+        project: ProjectId::new(),
+        tabs: vec![Tab {
+            id: TabId::new(),
+            name: None,
+            panes: vec![PaneId::new()],
+        }],
+    };
+    let mut buf = Vec::new();
+    Frame::write(&mut buf, &tabs).expect("writing succeeds");
+
+    let read: OlderServerMessage =
+        Frame::read(&mut buf.as_slice()).expect("an older peer still reads the frame");
+
+    assert_eq!(read, OlderServerMessage::Unknown);
 }

@@ -8,6 +8,8 @@ use super::*;
 
 use std::time::Instant;
 
+use dispatch_core::Placement;
+
 /// A harness registry holding a plain shell, so panes run something real.
 ///
 /// Carries a `[task]` form so delegation tests have a harness to delegate to;
@@ -203,6 +205,7 @@ fn spawning_a_pane_starts_a_process_and_tells_the_client() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
 
@@ -232,6 +235,7 @@ fn pane_output_reaches_the_client() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
 
@@ -289,6 +293,7 @@ fn every_subscribed_client_sees_the_same_panes() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
     daemon.tick();
@@ -322,6 +327,7 @@ fn a_client_that_has_not_subscribed_is_left_quiet() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
     daemon.tick();
@@ -348,6 +354,7 @@ fn a_client_attaching_later_is_told_what_already_exists() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
     wait_for(&mut daemon, &first, |m| {
@@ -382,6 +389,7 @@ fn panes_outlive_the_client_that_started_them() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
     wait_for(&mut daemon, &inbox, |m| {
@@ -411,6 +419,7 @@ fn closing_a_pane_removes_it_and_tells_everyone() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
 
@@ -477,6 +486,7 @@ fn spawning_into_an_unknown_project_is_reported() {
             project: ProjectId::new(),
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
 
@@ -501,6 +511,7 @@ fn spawning_an_unknown_harness_is_reported_with_its_name() {
             project,
             harness: "nonexistent".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
 
@@ -531,6 +542,7 @@ fn an_exited_pane_is_reported_and_kept() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
 
@@ -595,6 +607,7 @@ fn a_requested_shutdown_stops_the_loop_and_kills_the_panes() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
     wait_for(&mut daemon, &inbox, |m| {
@@ -653,6 +666,7 @@ fn a_subscriber_is_told_the_projects_before_the_panes() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
     wait_for(&mut daemon, &inbox, |m| {
@@ -851,6 +865,7 @@ fn a_client_attaching_later_is_replayed_what_a_pane_printed() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
 
@@ -901,6 +916,7 @@ fn a_pane_remembers_only_its_most_recent_output() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
     wait_for(&mut daemon, &inbox, |m| {
@@ -946,6 +962,7 @@ fn a_client_attaching_after_a_pane_exited_is_told_it_exited() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
 
@@ -1025,6 +1042,7 @@ fn spawn_pane_for_test(
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
 
@@ -1935,6 +1953,7 @@ fn a_project_with_panes_is_not_closed() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
     wait_for(&mut daemon, &inbox, |m| {
@@ -2079,6 +2098,7 @@ fn a_pane_reports_the_branch_of_the_directory_its_shell_is_in() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
 
@@ -2128,6 +2148,7 @@ fn an_exited_pane_keeps_the_branch_it_last_had() {
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     );
     let seen = wait_for(&mut daemon, &inbox, |messages| {

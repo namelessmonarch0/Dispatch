@@ -20,6 +20,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
+use dispatch_core::Placement;
 use dispatch_os::ipc::Connection;
 use dispatch_proto::{ClientMessage, Frame, ServerMessage};
 
@@ -277,6 +278,7 @@ fn spawn_parent_pane(
             project,
             harness: "shell".into(),
             size: (80, 24),
+            place: Placement::Auto,
         },
     )
     .expect("writing succeeds");
