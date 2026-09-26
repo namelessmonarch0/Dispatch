@@ -2193,3 +2193,430 @@ fn an_exited_pane_keeps_the_branch_it_last_had() {
         "the last word on the pane's branch is still main: {all:#?}"
     );
 }
+
+/// Attaches interface client `id`, subscribes it, and clears its inbox.
+fn subscribed(daemon: &mut Daemon, id: u64) -> Receiver<ServerMessage> {
+    let inbox = daemon.attach_for_test(id);
+    daemon.request_for_test(id, hello());
+    daemon.request_for_test(id, ClientMessage::Subscribe);
+    let _ = drain(&inbox);
+    inbox
+}
+
+/// Each tab's panes from the last `Tabs` seen for `project`.
+fn last_tabs(messages: &[ServerMessage], project: ProjectId) -> Option<Vec<Vec<PaneId>>> {
+    messages.iter().rev().find_map(|m| match m {
+        ServerMessage::Tabs { project: p, tabs } if *p == project => {
+            Some(tabs.iter().map(|tab| tab.panes.clone()).collect())
+        }
+        _ => None,
+    })
+}
+
+/// The id of tab `index` in the last `Tabs` seen for `project`.
+fn tab_at(messages: &[ServerMessage], project: ProjectId, index: usize) -> TabId {
+    messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            ServerMessage::Tabs { project: p, tabs } if *p == project => {
+                tabs.get(index).map(|tab| tab.id)
+            }
+            _ => None,
+        })
+        .expect("the tab is in the last snapshot")
+}
+
+/// Spawns a pane with `place`, as client 1, and waits for the snapshot that
+/// places it. Returns the pane and everything seen on the way.
+fn spawn_placed(
+    daemon: &mut Daemon,
+    inbox: &Receiver<ServerMessage>,
+    project: ProjectId,
+    place: Placement,
+) -> (PaneId, Vec<ServerMessage>) {
+    daemon.request_for_test(
+        1,
+        ClientMessage::SpawnPane {
+            project,
+            harness: "shell".into(),
+            size: (80, 24),
+            place,
+        },
+    );
+
+    let seen = wait_for(daemon, inbox, |m| {
+        m.iter().any(|m| matches!(m, ServerMessage::Tabs { .. }))
+    });
+    let pane = seen
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::PaneSpawned { pane, .. } => Some(*pane),
+            _ => None,
+        })
+        .expect("a pane was spawned");
+    (pane, seen)
+}
+
+/// Whether a client was refused with exactly `reason`.
+fn refused_with(messages: &[ServerMessage], reason: &str) -> bool {
+    messages.iter().any(|m| {
+        matches!(
+            m,
+            ServerMessage::Error { error: ProtocolError::Other(text) } if text == reason
+        )
+    })
+}
+
+#[test]
+fn a_spawned_pane_is_placed_and_everyone_is_told_after_the_announcement() {
+    let (mut daemon, project, _dir) = daemon("tabs-spawn");
+    let inbox = subscribed(&mut daemon, 1);
+
+    let (pane, seen) = spawn_placed(&mut daemon, &inbox, project, Placement::Auto);
+
+    assert_eq!(last_tabs(&seen, project), Some(vec![vec![pane]]));
+    let announced = seen
+        .iter()
+        .position(|m| matches!(m, ServerMessage::PaneSpawned { .. }))
+        .expect("the pane was announced");
+    let placed = seen
+        .iter()
+        .position(|m| matches!(m, ServerMessage::Tabs { .. }))
+        .expect("the pane was placed");
+    assert!(
+        announced < placed,
+        "a snapshot never names a pane not yet announced"
+    );
+}
+
+#[test]
+fn a_spawn_asked_into_a_full_tab_opens_the_next_one() {
+    let (mut daemon, project, _dir) = daemon("tabs-full-spawn");
+    let inbox = subscribed(&mut daemon, 1);
+    let mut all = Vec::new();
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        let (pane, placed) = spawn_placed(&mut daemon, &inbox, project, Placement::Auto);
+        all.push(pane);
+        seen = placed;
+    }
+    let first = tab_at(&seen, project, 0);
+
+    let (fifth, seen) = spawn_placed(&mut daemon, &inbox, project, Placement::Into { tab: first });
+
+    assert_eq!(
+        last_tabs(&seen, project),
+        Some(vec![all, vec![fifth]]),
+        "the full tab is untouched and the new one follows it"
+    );
+}
+
+#[test]
+fn a_client_attaching_later_hears_every_projects_tabs_after_their_panes() {
+    let (mut daemon, project, dir) = daemon("tabs-replay");
+    let inbox = subscribed(&mut daemon, 1);
+    let (a, _) = spawn_placed(&mut daemon, &inbox, project, Placement::Auto);
+    let (b, _) = spawn_placed(
+        &mut daemon,
+        &inbox,
+        project,
+        Placement::NewAfter { tab: None },
+    );
+    let empty_root = dir.0.join("empty");
+    std::fs::create_dir_all(&empty_root).expect("temp dir is writable");
+    let empty = daemon
+        .open_project(dispatch_os::paths::resolve(&empty_root).expect("the temp dir resolves"));
+
+    let late = daemon.attach_for_test(2);
+    daemon.request_for_test(2, hello());
+    daemon.request_for_test(2, ClientMessage::Subscribe);
+    let replay = drain(&late);
+
+    assert_eq!(last_tabs(&replay, project), Some(vec![vec![a], vec![b]]));
+    assert_eq!(
+        last_tabs(&replay, empty),
+        Some(Vec::new()),
+        "an empty project still says it keeps tabs"
+    );
+    let last_pane = replay
+        .iter()
+        .rposition(|m| matches!(m, ServerMessage::PaneSpawned { .. }))
+        .expect("the panes were replayed");
+    let first_tabs = replay
+        .iter()
+        .position(|m| matches!(m, ServerMessage::Tabs { .. }))
+        .expect("the tabs were replayed");
+    assert!(
+        last_pane < first_tabs,
+        "tabs come after every pane they name"
+    );
+}
+
+#[test]
+fn moving_a_pane_tells_everyone() {
+    let (mut daemon, project, _dir) = daemon("tabs-move");
+    let inbox = subscribed(&mut daemon, 1);
+    let (a, _) = spawn_placed(&mut daemon, &inbox, project, Placement::Auto);
+    let (b, seen) = spawn_placed(&mut daemon, &inbox, project, Placement::Auto);
+    let first = tab_at(&seen, project, 0);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::MovePane {
+            pane: b,
+            to: Placement::NewAfter { tab: Some(first) },
+        },
+    );
+
+    assert_eq!(
+        last_tabs(&drain(&inbox), project),
+        Some(vec![vec![a], vec![b]])
+    );
+}
+
+#[test]
+fn the_second_of_two_moves_into_the_last_slot_is_refused() {
+    // Two clients can each see room for one more pane. The daemon decides,
+    // so only one of them gets it.
+    let (mut daemon, project, _dir) = daemon("tabs-race");
+    let first_client = subscribed(&mut daemon, 1);
+    let second_client = subscribed(&mut daemon, 2);
+    let mut seen = spawn_placed(&mut daemon, &first_client, project, Placement::Auto).1;
+    for _ in 0..2 {
+        seen = spawn_placed(&mut daemon, &first_client, project, Placement::Auto).1;
+    }
+    let first = tab_at(&seen, project, 0);
+    let (d, _) = spawn_placed(
+        &mut daemon,
+        &first_client,
+        project,
+        Placement::NewAfter { tab: None },
+    );
+    let (e, _) = spawn_placed(
+        &mut daemon,
+        &first_client,
+        project,
+        Placement::NewAfter { tab: None },
+    );
+    let _ = drain(&second_client);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::MovePane {
+            pane: d,
+            to: Placement::Into { tab: first },
+        },
+    );
+    daemon.request_for_test(
+        2,
+        ClientMessage::MovePane {
+            pane: e,
+            to: Placement::Into { tab: first },
+        },
+    );
+
+    assert!(refused_with(
+        &drain(&second_client),
+        "that tab is full (4 panes)"
+    ));
+    let tabs = last_tabs(&drain(&first_client), project).expect("the first move was told");
+    assert_eq!(tabs[0].len(), 4);
+    assert_eq!(tabs[0][3], d, "the first to ask got the slot");
+    assert_eq!(tabs[1], vec![e]);
+}
+
+#[test]
+fn a_subagent_is_never_placed_or_moved() {
+    let (mut daemon, project, _dir) = daemon("tabs-subagent");
+    let ui = subscribed(&mut daemon, 1);
+    let (parent, _) = spawn_placed(&mut daemon, &ui, project, Placement::Auto);
+    let _caller = ask(&mut daemon, parent, "echo delegated");
+    let request = pending(&drain(&ui)).expect("the interface is asked");
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::DelegateDecision {
+            request,
+            approve: true,
+            blanket: false,
+        },
+    );
+    let seen = wait_for(&mut daemon, &ui, |m| m.iter().any(m_is_child));
+    let child = seen
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::PaneSpawned {
+                pane,
+                parent: Some(_),
+                ..
+            } => Some(*pane),
+            _ => None,
+        })
+        .expect("the subagent was announced");
+
+    assert!(
+        !seen.iter().any(|m| matches!(
+            m,
+            ServerMessage::Tabs { tabs, .. } if tabs.iter().any(|tab| tab.panes.contains(&child))
+        )),
+        "no snapshot places the subagent"
+    );
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::MovePane {
+            pane: child,
+            to: Placement::NewAfter { tab: None },
+        },
+    );
+    assert!(refused_with(
+        &drain(&ui),
+        "a subagent stays beside the pane that asked for it"
+    ));
+}
+
+#[test]
+fn renaming_a_tab_tells_everyone() {
+    let (mut daemon, project, _dir) = daemon("tabs-rename");
+    let inbox = subscribed(&mut daemon, 1);
+    let (_, seen) = spawn_placed(&mut daemon, &inbox, project, Placement::Auto);
+    let tab = tab_at(&seen, project, 0);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::RenameTab {
+            tab,
+            name: "  work  ".into(),
+        },
+    );
+
+    let named = drain(&inbox).into_iter().rev().find_map(|m| match m {
+        ServerMessage::Tabs { tabs, .. } => tabs.first().and_then(|tab| tab.name.clone()),
+        _ => None,
+    });
+    assert_eq!(named.as_deref(), Some("work"));
+}
+
+#[test]
+fn a_tab_that_is_gone_is_reported() {
+    let (mut daemon, _project, _dir) = daemon("tabs-gone");
+    let inbox = subscribed(&mut daemon, 1);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::RenameTab {
+            tab: TabId::new(),
+            name: "work".into(),
+        },
+    );
+    daemon.request_for_test(
+        1,
+        ClientMessage::MoveTab {
+            tab: TabId::new(),
+            index: 0,
+        },
+    );
+    daemon.request_for_test(1, ClientMessage::CloseTab { tab: TabId::new() });
+
+    let refusals = drain(&inbox)
+        .iter()
+        .filter(|m| {
+            matches!(
+                m,
+                ServerMessage::Error { error: ProtocolError::Other(text) } if text == "that tab is gone"
+            )
+        })
+        .count();
+    assert_eq!(refusals, 3);
+}
+
+#[test]
+fn closing_a_tab_closes_exactly_its_panes() {
+    let (mut daemon, project, _dir) = daemon("tabs-close");
+    let inbox = subscribed(&mut daemon, 1);
+    let (a, _) = spawn_placed(&mut daemon, &inbox, project, Placement::Auto);
+    let (b, _) = spawn_placed(&mut daemon, &inbox, project, Placement::Auto);
+    let (c, seen) = spawn_placed(
+        &mut daemon,
+        &inbox,
+        project,
+        Placement::NewAfter { tab: None },
+    );
+    let first = tab_at(&seen, project, 0);
+
+    daemon.request_for_test(1, ClientMessage::CloseTab { tab: first });
+
+    let seen = drain(&inbox);
+    for pane in [a, b] {
+        assert!(
+            seen.iter()
+                .any(|m| matches!(m, ServerMessage::PaneClosed { pane: p } if *p == pane)),
+            "{pane} was closed"
+        );
+    }
+    assert_eq!(last_tabs(&seen, project), Some(vec![vec![c]]));
+    assert_eq!(daemon.pane_count(), 1);
+}
+
+#[test]
+fn a_tab_moves_along_the_row() {
+    let (mut daemon, project, _dir) = daemon("tabs-reorder");
+    let inbox = subscribed(&mut daemon, 1);
+    let (a, _) = spawn_placed(&mut daemon, &inbox, project, Placement::Auto);
+    let (b, _) = spawn_placed(
+        &mut daemon,
+        &inbox,
+        project,
+        Placement::NewAfter { tab: None },
+    );
+    let (c, seen) = spawn_placed(
+        &mut daemon,
+        &inbox,
+        project,
+        Placement::NewAfter { tab: None },
+    );
+    let first = tab_at(&seen, project, 0);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::MoveTab {
+            tab: first,
+            index: 2,
+        },
+    );
+
+    assert_eq!(
+        last_tabs(&drain(&inbox), project),
+        Some(vec![vec![b], vec![c], vec![a]])
+    );
+}
+
+#[test]
+fn a_pane_that_exits_leaves_its_tab() {
+    let (mut daemon, project, _dir) = daemon("tabs-exit");
+    let inbox = subscribed(&mut daemon, 1);
+    let (pane, _) = spawn_placed(&mut daemon, &inbox, project, Placement::Auto);
+
+    daemon.request_for_test(
+        1,
+        ClientMessage::WritePane {
+            pane,
+            bytes: b"exit 0\r".to_vec(),
+        },
+    );
+
+    let seen = wait_for(&mut daemon, &inbox, |m| {
+        last_tabs(m, project).is_some_and(|tabs| tabs.is_empty())
+    });
+    assert!(seen.iter().any(|m| matches!(
+        m,
+        ServerMessage::PaneChanged {
+            update: PaneUpdate::Status {
+                status: PaneStatus::Exited(_)
+            },
+            ..
+        }
+    )));
+    assert_eq!(daemon.pane_count(), 1, "the pane itself stays until closed");
+}
