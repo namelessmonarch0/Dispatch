@@ -59,14 +59,66 @@ cargo build --workspace --target x86_64-pc-windows-gnu
 Every pane is drawn inside a thin border carrying its title, so one agent's
 output cannot be mistaken for the next one's or for the sidebar.
 
-At most four panes are tiled at once. A fifth does not shrink the other four —
-it opens a second tab, and `^a 1` through `^a 9` move between them (`^a Tab`
-walks them in order). The sidebar always lists every pane, whichever tab it is
-on, and the status row says which tab you are looking at.
+At most four panes are tiled at once, on a tab. Tabs are yours: a new pane
+opens on the tab you are on, and a fifth on a full tab opens the next one.
+Closing a pane never moves panes on other tabs. The sidebar always lists
+every pane, whichever tab it is on.
 
 A pane whose process exits gives its tile back straight away and the remaining
 panes spread into the space. It stays in the sidebar, where selecting it shows
 what it printed — `^a x` is what removes it for good.
+
+## Tabs
+
+The row across the top names each tab after its first pane's title, or the
+name you give it, with `+` at its end for a new one. Click a tab to go to
+it. When there are more tabs than fit, the row scrolls to keep yours in view.
+
+`Ctrl t` enters tab mode, and the status row lists its keys:
+
+| Key | Does |
+|---|---|
+| `n` | new tab: the picker, with your shell first |
+| `r` | rename the tab (empty goes back to the first pane's title) |
+| `x` | close the tab and every pane on it, after a y/n |
+| `←` `→` / `h` `l` | previous / next tab |
+| `[` `]` | move the focused pane to the previous / next tab (a new one past the last) |
+| `i` `o` | move the tab left / right |
+| `1`–`9` | go to a tab by position |
+| `Tab` | the tab you were on before |
+| `Esc` / `Enter` | leave tab mode |
+| `Ctrl t` | send `Ctrl t` itself to the pane (Claude Code and fzf use it) |
+
+Some keys work without a mode: `Alt n` opens a new pane on this tab,
+`Alt i` / `Alt o` move the tab, and `Alt` with an arrow or `h` `j` `k` `l`
+moves focus, going on to the next tab at the grid's edge. `^a 1`–`^a 9` and
+`^a Tab` still work too.
+
+A daemon keeps its projects' tabs, so they survive detaching and look the
+same from every client. A daemon older than tabs still works: its panes are
+grouped four at a time, as before.
+
+## Shell panes
+
+The picker's first entry is your own shell — `Shell · zsh`, or whatever
+`$SHELL` is on the machine the project is on — so `Enter` opens a terminal
+in the project's directory. It starts the way your terminal starts it (a
+login shell on macOS, a plain interactive one elsewhere), so your rc file
+runs and your prompt, Starship or otherwise, looks as it does anywhere else.
+To choose it yourself:
+
+```toml
+# ~/.config/dispatch/config.toml
+[shell]
+command = "/usr/bin/fish"   # default: $SHELL, then your login record, then /bin/sh
+args = []
+login = "auto"              # auto | always | never
+```
+
+Every pane is told it is in Dispatch's terminal — `TERM=xterm-256color`,
+`COLORTERM=truecolor`, `TERM_PROGRAM=dispatch` — and not the one Dispatch
+runs in, so a program never sends it another terminal's private sequences.
+A harness's own `env` still wins.
 
 ## The sidebar
 

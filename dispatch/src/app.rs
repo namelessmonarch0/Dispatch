@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use dispatch_client::Client;
-use dispatch_config::{HarnessRegistry, Launch};
+use dispatch_config::{HarnessRegistry, Launch, SHELL};
 use dispatch_core::{
     AppState, Device, DeviceId, HarnessId, Pane as CorePane, PaneId, PaneStatus, Placement,
     Project, ProjectId, ProjectSource, ProjectTabs, RequestId, TabId,
@@ -114,6 +114,15 @@ fn pane_title(state: &AppState, id: PaneId) -> String {
         .pane(id)
         .map(|pane| format!(" {} ", pane.title))
         .unwrap_or_default()
+}
+
+/// The picker's name for the user's shell, after its program: `Shell · zsh`.
+fn shell_label(command: &str) -> String {
+    let program = Path::new(command).file_stem().map_or_else(
+        || command.to_string(),
+        |stem| stem.to_string_lossy().into_owned(),
+    );
+    format!("Shell · {program}")
 }
 
 /// Which picker is open, decoupled from the picker itself so a selection can
@@ -845,6 +854,18 @@ impl App {
         self.attachments()
             .iter()
             .find(|attachment| attachment.device == device)
+    }
+
+    /// Whether the selected project's panes run on this machine.
+    fn project_is_local(&self) -> bool {
+        match &self.mode {
+            Mode::Standalone => true,
+            Mode::Attached(_) => self
+                .state
+                .selected_project()
+                .and_then(|project| self.attachment_for_project(project))
+                .is_some_and(|attachment| !attachment.remote),
+        }
     }
 
     /// The daemon a project is on, or `None` with the reason said out loud.
@@ -2990,11 +3011,28 @@ impl App {
 
     /// Opens the picker for a pane that goes where `place` says.
     fn open_picker_placing(&mut self, place: Placement) {
-        let items: Vec<Item> = self
+        let local = self.project_is_local();
+        let mut items: Vec<Item> = self
             .harnesses
             .all()
-            .map(|h| Item::new(&h.id, &h.display_name).with_detail(&h.launch.command))
+            .map(|h| {
+                if h.id == SHELL && !local {
+                    // The picker is this machine's, but a shell runs where the
+                    // project is, and this machine cannot say which one that
+                    // machine will start.
+                    return Item::new(&h.id, &h.display_name);
+                }
+                let label = if h.id == SHELL {
+                    shell_label(&h.launch.command)
+                } else {
+                    h.display_name.clone()
+                };
+                Item::new(&h.id, label).with_detail(&h.launch.command)
+            })
             .collect();
+        // The user's own shell first, and so chosen: Enter on a new tab gives
+        // a shell, one arrow an agent.
+        items.sort_by_key(|item| item.id != SHELL);
 
         if items.is_empty() {
             self.status = "no harnesses registered; press ^a H to add one".into();
@@ -10244,5 +10282,69 @@ mod tests {
         let row = top_row(&terminal);
         click(&mut app, cell_of(&row, "›"), 0);
         assert_eq!(app.current_tab(), 6, "clicking › shows the next tab");
+    }
+
+    /// A registry holding `claude` and the user's shell, `command`.
+    fn registry_with_shell(command: &str) -> HarnessRegistry {
+        [
+            dispatch_config::HarnessDef {
+                id: "claude".to_string(),
+                display_name: "Claude Code".to_string(),
+                ..dispatch_config::HarnessDef::default()
+            },
+            dispatch_config::HarnessDef {
+                id: dispatch_config::SHELL.to_string(),
+                display_name: "Shell".to_string(),
+                launch: Launch {
+                    command: command.to_string(),
+                    ..Launch::default()
+                },
+                ..dispatch_config::HarnessDef::default()
+            },
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn the_picker_offers_the_users_shell_first_named_after_its_program() {
+        let mut app = App::new(registry_with_shell("/usr/bin/zsh"));
+        app.state
+            .add_project(Project::new("/tmp/one", ProjectSource::LocalDir));
+
+        app.open_harness_picker();
+
+        let Some(Overlay::Harness(picker)) = &app.overlay else {
+            panic!("the picker is open");
+        };
+        assert_eq!(picker.items()[0].label, "Shell · zsh");
+        assert_eq!(
+            picker.selected().map(|item| item.id.as_str()),
+            Some("shell"),
+            "Enter gives a shell"
+        );
+    }
+
+    #[test]
+    fn a_shell_on_another_machine_is_not_named_after_this_ones() {
+        // The picker is this machine's, but a shell runs where the project
+        // is: its program is only this machine's to name when that is here.
+        let (client, daemon, _sent) = Client::for_test();
+        let mut app = App::new(registry_with_shell("/usr/bin/zsh"));
+        app.attach_named(client, Some("box".into()), Vec::new());
+        daemon
+            .send(ServerMessage::ProjectOpened {
+                project: Project::new("/srv/app", ProjectSource::LocalDir),
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        app.open_harness_picker();
+
+        let Some(Overlay::Harness(picker)) = &app.overlay else {
+            panic!("the picker is open");
+        };
+        assert_eq!(picker.items()[0].label, "Shell");
+        assert_eq!(picker.items()[0].detail, None);
     }
 }

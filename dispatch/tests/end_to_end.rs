@@ -17,6 +17,10 @@ const SETTLE: Duration = Duration::from_secs(10);
 
 /// A harness definition the test controls, written into a temporary config
 /// directory so the developer's own harnesses are neither used nor disturbed.
+///
+/// The built-in Shell now sorts first in the picker, so this one sorts first
+/// only among the harness files below it — it remains the harness the
+/// delegation tests delegate to, since it alone carries a `[task]` form.
 const SHELL_HARNESS: &str = r#"
 id = "aaashell"
 display_name = "Test Shell"
@@ -95,14 +99,23 @@ impl Fixture {
         std::fs::create_dir_all(&project).expect("temp dir is writable");
 
         // Dispatch writes its built-ins here on first run; adding one of our
-        // own proves a user-registered harness is picked up, and sorts first
-        // so `new pane` selects it.
+        // own proves a user-registered harness is picked up. It sorts first
+        // among the harness files, below the built-in Shell, and it remains
+        // the harness the delegation tests delegate to.
         let harnesses = config.path().join("harnesses");
         std::fs::create_dir_all(&harnesses).expect("temp dir is writable");
-        // The id must match the file stem, and sorting first is what makes
-        // "new pane" choose it over the built-ins.
+        // The id must match the file stem, and sorting first among the
+        // harness files is what makes "new pane" choose it over the others.
         std::fs::write(harnesses.join("aaashell.toml"), SHELL_HARNESS.trim())
             .expect("temp dir is writable");
+
+        // The built-in shell is offered first. Pinned to plain `sh` here, so
+        // no test runs the developer's own shell and its prompt.
+        std::fs::write(
+            config.path().join("config.toml"),
+            "[shell]\ncommand = \"sh\"\nlogin = \"never\"\n",
+        )
+        .expect("temp dir is writable");
 
         Self { config, project }
     }
@@ -333,8 +346,9 @@ impl Harness {
 
     /// Opens the harness picker and chooses the test shell.
     ///
-    /// The picker lists harnesses by display name, and the test shell sorts
-    /// first, so Enter takes it.
+    /// The built-in Shell sorts first now, with the test shell right behind
+    /// it, so one `j` reaches the test shell: the harness the delegation
+    /// tests need, since only it carries a `[task]` form.
     fn spawn_shell(&mut self) {
         let before = self.shell_panes();
 
@@ -344,7 +358,7 @@ impl Harness {
             "the harness picker should open"
         );
 
-        self.send(b"\r");
+        self.send(b"j\r");
         assert!(
             self.wait_for(move |lines| panes_shown(lines) > before),
             "a pane should be listed after choosing a harness"
@@ -1405,4 +1419,43 @@ fn a_machine_asleep_at_startup_joins_when_it_wakes() {
     drop(app);
     stop_recorded_daemon(&here);
     stop_recorded_daemon(&there);
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn the_picker_offers_the_users_shell_first() {
+    let mut app = Harness::start(Size::new(100, 30));
+    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+
+    app.send(b"\x01n");
+    assert!(
+        app.wait_for(|lines| contains(lines, "Shell · sh")),
+        "the user's shell is offered by name"
+    );
+
+    app.send(b"\r");
+    assert!(app.wait_for(|lines| panes_shown(lines) > 0));
+    app.send(b"echo from-the-users-shell\r");
+    assert!(
+        app.wait_for(|lines| contains(lines, "from-the-users-shell")),
+        "Enter started the shell, and it answers"
+    );
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "the test harness spawns a POSIX shell")]
+fn tab_mode_opens_a_new_tab_with_a_pane_of_its_own() {
+    let mut app = Harness::start(Size::new(100, 30));
+    assert!(app.wait_for(|lines| contains(lines, "pane(s)")));
+    app.spawn_shell();
+
+    // Ctrl t, then n: the picker, for a pane on a new tab.
+    app.send(b"\x14n");
+    assert!(app.wait_for(|lines| contains(lines, "New pane")));
+    app.send(b"\r");
+
+    assert!(
+        app.wait_for(|lines| contains(lines, "tab 2/2")),
+        "the new pane is on a tab of its own"
+    );
 }
