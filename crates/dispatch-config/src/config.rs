@@ -9,11 +9,13 @@
 //! whenever a machine is mid-upgrade — but a typo must not be silent either, so
 //! unknown keys are reported by name for the caller to log.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::ConfigError;
+use crate::harness::Launch;
 
 /// Limits on delegation, which starts processes on this machine.
 ///
@@ -61,14 +63,89 @@ impl Default for InterfaceConfig {
     }
 }
 
-/// Everything `config.toml` can say.
+/// Whether the user's shell starts as a login shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LoginShell {
+    /// As this platform's terminals do: a login shell on macOS, not
+    /// elsewhere.
+    #[default]
+    Auto,
+    /// Always pass `-l`.
+    Always,
+    /// Never pass `-l`.
+    Never,
+}
+
+/// The shell a `shell` pane runs.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShellConfig {
+    /// The program. `None` means the machine's own: `$SHELL`, then the
+    /// login record, then `/bin/sh`.
+    pub command: Option<String>,
+    /// Arguments, after any `-l`.
+    pub args: Vec<String>,
+    /// Whether it starts as a login shell.
+    pub login: LoginShell,
+}
+
+impl ShellConfig {
+    /// How to start the shell on this machine.
+    #[must_use]
+    pub fn launch(&self) -> Launch {
+        self.launch_with(
+            dispatch_os::shell::user_shell,
+            dispatch_os::shell::login_by_default(),
+            dispatch_os::shell::takes_login_flag(),
+        )
+    }
+
+    /// [`Self::launch`], with what it would ask the machine handed in, so
+    /// every platform's rules can be tested on any one of them.
+    pub(crate) fn launch_with(
+        &self,
+        user_shell: impl FnOnce() -> String,
+        login_by_default: bool,
+        takes_login_flag: bool,
+    ) -> Launch {
+        let command = self
+            .command
+            .clone()
+            .filter(|command| !command.trim().is_empty())
+            .unwrap_or_else(user_shell);
+
+        let login = match self.login {
+            LoginShell::Auto => login_by_default,
+            LoginShell::Always => true,
+            LoginShell::Never => false,
+        };
+
+        let mut args = Vec::new();
+        if login && takes_login_flag {
+            args.push("-l".to_string());
+        }
+        args.extend(self.args.iter().cloned());
+
+        Launch {
+            command,
+            args,
+            env: BTreeMap::new(),
+        }
+    }
+}
+
+/// Everything `config.toml` can say.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Limits on delegation.
     pub delegation: DelegationLimits,
     /// How the interface draws itself. The daemon ignores it.
     pub interface: InterfaceConfig,
+    /// The shell a `shell` pane runs. Read by whichever side starts panes:
+    /// the daemon, or a standalone client.
+    pub shell: ShellConfig,
 }
 
 /// A loaded configuration, plus the keys this build did not understand.
@@ -127,6 +204,7 @@ impl Config {
 /// Dotted paths of keys Dispatch does not know.
 fn unknown_keys(raw: &toml::Table) -> Vec<String> {
     const DELEGATION: [&str; 3] = ["max_depth", "max_live_per_parent", "request_timeout_secs"];
+    const SHELL: [&str; 3] = ["command", "args", "login"];
 
     let mut unknown = Vec::new();
 
@@ -143,6 +221,13 @@ fn unknown_keys(raw: &toml::Table) -> Vec<String> {
                 for key in table.keys() {
                     if key != "motion" {
                         unknown.push(format!("interface.{key}"));
+                    }
+                }
+            }
+            ("shell", toml::Value::Table(table)) => {
+                for key in table.keys() {
+                    if !SHELL.contains(&key.as_str()) {
+                        unknown.push(format!("shell.{key}"));
                     }
                 }
             }

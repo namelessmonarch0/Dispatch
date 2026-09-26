@@ -15,9 +15,14 @@ mod testing;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub use config::{Config, DelegationLimits, InterfaceConfig, LoadedConfig};
+pub use config::{
+    Config, DelegationLimits, InterfaceConfig, LoadedConfig, LoginShell, ShellConfig,
+};
 pub use harness::{HarnessDef, Launch, SettingDef, SettingKind, TaskArgs, TaskLaunch};
 pub use status::{RuleState, StatusInput, StatusRules};
+
+/// The id of the harness that runs the user's own shell.
+pub const SHELL: &str = "shell";
 
 /// Failures while loading configuration.
 ///
@@ -76,6 +81,9 @@ pub struct HarnessRegistry {
     harnesses: BTreeMap<String, HarnessDef>,
     /// Each harness's status rules, compiled once as it is registered.
     rules: BTreeMap<String, std::sync::Arc<status::StatusRules>>,
+    /// The shell this registry was given, so reloading the directory can
+    /// give it back.
+    shell: Option<ShellConfig>,
 }
 
 impl FromIterator<HarnessDef> for HarnessRegistry {
@@ -104,7 +112,11 @@ impl HarnessRegistry {
             })
             .collect();
 
-        Self { harnesses, rules }
+        Self {
+            harnesses,
+            rules,
+            shell: None,
+        }
     }
 
     /// The status rules for harness `id`.
@@ -209,6 +221,40 @@ impl HarnessRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.harnesses.is_empty()
+    }
+
+    /// This registry plus the user's own shell, as the `shell` harness.
+    ///
+    /// Built in code rather than written to the harnesses directory: what it
+    /// runs depends on the machine and on `[shell]`, and a file written once
+    /// would go stale the day either changed. A harness file with the id
+    /// `shell` wins, as a user's file always does.
+    #[must_use]
+    pub fn with_shell(mut self, shell: &ShellConfig) -> Self {
+        self.shell = Some(shell.clone());
+        if !self.harnesses.contains_key(SHELL) {
+            let def = HarnessDef {
+                id: SHELL.to_string(),
+                display_name: "Shell".to_string(),
+                launch: shell.launch(),
+                ..HarnessDef::default()
+            };
+            self.rules.insert(
+                SHELL.to_string(),
+                std::sync::Arc::new(status::StatusRules::for_harness(SHELL, None)),
+            );
+            self.harnesses.insert(SHELL.to_string(), def);
+        }
+        self
+    }
+
+    /// Loads `dir` again, keeping the shell this registry was given.
+    pub fn reloaded(&self, dir: &Path) -> Result<Self, ConfigError> {
+        let fresh = Self::load_from_dir(dir)?;
+        Ok(match &self.shell {
+            Some(shell) => fresh.with_shell(shell),
+            None => fresh,
+        })
     }
 }
 

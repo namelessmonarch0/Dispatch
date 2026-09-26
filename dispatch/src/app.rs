@@ -2840,7 +2840,9 @@ impl App {
 
                 // Reload so the new harness is offered immediately rather
                 // than only after a restart.
-                self.harnesses = HarnessRegistry::load_from_dir(&dir)
+                self.harnesses = self
+                    .harnesses
+                    .reloaded(&dir)
                     .context("failed to reload harness definitions")?;
                 self.status = format!("registered {id}");
             }

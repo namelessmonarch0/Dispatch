@@ -615,3 +615,61 @@ fn each_built_in_wears_the_mark_its_agent_is_known_by() {
         assert_eq!(bare.icon(), glyph.to_string(), "{id}'s fallback");
     }
 }
+
+#[test]
+fn every_registry_can_offer_the_users_shell() {
+    let registry = HarnessRegistry::default().with_shell(&ShellConfig {
+        command: Some("/usr/bin/fish".into()),
+        ..ShellConfig::default()
+    });
+
+    let shell = registry.get(SHELL).expect("the shell is registered");
+    assert_eq!(shell.display_name, "Shell");
+    assert_eq!(shell.launch.command, "/usr/bin/fish");
+    assert!(shell.task.is_none(), "nothing can delegate to a shell");
+    assert!(shell.settings.is_empty());
+    assert_eq!(shell.icon(), crate::harness::DEFAULT_ICON);
+    assert!(
+        registry.status_rules(SHELL).is_empty(),
+        "its state comes from output alone"
+    );
+}
+
+#[test]
+fn a_harness_file_named_shell_wins_over_the_built_in_one() {
+    let dir = TempDir::new("shell-file");
+    std::fs::write(
+        dir.path().join("shell.toml"),
+        "id = \"shell\"\ndisplay_name = \"My shell\"\ncommand = \"sh\"\n",
+    )
+    .expect("temp dir is writable");
+
+    let registry = HarnessRegistry::load_from_dir(dir.path())
+        .expect("loading succeeds")
+        .with_shell(&ShellConfig::default());
+
+    assert_eq!(
+        registry.get(SHELL).map(|def| def.display_name.as_str()),
+        Some("My shell")
+    );
+}
+
+#[test]
+fn reloading_keeps_the_shell() {
+    // Registering a harness reloads the directory; the shell is not in it and
+    // must not vanish from the picker because of that.
+    let dir = TempDir::new("shell-reload");
+    let registry = HarnessRegistry::load_from_dir(dir.path())
+        .expect("loading succeeds")
+        .with_shell(&ShellConfig {
+            command: Some("/bin/zsh".into()),
+            ..ShellConfig::default()
+        });
+
+    let reloaded = registry.reloaded(dir.path()).expect("reloading succeeds");
+
+    assert_eq!(
+        reloaded.get(SHELL).map(|def| def.launch.command.as_str()),
+        Some("/bin/zsh")
+    );
+}

@@ -169,6 +169,10 @@ fn main() -> Result<ExitCode> {
         tracing::warn!(keys = ?loaded.unknown, path = %config_path.display(), "ignoring unknown configuration keys");
     }
 
+    // The `shell` harness runs whatever this machine and `[shell]` resolve to,
+    // built in rather than written to the harnesses directory.
+    let harnesses = harnesses.with_shell(&loaded.config.shell);
+
     // Read before deciding how to run: any registered machine means the
     // agents belong to daemons, this machine's included.
     let machines = dispatch_config::machines::load(&config_dir)
