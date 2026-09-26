@@ -78,6 +78,11 @@ id_type! {
 }
 
 id_type! {
+    /// Identifies a tab: a group of panes a project's grid shows together.
+    TabId
+}
+
+id_type! {
     /// Identifies one agent pane.
     PaneId
 }
