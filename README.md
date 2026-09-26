@@ -92,7 +92,8 @@ it. When there are more tabs than fit, the row scrolls to keep yours in view.
 Some keys work without a mode: `Alt n` opens a new pane on this tab,
 `Alt i` / `Alt o` move the tab, and `Alt` with an arrow or `h` `j` `k` `l`
 moves focus, going on to the next tab at the grid's edge. `^a 1`–`^a 9` and
-`^a Tab` still work too.
+`^a Tab` still work too. As in zellij, a quick `Esc` followed by a letter
+(as in vim) can reach Dispatch as `Alt` and that letter.
 
 A daemon keeps its projects' tabs, so they survive detaching and look the
 same from every client. A daemon older than tabs still works: its panes are
@@ -114,6 +115,9 @@ command = "/usr/bin/fish"   # default: $SHELL, then your login record, then /bin
 args = []
 login = "auto"              # auto | always | never
 ```
+
+`[shell]` is read when the daemon (or a standalone Dispatch) starts, so
+restart the daemon after changing it.
 
 Every pane is told it is in Dispatch's terminal — `TERM=xterm-256color`,
 `COLORTERM=truecolor`, `TERM_PROGRAM=dispatch` — and not the one Dispatch
