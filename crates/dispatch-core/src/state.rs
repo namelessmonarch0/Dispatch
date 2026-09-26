@@ -5,12 +5,13 @@
 //! transitions from the wire, so each one has to be a single named operation
 //! with its invariants enforced in one place.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::device::Device;
-use crate::id::{DeviceId, PaneId, ProjectId};
+use crate::id::{DeviceId, PaneId, ProjectId, TabId};
 use crate::pane::{HarnessId, Pane, PaneRole, PaneStatus};
 use crate::project::Project;
+use crate::tabs::{Placement, ProjectTabs};
 
 /// Rejected state transitions.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -50,6 +51,13 @@ pub struct AppState {
     /// Panes that finished, or rang for attention, while the user was looking
     /// elsewhere. Client state, like the folds: nothing on the wire.
     unseen: HashSet<PaneId>,
+    /// Each project's tabs, while whoever runs its panes keeps them: this
+    /// client for its own, the daemon for its.
+    ///
+    /// Absent for a project whose daemon is too old to keep tabs, and that
+    /// absence is how the client knows to group the panes four at a time
+    /// itself.
+    tabs: HashMap<ProjectId, ProjectTabs>,
 }
 
 impl AppState {
@@ -98,6 +106,7 @@ impl AppState {
 
         self.projects.remove(index);
         self.collapsed_projects.remove(&project);
+        self.tabs.remove(&project);
 
         if self.selected_project == Some(project) {
             self.zoomed_pane = None;
@@ -180,6 +189,7 @@ impl AppState {
 
         for project in projects {
             self.collapsed_projects.remove(&project);
+            self.tabs.remove(&project);
         }
 
         self.repair_selection();
@@ -357,6 +367,7 @@ impl AppState {
             return Err(StateError::NoSuchPane(id));
         }
 
+        self.leave_tab(id);
         self.unseen.remove(&id);
 
         let mut judged = HashSet::new();
@@ -625,6 +636,13 @@ impl AppState {
             .find(|p| p.id == id)
             .ok_or(StateError::NoSuchPane(id))?;
         pane.status = status;
+
+        // An exited pane gives its place on the tab back, as a closed one
+        // does: its output stays readable from the sidebar, but it has
+        // nothing left to tile.
+        if !status.is_live() {
+            self.leave_tab(id);
+        }
         Ok(())
     }
 
@@ -658,6 +676,56 @@ impl AppState {
     #[must_use]
     pub fn is_unseen(&self, id: PaneId) -> bool {
         self.unseen.contains(&id)
+    }
+
+    /// A project's tabs, when anything keeps them.
+    #[must_use]
+    pub fn project_tabs(&self, project: ProjectId) -> Option<&ProjectTabs> {
+        self.tabs.get(&project)
+    }
+
+    /// A project's tabs, mutably, when anything keeps them.
+    pub fn project_tabs_mut(&mut self, project: ProjectId) -> Option<&mut ProjectTabs> {
+        self.tabs.get_mut(&project)
+    }
+
+    /// Replaces a project's tabs with what their owner says they are.
+    ///
+    /// Returns whether the project is known. A snapshot for one this client
+    /// has not been told about is ignored: keeping it would leave tabs behind
+    /// for a project that may never arrive.
+    pub fn set_project_tabs(&mut self, project: ProjectId, tabs: ProjectTabs) -> bool {
+        if !self.projects.iter().any(|p| p.id == project) {
+            return false;
+        }
+        self.tabs.insert(project, tabs);
+        true
+    }
+
+    /// Puts a top-level pane on one of its project's tabs, when the project
+    /// keeps tabs. Returns the tab.
+    ///
+    /// A subagent is never placed: it is tiled beside the pane that asked for
+    /// it, wherever that pane is.
+    pub fn place_pane(&mut self, id: PaneId, place: Placement) -> Option<TabId> {
+        let pane = self.pane(id)?;
+        if pane.parent.is_some() {
+            return None;
+        }
+        let project = pane.project;
+        self.tabs
+            .get_mut(&project)
+            .map(|tabs| tabs.place(id, place))
+    }
+
+    /// Takes a pane off its tab, if it is on one.
+    fn leave_tab(&mut self, id: PaneId) {
+        let Some(project) = self.pane(id).map(|pane| pane.project) else {
+            return;
+        };
+        if let Some(tabs) = self.tabs.get_mut(&project) {
+            tabs.remove(id);
+        }
     }
 
     /// Records which branch a pane is working on.
@@ -763,6 +831,7 @@ mod tests {
 
     use crate::device::Device;
     use crate::project::ProjectSource;
+    use crate::tabs::{Placement, ProjectTabs};
 
     /// State with one project selected, plus that project's id.
     fn with_project() -> (AppState, ProjectId) {
@@ -1844,5 +1913,151 @@ mod tests {
             !state.is_unseen(parent),
             "the mark is cleared even for a tombstone"
         );
+    }
+
+    /// A state with one project whose tabs are kept, and that project.
+    fn state_with_tabs() -> (AppState, ProjectId) {
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/tabs", ProjectSource::LocalDir));
+        assert!(state.set_project_tabs(project, ProjectTabs::new()));
+        (state, project)
+    }
+
+    #[test]
+    fn a_project_has_no_tabs_until_something_keeps_them() {
+        // Absence is how a client knows the project's daemon is too old to
+        // keep tabs, and so groups its panes itself.
+        let mut state = AppState::new();
+        let project = state.add_project(Project::new("/tmp/tabs", ProjectSource::LocalDir));
+        let pane = state
+            .spawn_pane(project, HarnessId::new("shell"))
+            .expect("the project exists");
+
+        assert!(state.project_tabs(project).is_none());
+        assert_eq!(state.place_pane(pane, Placement::Auto), None);
+    }
+
+    #[test]
+    fn tabs_for_a_project_not_yet_announced_are_not_kept() {
+        let mut state = AppState::new();
+        let unknown = ProjectId::new();
+
+        assert!(!state.set_project_tabs(unknown, ProjectTabs::new()));
+        assert!(state.project_tabs(unknown).is_none());
+    }
+
+    #[test]
+    fn a_top_level_pane_is_placed_on_a_tab() {
+        let (mut state, project) = state_with_tabs();
+        let pane = state
+            .spawn_pane(project, HarnessId::new("shell"))
+            .expect("the project exists");
+
+        let tab = state
+            .place_pane(pane, Placement::Auto)
+            .expect("the project keeps tabs");
+
+        assert_eq!(
+            state
+                .project_tabs(project)
+                .and_then(|tabs| tabs.tab_of(pane)),
+            Some(tab)
+        );
+    }
+
+    #[test]
+    fn a_subagent_is_never_placed() {
+        // It is tiled beside the pane that asked for it, wherever that is.
+        let (mut state, project) = state_with_tabs();
+        let parent = state
+            .spawn_pane(project, HarnessId::new("shell"))
+            .expect("the project exists");
+        let mut child = Pane::new(project, HarnessId::new("shell"));
+        child.parent = Some(parent);
+        let child = state.adopt_pane(child).expect("the project exists");
+
+        assert_eq!(state.place_pane(child, Placement::Auto), None);
+    }
+
+    #[test]
+    fn closing_a_pane_takes_it_off_its_tab() {
+        let (mut state, project) = state_with_tabs();
+        let pane = state
+            .spawn_pane(project, HarnessId::new("shell"))
+            .expect("the project exists");
+        state.place_pane(pane, Placement::Auto);
+
+        state.close_pane(pane).expect("the pane exists");
+
+        assert!(
+            state
+                .project_tabs(project)
+                .is_some_and(|tabs| tabs.tabs().is_empty())
+        );
+    }
+
+    #[test]
+    fn a_pane_that_exits_gives_its_place_back() {
+        let (mut state, project) = state_with_tabs();
+        let pane = state
+            .spawn_pane(project, HarnessId::new("shell"))
+            .expect("the project exists");
+        state.place_pane(pane, Placement::Auto);
+
+        state
+            .set_pane_status(pane, PaneStatus::Exited(0))
+            .expect("the pane exists");
+
+        assert!(
+            state
+                .project_tabs(project)
+                .is_some_and(|tabs| tabs.tabs().is_empty())
+        );
+    }
+
+    #[test]
+    fn working_or_waiting_keeps_a_pane_on_its_tab() {
+        let (mut state, project) = state_with_tabs();
+        let pane = state
+            .spawn_pane(project, HarnessId::new("shell"))
+            .expect("the project exists");
+        let tab = state.place_pane(pane, Placement::Auto);
+
+        for status in [PaneStatus::Running, PaneStatus::Idle, PaneStatus::Blocked] {
+            state
+                .set_pane_status(pane, status)
+                .expect("the pane exists");
+        }
+
+        assert_eq!(
+            state
+                .project_tabs(project)
+                .and_then(|tabs| tabs.tab_of(pane)),
+            tab
+        );
+    }
+
+    #[test]
+    fn forgetting_a_project_forgets_its_tabs() {
+        let (mut state, project) = state_with_tabs();
+
+        state
+            .remove_project(project)
+            .expect("the project has no panes");
+
+        assert!(state.project_tabs(project).is_none());
+    }
+
+    #[test]
+    fn forgetting_a_machines_projects_forgets_their_tabs() {
+        let mut state = AppState::new();
+        let device = state.add_device(Device::new("other"));
+        let project = state
+            .add_project(Project::new("/tmp/tabs", ProjectSource::LocalDir).with_device(device));
+        state.set_project_tabs(project, ProjectTabs::new());
+
+        state.forget_device_projects(device);
+
+        assert!(state.project_tabs(project).is_none());
     }
 }
