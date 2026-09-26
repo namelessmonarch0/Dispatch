@@ -44,7 +44,8 @@ use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 /// way a label rather than a heading is.
 const APP_NAME: &str = "D I S P A T C H";
 
-/// How many columns of a pane's title a tab shows.
+/// How many columns of a tab's name it shows: the one it was given, else its
+/// first pane's title.
 const TAB_TITLE: usize = 16;
 
 /// What a tab command says on a project whose daemon keeps no tabs.
@@ -2272,7 +2273,10 @@ impl App {
         }
 
         // The tab row is not part of input routing either: a click on it is
-        // resolved against what was drawn there last frame.
+        // resolved against what was drawn there last frame. Reversed, so an
+        // overlap (there should be none, but a narrow row leaves little
+        // room for error) favours whatever was drawn last, which is what is
+        // actually on top.
         if let Event::Mouse(mouse) = event
             && matches!(mouse.kind, MouseEventKind::Down(_))
             && self.tab_row.height > 0
@@ -2280,6 +2284,7 @@ impl App {
             && let Some(hit) = self
                 .tab_hits
                 .iter()
+                .rev()
                 .find(|(x, width, _)| mouse.column >= *x && mouse.column < x.saturating_add(*width))
                 .map(|(_, _, hit)| *hit)
         {
@@ -4313,16 +4318,64 @@ impl App {
             })
             .collect();
         let shown = tabs::visible_range(&widths, current, area.width);
+        let right = area.x.saturating_add(area.width);
+
+        // The width the tabs and marks would take if drawn in full: the same
+        // tally `visible_range` reserves room against, so it says whether the
+        // `+` can simply follow them or has to be pinned instead. This can
+        // still exceed the row: `visible_range` keeps a tab too wide to fit
+        // alone on screen anyway, cut off at the edge.
+        let drawn_indices: Vec<usize> = shown.clone().filter(|&index| widths[index] > 0).collect();
+        let labels_width: u32 = drawn_indices
+            .iter()
+            .map(|&index| u32::from(widths[index]))
+            .sum();
+        let gaps = u32::try_from(drawn_indices.len().saturating_sub(1)).unwrap_or(u32::MAX);
+        let before_mark = shown.start > 0;
+        let after_mark = shown.end < views.len();
+        let marks = u32::from(tabs::MARK) * (u32::from(before_mark) + u32::from(after_mark));
+        let content_width = u16::try_from(labels_width.saturating_add(gaps).saturating_add(marks))
+            .unwrap_or(u16::MAX);
+        let content_end = area.x.saturating_add(content_width);
+
+        let have_plus = area.width >= tabs::PLUS;
+        let natural_plus_x = content_end.saturating_add(u16::from(content_width > 0));
+        // Pinned once the tabs and marks would not leave room for ` + ` and
+        // its own gap after them; otherwise it follows the last one drawn.
+        let pin = have_plus && natural_plus_x.saturating_add(tabs::PLUS) > right;
+        let plus_x = have_plus.then(|| {
+            if pin {
+                right.saturating_sub(tabs::PLUS)
+            } else {
+                natural_plus_x
+            }
+        });
+
+        // Where the tabs and marks may be drawn: the whole row ordinarily,
+        // but ending a gap before a pinned `+` so it can never overwrite
+        // them. When there is more to scroll to, a forced `›` — rather than
+        // wherever the tabs' own would naturally fall — claims the last two
+        // of those columns, so the clipped end still says so.
+        let content_limit = if pin {
+            plus_x.unwrap_or(right).saturating_sub(1).max(area.x)
+        } else {
+            right
+        };
+        let forced_next = pin && after_mark;
+        let inline_next = after_mark && !pin;
+        let tail_reserve = if forced_next { tabs::MARK } else { 0 };
+        let body_limit = content_limit.saturating_sub(tail_reserve).max(area.x);
 
         let faded = Style::default().fg(self.theme.faded);
         let mut spans: Vec<Span<'static>> = Vec::new();
         let mut column = area.x;
         // Where each tab sits in the row, for the sliding tint.
         let mut extents: Vec<Option<(u16, u16)>> = vec![None; views.len()];
+        let mut hits: Vec<(u16, u16, TabHit)> = Vec::new();
 
-        if shown.start > 0 {
+        if before_mark && column < body_limit {
             spans.push(Span::styled("‹ ", faded));
-            self.tab_hits.push((column, 1, TabHit::Previous));
+            hits.push((column, 1, TabHit::Previous));
             column = column.saturating_add(tabs::MARK);
         }
         let mut drawn_any = false;
@@ -4330,39 +4383,60 @@ impl App {
             if widths[index] == 0 {
                 continue;
             }
+            if column >= body_limit {
+                break;
+            }
             // The gap between two tabs belongs to neither.
+            let gap = u16::from(drawn_any);
+            if column.saturating_add(gap) >= body_limit {
+                break;
+            }
             if drawn_any {
                 spans.push(Span::raw(" "));
                 column = column.saturating_add(1);
             }
             drawn_any = true;
-            extents[index] = Some((column, widths[index]));
-            self.tab_hits
-                .push((column, widths[index], TabHit::Tab(index)));
+            // A tab cut off by the edge — the row scrolled, or this is the
+            // one tab too wide to fit alone — keeps a hit only for the
+            // columns actually drawn; `Paragraph` clips the rest on its own.
+            let visible = widths[index].min(body_limit.saturating_sub(column));
+            extents[index] = Some((column, visible));
+            hits.push((column, visible, TabHit::Tab(index)));
             spans.extend(labels[index].iter().cloned());
-            column = column.saturating_add(widths[index]);
+            column = column.saturating_add(widths[index]).min(body_limit);
         }
-        if shown.end < views.len() {
+        if inline_next && column < body_limit {
             spans.push(Span::styled(" ›", faded));
-            self.tab_hits
-                .push((column.saturating_add(1), 1, TabHit::Next));
-            column = column.saturating_add(tabs::MARK);
+            hits.push((column.saturating_add(1), 1, TabHit::Next));
         }
-        Paragraph::new(Line::from(spans)).render(area, frame.buffer_mut());
 
-        // Straight after the tabs while they all fit; pinned to the right edge
-        // once the row scrolls, so it is always in the same place to reach for.
-        let right = area.x.saturating_add(area.width);
-        let plus_x = if shown.start == 0 && shown.end == views.len() {
-            column.saturating_add(u16::from(drawn_any))
-        } else {
-            right.saturating_sub(tabs::PLUS)
-        };
-        if plus_x < right {
-            let plus = Rect::new(plus_x, area.y, tabs::PLUS.min(right - plus_x), 1);
-            Paragraph::new(Span::styled(" + ", faded)).render(plus, frame.buffer_mut());
-            self.tab_hits.push((plus_x, plus.width, TabHit::New));
+        if body_limit > area.x {
+            Paragraph::new(Line::from(spans)).render(
+                Rect::new(area.x, area.y, body_limit - area.x, 1),
+                frame.buffer_mut(),
+            );
         }
+
+        if forced_next {
+            let width = content_limit.saturating_sub(body_limit).min(tabs::MARK);
+            if width > 0 {
+                let (mark, glyph_at) = if width >= tabs::MARK {
+                    (" ›", body_limit.saturating_add(1))
+                } else {
+                    ("›", body_limit)
+                };
+                Paragraph::new(Span::styled(mark, faded))
+                    .render(Rect::new(body_limit, area.y, width, 1), frame.buffer_mut());
+                hits.push((glyph_at, 1, TabHit::Next));
+            }
+        }
+
+        if let Some(plus_x) = plus_x {
+            Paragraph::new(Span::styled(" + ", faded))
+                .render(Rect::new(plus_x, area.y, tabs::PLUS, 1), frame.buffer_mut());
+            hits.push((plus_x, tabs::PLUS, TabHit::New));
+        }
+        self.tab_hits = hits;
 
         if let Some(t) = self.animations.value(Target::Tab, now) {
             let (from_x, from_w) = extents
@@ -7420,6 +7494,7 @@ mod tests {
             over_panes.contains(" refactor "),
             "a lone tab is still drawn, named for its pane, with no number: {top:?}"
         );
+        assert!(!over_panes.contains("1 refactor"), "{top:?}");
     }
 
     #[test]
@@ -10080,5 +10155,94 @@ mod tests {
         key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         drawn(&mut app, &mut terminal);
         assert!(bottom_row(&terminal).starts_with(TAB_MODE_HELP));
+    }
+
+    #[test]
+    fn the_plus_and_the_scroll_marks_stay_clickable_on_a_narrow_row() {
+        // Sixteen-column names leave no room for even one to fit beside the
+        // marks and the `+`: the row pins the `+` to the edge and clips the
+        // current tab, exactly the width the reviewer's probe found broken.
+        let (mut app, project, daemon, sent) = attached_app_with_shell();
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        app.rename(panes[0], "alphabetalphabet");
+        app.rename(panes[1], "betabetabetabeta");
+        app.rename(panes[2], "gammagammagammag");
+        let tabs = send_tabs(
+            &mut app,
+            &daemon,
+            project,
+            &[&panes[..1], &panes[1..2], &panes[2..]],
+        );
+        app.focus_pane(panes[1]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(56, 30))
+            .expect("a test backend can be created");
+
+        drawn(&mut app, &mut terminal);
+        let row = top_row(&terminal);
+        assert!(row.contains('‹'), "{row:?}");
+        assert!(
+            row.contains('›'),
+            "the clipped end still says there is more: {row:?}"
+        );
+        assert!(row.contains(" + "), "{row:?}");
+
+        let plus = cell_of(&row, " + ") + 1;
+        click(&mut app, plus, 0);
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            placed(&sent),
+            Some(Placement::NewAfter { tab: Some(tabs[1]) }),
+            "the click on `+` landed on `+`, not on a tab or `›` beneath it"
+        );
+    }
+
+    #[test]
+    fn a_row_too_narrow_for_the_plus_draws_none_and_leaves_the_sidebar_alone() {
+        let (mut app, project, daemon, _sent) = attached_app_with_shell();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        send_tabs(&mut app, &daemon, project, &[&panes]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(35, 30))
+            .expect("a test backend can be created");
+
+        drawn(&mut app, &mut terminal);
+        let row = top_row(&terminal);
+        assert!(
+            !row.contains('+'),
+            "no room for it, so none is drawn: {row:?}"
+        );
+
+        // The column the old, unclamped `+` used to spill onto: still the
+        // sidebar's own, so a click there is the sidebar's to answer.
+        click(&mut app, sidebar::WIDTH - 1, 0);
+
+        assert!(
+            app.overlay.is_none(),
+            "too narrow for a `+` to open a picker from"
+        );
+    }
+
+    #[test]
+    fn clicking_the_scroll_marks_moves_between_tabs() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 10);
+        for (index, pane) in panes.iter().enumerate() {
+            app.rename(*pane, &format!("tab-number-{index:02}"));
+        }
+        let groups: Vec<&[PaneId]> = panes.chunks(1).collect();
+        send_tabs(&mut app, &daemon, project, &groups);
+        app.focus_pane(panes[5]);
+        let mut terminal = a_terminal();
+        drawn(&mut app, &mut terminal);
+
+        let row = top_row(&terminal);
+        click(&mut app, cell_of(&row, "‹"), 0);
+        assert_eq!(app.current_tab(), 4, "clicking ‹ shows the previous tab");
+
+        app.focus_pane(panes[5]);
+        drawn(&mut app, &mut terminal);
+        let row = top_row(&terminal);
+        click(&mut app, cell_of(&row, "›"), 0);
+        assert_eq!(app.current_tab(), 6, "clicking › shows the next tab");
     }
 }
