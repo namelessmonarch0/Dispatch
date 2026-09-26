@@ -79,12 +79,16 @@ pub struct Tab {
 pub struct ProjectTabs { tabs: Vec<Tab> }
 
 pub enum Placement {
-    /// No preference: the last tab with room, else a new tab at the end.
+    /// No preference: the last tab if it has room, else a new tab at the
+    /// end. It never back-fills an earlier tab, so it groups panes the way
+    /// an older client's four-at-a-time chunking does.
     Auto,
     /// Into this tab; if it is full, a new tab straight after it.
-    Into(TabId),
+    Into { tab: TabId },
     /// A new tab straight after this one (at the end when `None`).
-    NewAfter(Option<TabId>),
+    NewAfter { tab: Option<TabId> },
+    /// A placement from a newer peer; treated as `Auto`.
+    Unknown,
 }
 ```
 
@@ -135,9 +139,9 @@ Client to daemon:
 
 Daemon to client:
 
-- `Tabs { project, tabs: Vec<TabInfo> }`, where
-  `TabInfo { id, name: Option<String>, panes: Vec<PaneId> }`. It goes to
-  every subscriber after any change to that project's tabs.
+- `Tabs { project, tabs: Vec<Tab> }`, where `Tab { id, name, panes }` is
+  the model's own type. It goes to every subscriber after any change to
+  that project's tabs.
 
 The subscribe replay sends one `Tabs` for **every** open project, even an
 empty one, after that project's `PaneSpawned` messages. The panes a
@@ -146,8 +150,11 @@ snapshot names are therefore always already known.
 A refused operation gets `Error { error: ProtocolError::Other(text) }`, or
 `NoSuchPane`. The client shows it in the status row.
 
-`Placement`, `TabInfo` and `TabId` live in `dispatch-core` and derive
-`Serialize`/`Deserialize`, like `PaneId` and `PaneStatus`.
+`Placement`, `Tab` and `TabId` live in `dispatch-core` and derive
+`Serialize`/`Deserialize`, like `PaneId` and `PaneStatus`. `Placement` is
+tagged like the protocol's other nested enums, with `#[serde(other)]` on
+`Unknown`, so a newer peer's placement cannot fail an older daemon's
+frame.
 
 ## Who owns a project's tabs
 
