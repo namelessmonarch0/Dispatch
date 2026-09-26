@@ -246,7 +246,10 @@ impl ProjectTabs {
             .ok_or(TabError::NoSuchTab)?;
 
         let visible: String = name.chars().filter(|c| !c.is_control()).collect();
-        let kept: String = visible.trim().chars().take(NAME_LIMIT).collect();
+        let capped: String = visible.trim().chars().take(NAME_LIMIT).collect();
+        // Trimmed again: the cap can land just past a space, and a name is
+        // stored with none around it.
+        let kept = capped.trim_end().to_string();
         tab.name = (!kept.is_empty()).then_some(kept);
         Ok(())
     }

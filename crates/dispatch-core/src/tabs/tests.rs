@@ -274,6 +274,21 @@ fn a_name_is_cleaned_trimmed_and_capped() {
 }
 
 #[test]
+fn a_name_cut_at_a_space_keeps_no_trailing_space() {
+    let ids = panes(1);
+    let mut tabs = tabs_of(&[&ids[..]]);
+    let tab = tabs.tabs()[0].id;
+    let long = format!("{} yyy", "x".repeat(NAME_LIMIT - 1));
+
+    tabs.rename(tab, &long).expect("the tab exists");
+
+    assert_eq!(
+        tabs.tabs()[0].name.as_deref(),
+        Some("x".repeat(NAME_LIMIT - 1).as_str())
+    );
+}
+
+#[test]
 fn an_empty_name_goes_back_to_the_automatic_one() {
     let ids = panes(1);
     let mut tabs = tabs_of(&[&ids[..]]);
