@@ -9,6 +9,7 @@ pub mod host;
 pub mod ipc;
 pub mod paths;
 pub mod process;
+pub mod shell;
 pub mod signal;
 pub mod tty;
 
