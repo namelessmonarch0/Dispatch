@@ -124,5 +124,66 @@ pub fn name(state: &AppState, view: &TabView) -> String {
         .unwrap_or_default()
 }
 
+/// Columns a `‹` or `›` takes, with the blank beside it.
+pub const MARK: u16 = 2;
+
+/// Columns ` + ` takes.
+pub const PLUS: u16 = 3;
+
+/// What a click on the tab row lands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabHit {
+    /// The tab at this position.
+    Tab(usize),
+    /// The `+`, which opens a new tab.
+    New,
+    /// The `‹` before the first tab drawn.
+    Previous,
+    /// The `›` after the last tab drawn.
+    Next,
+}
+
+/// Which tabs to draw in `width` columns so the current one is in view.
+///
+/// `widths` are the tabs' label widths; one blank separates two tabs. Room is
+/// kept for ` + ` and the blank before it, for `‹` when the range does not
+/// start at the first tab, and for `›` when it does not reach the last.
+/// Starts from the first tab while the current one fits that way, so the row
+/// only scrolls once it has to. A current tab too wide to fit alone is still
+/// the one shown, cut off at the edge.
+pub fn visible_range(widths: &[u16], current: usize, width: u16) -> std::ops::Range<usize> {
+    let count = widths.len();
+    if count == 0 {
+        return 0..0;
+    }
+    let current = current.min(count - 1);
+    let room = u32::from(width.saturating_sub(PLUS + 1));
+
+    let fits = |start: usize, end: usize| {
+        let labels: u32 = widths[start..end].iter().map(|w| u32::from(*w)).sum();
+        let gaps = u32::try_from((end - start).saturating_sub(1)).unwrap_or(u32::MAX);
+        let marks = u32::from(MARK) * (u32::from(start > 0) + u32::from(end < count));
+        labels.saturating_add(gaps).saturating_add(marks) <= room
+    };
+
+    let mut end = 0;
+    while end < count && fits(0, end + 1) {
+        end += 1;
+    }
+    if current < end {
+        return 0..end;
+    }
+
+    let mut start = current;
+    while start > 0 && fits(start - 1, current + 1) {
+        start -= 1;
+    }
+    let mut end = current + 1;
+    while end < count && fits(start, end + 1) {
+        end += 1;
+    }
+    start..end
+}
+
 #[cfg(test)]
 mod tests;

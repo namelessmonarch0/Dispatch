@@ -128,3 +128,30 @@ fn a_tab_is_called_by_its_name_or_else_its_first_panes_title() {
     view.name = Some("work".into());
     assert_eq!(name(&state, &view), "work");
 }
+
+#[test]
+fn every_tab_is_shown_when_they_all_fit() {
+    assert_eq!(visible_range(&[10, 10, 10], 1, 80), 0..3);
+}
+
+#[test]
+fn the_row_starts_at_the_first_tab_while_the_current_one_fits_that_way() {
+    // 60 columns: 4 go to ` + ` and its gap, 2 to `›`. Two 20-column tabs
+    // and their gap fit; a third does not.
+    assert_eq!(visible_range(&[20; 6], 1, 60), 0..2);
+}
+
+#[test]
+fn the_row_scrolls_to_keep_the_current_tab_in_view() {
+    assert_eq!(visible_range(&[20; 6], 5, 60), 4..6);
+}
+
+#[test]
+fn a_tab_too_wide_to_fit_alone_is_still_the_one_shown() {
+    assert_eq!(visible_range(&[100, 10], 0, 40), 0..1);
+}
+
+#[test]
+fn no_tabs_shows_nothing() {
+    assert_eq!(visible_range(&[], 0, 80), 0..0);
+}

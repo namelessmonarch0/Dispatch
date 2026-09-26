@@ -22,18 +22,14 @@ use dispatch_pty::{
 use crate::add_machine::{self, AddMachine, Checked, Step};
 use crate::approval::Approval;
 use crate::backend::{Backend, RemotePane};
-use crate::tabs::{self, TabView};
+use crate::tabs::{self, TabHit, TabView};
 use dispatch_config::machines::{self, Machine};
 use dispatch_tui::activity::{Tracker, Verdict};
 use dispatch_tui::browser::Browser;
 use dispatch_tui::input::{
-    Action, Direction, Event, InputRouter, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    Action, Direction, Event, InputRouter, KeyCode, KeyEvent, KeyEventKind, KeyMode, KeyModifiers,
     MouseEventKind,
 };
-// Only the tests read a `KeyMode` back; the status row that shows one to the
-// user is Task 11's.
-#[cfg(test)]
-use dispatch_tui::input::KeyMode;
 use dispatch_tui::motion::{Animations, SPIN_FRAME, TWEEN_FRAME};
 use dispatch_tui::theme::Role;
 use dispatch_tui::{Item, PaneWidget, Picker, Prompt, Sidebar, Theme, sidebar, truncate};
@@ -53,6 +49,11 @@ const TAB_TITLE: usize = 16;
 
 /// What a tab command says on a project whose daemon keeps no tabs.
 const NEEDS_UPGRADE: &str = "this machine's Dispatch needs upgrading for tabs";
+
+/// The status row while tab mode is on: every key it takes, since nothing
+/// else on screen says what they are.
+const TAB_MODE_HELP: &str =
+    "TAB  n new  r rename  x close  ←→ switch  [ ] move pane  i o move tab  1-9 go  Esc done";
 
 /// The border drawn around one pane, in `colour`, its title bold when
 /// `focused`.
@@ -640,6 +641,10 @@ pub struct App {
     /// going back to the tab the user came from.
     tab_shown: Option<TabId>,
     tab_back: Option<TabId>,
+    /// Where the tab row was drawn last frame, and what each stretch of it
+    /// is, for a click to be matched against.
+    tab_row: Rect,
+    tab_hits: Vec<(u16, u16, TabHit)>,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -709,6 +714,8 @@ impl App {
             tab_focus: HashMap::new(),
             tab_shown: None,
             tab_back: None,
+            tab_row: Rect::default(),
+            tab_hits: Vec::new(),
         }
     }
 
@@ -2262,6 +2269,27 @@ impl App {
         // and approval keys decide rather than either reaching an agent.
         if self.overlay.is_some() {
             return self.handle_overlay(event, area);
+        }
+
+        // The tab row is not part of input routing either: a click on it is
+        // resolved against what was drawn there last frame.
+        if let Event::Mouse(mouse) = event
+            && matches!(mouse.kind, MouseEventKind::Down(_))
+            && self.tab_row.height > 0
+            && mouse.row == self.tab_row.y
+            && let Some(hit) = self
+                .tab_hits
+                .iter()
+                .find(|(x, width, _)| mouse.column >= *x && mouse.column < x.saturating_add(*width))
+                .map(|(_, _, hit)| *hit)
+        {
+            match hit {
+                TabHit::Tab(index) => self.select_tab(index),
+                TabHit::New => self.open_new_tab_picker(),
+                TabHit::Previous => self.select_previous_tab(),
+                TabHit::Next => self.select_tab(self.current_tab() + 1),
+            }
+            return Ok(());
         }
 
         // The sidebar is not otherwise part of input routing — `layout` below
@@ -4218,86 +4246,139 @@ impl App {
 
     /// Draws the row of tabs above the grid.
     ///
-    /// Each is its number and its first pane's title. The one on screen sits
-    /// on a tint rather than being inverted: it should read as the one you
-    /// are in, not as a warning.
-    fn draw_tabs(&self, frame: &mut Frame<'_>, area: Rect, now: Instant) {
-        if area.height == 0 {
+    /// Each is its rollup glyph and its name: the one it was given, else its
+    /// first pane's title. No number: a digit still picks one by position, and
+    /// the status row says which position is on screen. The one on screen
+    /// sits on a tint rather than being inverted: it should read as the one
+    /// you are in, not as a warning.
+    fn draw_tabs(&mut self, frame: &mut Frame<'_>, area: Rect, now: Instant) {
+        self.tab_hits.clear();
+        self.tab_row = area;
+        if area.height == 0 || area.width == 0 {
             return;
         }
 
-        let current = self.current_tab();
         let views = self.tab_views();
+        let current = self.current_tab();
         let sliding = self.animations.value(Target::Tab, now).is_some();
-        let mut spans = Vec::new();
-        // Where each tab sits in the row, for the sliding tint.
-        let mut extents: Vec<(u16, u16)> = Vec::new();
-        let mut column = area.x;
+        let spinner = self.spinner_frame();
 
-        for (index, view) in views.iter().enumerate() {
-            let title = view
-                .panes
-                .first()
-                .and_then(|id| self.state.pane(*id))
-                .map(|pane| truncate(&pane.title, TAB_TITLE));
-
-            let label = match title {
-                Some(title) => format!(" {} {title} ", index + 1),
-                None => format!(" {} ", index + 1),
-            };
-            // `tab` is mixed from the palette, the fallback's dark one when
-            // the terminal did not answer, so the text on it comes from the
-            // palette too rather than being the terminal's own. While the
-            // tint slides it is laid on afterwards, across whichever columns
-            // it has reached, so the tab itself leaves it off.
-            let style = if index == current {
-                let style = Style::default()
-                    .fg(self.theme.text)
-                    .add_modifier(Modifier::BOLD);
-                if sliding {
-                    style
-                } else {
-                    style.bg(self.theme.tab)
+        // A project with nothing to tile has a tab to be on but nothing to
+        // call it: it draws no label, only the `+`.
+        let labels: Vec<Vec<Span<'static>>> = views
+            .iter()
+            .enumerate()
+            .map(|(index, view)| {
+                if view.panes.is_empty() {
+                    return Vec::new();
                 }
-            } else {
-                Style::default().fg(self.theme.faded)
-            };
+                // `tab` is mixed from the palette, the fallback's dark one
+                // when the terminal did not answer, so the text on it comes
+                // from the palette too. While the tint slides it is laid on
+                // afterwards, across whichever columns it has reached.
+                let style = if index == current {
+                    let style = Style::default()
+                        .fg(self.theme.text)
+                        .add_modifier(Modifier::BOLD);
+                    if sliding {
+                        style
+                    } else {
+                        style.bg(self.theme.tab)
+                    }
+                } else {
+                    Style::default().fg(self.theme.faded)
+                };
 
-            let rollup = sidebar::Rollup::of(
-                &self.state,
-                view.panes.iter().filter_map(|id| self.state.pane(*id)),
-            );
+                let mut spans = Vec::new();
+                if let Some(rollup) = sidebar::Rollup::of(
+                    &self.state,
+                    view.panes.iter().filter_map(|id| self.state.pane(*id)),
+                ) {
+                    let (glyph, glyph_style) = rollup.glyph(spinner, &self.theme);
+                    spans.push(Span::styled(" ", style));
+                    spans.push(Span::styled(glyph, style.patch(glyph_style)));
+                }
+                let name = truncate(&tabs::name(&self.state, view), TAB_TITLE);
+                spans.push(Span::styled(format!(" {name} "), style));
+                spans
+            })
+            .collect();
+        let widths: Vec<u16> = labels
+            .iter()
+            .map(|spans| {
+                spans
+                    .iter()
+                    .map(|span| u16::try_from(span.width()).unwrap_or(u16::MAX))
+                    .sum()
+            })
+            .collect();
+        let shown = tabs::visible_range(&widths, current, area.width);
 
+        let faded = Style::default().fg(self.theme.faded);
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut column = area.x;
+        // Where each tab sits in the row, for the sliding tint.
+        let mut extents: Vec<Option<(u16, u16)>> = vec![None; views.len()];
+
+        if shown.start > 0 {
+            spans.push(Span::styled("‹ ", faded));
+            self.tab_hits.push((column, 1, TabHit::Previous));
+            column = column.saturating_add(tabs::MARK);
+        }
+        let mut drawn_any = false;
+        for index in shown.clone() {
+            if widths[index] == 0 {
+                continue;
+            }
             // The gap between two tabs belongs to neither.
-            if index > 0 {
+            if drawn_any {
                 spans.push(Span::raw(" "));
                 column = column.saturating_add(1);
             }
-            let first = spans.len();
-            if let Some(rollup) = rollup {
-                let (glyph, glyph_style) = rollup.glyph(self.spinner_frame(), &self.theme);
-                spans.push(Span::styled(" ", style));
-                spans.push(Span::styled(glyph, style.patch(glyph_style)));
-            }
-            spans.push(Span::styled(label, style));
-
-            let width: u16 = spans[first..]
-                .iter()
-                .map(|span| u16::try_from(span.width()).unwrap_or(u16::MAX))
-                .sum();
-            extents.push((column, width));
-            column = column.saturating_add(width);
+            drawn_any = true;
+            extents[index] = Some((column, widths[index]));
+            self.tab_hits
+                .push((column, widths[index], TabHit::Tab(index)));
+            spans.extend(labels[index].iter().cloned());
+            column = column.saturating_add(widths[index]);
         }
-
+        if shown.end < views.len() {
+            spans.push(Span::styled(" ›", faded));
+            self.tab_hits
+                .push((column.saturating_add(1), 1, TabHit::Next));
+            column = column.saturating_add(tabs::MARK);
+        }
         Paragraph::new(Line::from(spans)).render(area, frame.buffer_mut());
 
+        // Straight after the tabs while they all fit; pinned to the right edge
+        // once the row scrolls, so it is always in the same place to reach for.
+        let right = area.x.saturating_add(area.width);
+        let plus_x = if shown.start == 0 && shown.end == views.len() {
+            column.saturating_add(u16::from(drawn_any))
+        } else {
+            right.saturating_sub(tabs::PLUS)
+        };
+        if plus_x < right {
+            let plus = Rect::new(plus_x, area.y, tabs::PLUS.min(right - plus_x), 1);
+            Paragraph::new(Span::styled(" + ", faded)).render(plus, frame.buffer_mut());
+            self.tab_hits.push((plus_x, plus.width, TabHit::New));
+        }
+
         if let Some(t) = self.animations.value(Target::Tab, now) {
-            let (from_x, from_w) = extents.get(self.tab_from).copied().unwrap_or((area.x, 0));
-            let (to_x, to_w) = extents.get(current).copied().unwrap_or((area.x, 0));
+            let (from_x, from_w) = extents
+                .get(self.tab_from)
+                .copied()
+                .flatten()
+                .unwrap_or((area.x, 0));
+            let (to_x, to_w) = extents
+                .get(current)
+                .copied()
+                .flatten()
+                .unwrap_or((area.x, 0));
             let lerp =
                 |a: u16, b: u16| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u16;
             let (x, width) = (lerp(from_x, to_x), lerp(from_w, to_w));
-            for column in x..x.saturating_add(width).min(area.x + area.width) {
+            for column in x..x.saturating_add(width).min(right) {
                 if let Some(cell) = frame.buffer_mut().cell_mut((column, area.y)) {
                     cell.set_bg(self.theme.tab);
                 }
@@ -4360,6 +4441,9 @@ impl App {
             // A prefix that armed invisibly is how a keystroke goes missing
             // with no explanation.
             "PREFIX".to_string()
+        } else if self.router.key_mode() == KeyMode::Tabs {
+            // The same goes for a mode, and it has keys of its own to spell out.
+            TAB_MODE_HELP.to_string()
         } else {
             let (lead, help) = if !unreachable.is_empty() {
                 // Ahead of `self.status`, which may still hold whatever was
@@ -4375,11 +4459,7 @@ impl App {
             } else {
                 let panes = self.state.visible_panes().len();
                 let tabs = if self.tab_count() > 1 {
-                    format!(
-                        "  tab {}/{}  ^a 1-9",
-                        self.current_tab() + 1,
-                        self.tab_count()
-                    )
+                    format!("  tab {}/{}", self.current_tab() + 1, self.tab_count())
                 } else {
                     String::new()
                 };
@@ -4389,7 +4469,7 @@ impl App {
                     .device()
                     .map_or_else(String::new, |device| format!("  {device}"));
                 let help = format!(
-                    "{panes} pane(s){where_}{tabs}  ^a n new  ^a x close  ^a z zoom  ^a s child  ^a c collapse  ^a q quit"
+                    "{panes} pane(s){where_}{tabs}  ^a n new  Ctrl t tabs  ^a x close  ^a z zoom  ^a s child  ^a c collapse  ^a q quit"
                 );
                 (None, Some(help))
             };
@@ -4409,7 +4489,7 @@ impl App {
 
         // On `tab`, like the active tab, and in the same text colour for the
         // same reason.
-        let style = if self.router.is_armed() {
+        let style = if self.router.is_armed() || self.router.key_mode() == KeyMode::Tabs {
             Style::default()
                 .bg(self.theme.tab)
                 .fg(self.theme.text)
@@ -6537,6 +6617,10 @@ mod tests {
     fn a_tab_is_prefixed_with_its_most_urgent_state() {
         let (mut app, project, daemon, _sent) = attached_app();
         let panes = spawn_several(&mut app, &daemon, project, 5);
+        // The row carries no numbers now, so the two tabs need names of their
+        // own to tell which one the glyph sits on.
+        app.rename(panes[0], "alpha");
+        app.rename(panes[4], "beta");
         app.state
             .set_pane_status(panes[1], PaneStatus::Blocked)
             .expect("exists");
@@ -6555,10 +6639,13 @@ mod tests {
             .skip(sidebar::WIDTH as usize)
             .collect();
 
-        assert!(top.contains(&format!("{} 1 ", sidebar::BLOCKED)), "{top:?}");
         assert!(
-            !top.contains(&format!("{} 2 ", sidebar::BLOCKED)),
-            "tab 2 has nothing blocked: {top:?}"
+            top.contains(&format!("{} alpha", sidebar::BLOCKED)),
+            "{top:?}"
+        );
+        assert!(
+            !top.contains(&format!("{} beta", sidebar::BLOCKED)),
+            "the other tab has nothing blocked: {top:?}"
         );
     }
 
@@ -7330,8 +7417,8 @@ mod tests {
 
         assert_eq!(over_sidebar.trim(), APP_NAME, "{top:?}");
         assert!(
-            over_panes.contains("1 refactor"),
-            "a lone tab is still drawn, named for its pane: {top:?}"
+            over_panes.contains(" refactor "),
+            "a lone tab is still drawn, named for its pane, with no number: {top:?}"
         );
     }
 
@@ -7361,16 +7448,16 @@ mod tests {
             .filter_map(|x| buf.cell((x, 0)))
             .collect();
 
-        let number = top
+        // No number ahead of it now: the title starts right after the tab's
+        // single leading blank.
+        let title = top
             .iter()
-            .position(|cell| cell.symbol() == "1")
+            .position(|cell| cell.symbol() != " ")
             .expect("the tab is drawn");
         let cut = top
             .iter()
             .position(|cell| cell.symbol() == "…")
             .expect("the title is cut, and says so");
-        // The title starts a blank after the tab's number.
-        let title = number + 2;
         assert!(
             cut + 1 - title <= TAB_TITLE,
             "the title takes {} columns",
@@ -7384,29 +7471,33 @@ mod tests {
         // The tint at rest, rather than a first frame sliding it over from
         // the first tab.
         app.set_motion(false);
-        spawn_several(&mut app, &daemon, project, 5);
+        let panes = spawn_several(&mut app, &daemon, project, 5);
+        // The row carries no numbers now, so the two tabs need names of
+        // their own to tell which is which.
+        app.rename(panes[0], "alpha");
+        app.rename(panes[4], "beta");
 
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
             .expect("a test backend can be created");
         terminal
             .draw(|frame| app.draw(frame))
             .expect("the frame is drawn");
+        let text = rendered_text(&terminal);
+        let row = text.lines().next().expect("a row");
         let buf = terminal.backend().buffer();
         let theme = Theme::fallback();
 
-        let top: Vec<&ratatui::buffer::Cell> = (sidebar::WIDTH..buf.area.width)
-            .filter_map(|x| buf.cell((x, 0)))
-            .collect();
-        let active = top
-            .iter()
-            .find(|cell| cell.symbol() == "2")
+        let active = buf
+            .cell((cell_of(row, "beta"), 0))
             .expect("the focused pane's tab is drawn");
-        let inactive = top
-            .iter()
-            .find(|cell| cell.symbol() == "1")
+        let inactive = buf
+            .cell((cell_of(row, "alpha"), 0))
             .expect("the other tab is drawn");
 
-        assert_eq!(active.bg, theme.tab, "the fifth pane is focused, on tab 2");
+        assert_eq!(
+            active.bg, theme.tab,
+            "the fifth pane is focused, on the beta tab"
+        );
         assert_eq!(
             active.fg, theme.text,
             "in the palette's text: the terminal's own may be a light \
@@ -9821,5 +9912,173 @@ mod tests {
 
         app.focus_or_tab(Direction::Left);
         assert_eq!(app.state.focused_pane(), Some(panes[0]));
+    }
+
+    /// Row 0 of what was drawn: the name and the tab row.
+    fn top_row(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        rendered_text(terminal)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The last row of what was drawn: the status row.
+    fn bottom_row(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        rendered_text(terminal)
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The screen column `needle` starts at in `row`, counted in cells.
+    fn cell_of(row: &str, needle: &str) -> u16 {
+        u16::try_from(column_of(row, needle)).expect("the row is narrow")
+    }
+
+    #[test]
+    fn a_tab_is_labelled_by_its_first_panes_title_with_no_number() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        app.rename(panes[0], "alpha");
+        app.rename(panes[1], "beta");
+        send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        let mut terminal = a_terminal();
+
+        drawn(&mut app, &mut terminal);
+
+        let row = top_row(&terminal);
+        assert!(row.contains(" alpha ") && row.contains(" beta "), "{row:?}");
+        assert!(
+            !row.contains("1 alpha") && !row.contains("2 beta"),
+            "{row:?}"
+        );
+    }
+
+    #[test]
+    fn a_name_given_to_a_tab_replaces_its_panes_title() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        app.rename(panes[0], "alpha");
+        daemon
+            .send(ServerMessage::Tabs {
+                project,
+                tabs: vec![Tab {
+                    id: TabId::new(),
+                    name: Some("work".into()),
+                    panes: panes.clone(),
+                }],
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+        let mut terminal = a_terminal();
+
+        drawn(&mut app, &mut terminal);
+
+        let row = top_row(&terminal);
+        assert!(row.contains(" work ") && !row.contains("alpha"), "{row:?}");
+    }
+
+    #[test]
+    fn a_wide_name_is_cut_to_sixteen_columns() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        let wide = "界".repeat(20);
+        daemon
+            .send(ServerMessage::Tabs {
+                project,
+                tabs: vec![Tab {
+                    id: TabId::new(),
+                    name: Some(wide.clone()),
+                    panes,
+                }],
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+        let mut terminal = a_terminal();
+
+        drawn(&mut app, &mut terminal);
+
+        // Sixteen columns: seven two-column characters and the ellipsis.
+        let row = top_row(&terminal);
+        assert_eq!(row.matches('界').count(), 7, "{row:?}");
+        assert!(row.contains('…'), "{row:?}");
+    }
+
+    #[test]
+    fn the_plus_opens_the_picker_for_a_new_tab() {
+        let (mut app, project, daemon, sent) = attached_app_with_shell();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes]);
+        let mut terminal = a_terminal();
+        drawn(&mut app, &mut terminal);
+
+        let plus = cell_of(&top_row(&terminal), " + ") + 1;
+        click(&mut app, plus, 0);
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            placed(&sent),
+            Some(Placement::NewAfter { tab: Some(tabs[0]) })
+        );
+    }
+
+    #[test]
+    fn clicking_a_tab_shows_it() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        app.rename(panes[0], "alpha");
+        app.rename(panes[1], "beta");
+        send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        app.focus_pane(panes[0]);
+        let mut terminal = a_terminal();
+        drawn(&mut app, &mut terminal);
+
+        click(&mut app, cell_of(&top_row(&terminal), "beta"), 0);
+
+        assert_eq!(app.current_tab(), 1);
+    }
+
+    #[test]
+    fn with_more_tabs_than_fit_the_one_on_screen_stays_in_view() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 10);
+        for (index, pane) in panes.iter().enumerate() {
+            app.rename(*pane, &format!("tab-number-{index:02}"));
+        }
+        let groups: Vec<&[PaneId]> = panes.chunks(1).collect();
+        send_tabs(&mut app, &daemon, project, &groups);
+        let mut terminal = a_terminal();
+
+        app.focus_pane(panes[9]);
+        drawn(&mut app, &mut terminal);
+        let row = top_row(&terminal);
+        assert!(
+            row.contains("tab-number-09") && row.contains('‹'),
+            "{row:?}"
+        );
+
+        app.focus_pane(panes[0]);
+        drawn(&mut app, &mut terminal);
+        let row = top_row(&terminal);
+        assert!(
+            row.contains("tab-number-00") && row.contains('›'),
+            "{row:?}"
+        );
+    }
+
+    #[test]
+    fn tab_mode_is_spelled_out_on_the_status_row() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_terminal();
+
+        drawn(&mut app, &mut terminal);
+        assert!(bottom_row(&terminal).contains("Ctrl t tabs"));
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        drawn(&mut app, &mut terminal);
+        assert!(bottom_row(&terminal).starts_with(TAB_MODE_HELP));
     }
 }
