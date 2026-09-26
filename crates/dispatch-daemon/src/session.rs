@@ -758,8 +758,8 @@ impl Daemon {
         };
         let project = target.project;
 
-        // Moved here unchanged from the `ClosePane` arm, so closing a tab
-        // closes each pane exactly as closing it alone does.
+        // Shared by `ClosePane` and `CloseTab`: closing a tab closes each of
+        // its panes exactly as closing that pane alone does.
         //
         // The pane is being killed, not allowed to finish; its caller, if it
         // has one, is answered here or not at all.
