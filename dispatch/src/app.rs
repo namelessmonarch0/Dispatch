@@ -3740,15 +3740,19 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Whether the selected project's daemon keeps tabs of its own, rather
+    /// than this client grouping panes into them itself.
+    fn keeps_tabs(&self) -> bool {
+        self.state
+            .selected_project()
+            .is_some_and(|project| self.state.project_tabs(project).is_some())
+    }
+
     /// The tab on screen, when its project keeps tabs; otherwise says why
     /// nothing can be done with it, and gives `None`.
     #[allow(dead_code)] // wired to keys in the next change
     fn tab_to_change(&mut self) -> Option<TabId> {
-        let keeps_tabs = self
-            .state
-            .selected_project()
-            .is_some_and(|project| self.state.project_tabs(project).is_some());
-        if !keeps_tabs {
+        if !self.keeps_tabs() {
             self.status = NEEDS_UPGRADE.into();
             return None;
         }
@@ -3810,8 +3814,16 @@ impl App {
 
     /// Opens the picker for a pane on a new tab, straight after the one on
     /// screen.
+    ///
+    /// Not routed through `tab_to_change`: an empty project that does keep
+    /// tabs has none on screen to change, but a new one is exactly what this
+    /// opens the picker for.
     #[allow(dead_code)] // wired to keys in the next change
     fn open_new_tab_picker(&mut self) {
+        if !self.keeps_tabs() {
+            self.status = NEEDS_UPGRADE.into();
+            return;
+        }
         self.open_picker_placing(Placement::NewAfter {
             tab: self.current_tab_id(),
         });
@@ -9517,6 +9529,18 @@ mod tests {
 
         assert!(app.overlay.is_none());
         assert!(tab_commands(&sent).is_empty());
+    }
+
+    #[test]
+    fn a_new_tab_on_a_daemon_too_old_for_tabs_is_refused_here() {
+        let (mut app, project, daemon, sent) = attached_app_with_shell();
+        spawn_several(&mut app, &daemon, project, 1);
+
+        app.open_new_tab_picker();
+
+        assert_eq!(app.status, NEEDS_UPGRADE);
+        assert!(app.overlay.is_none(), "no picker opens");
+        assert_eq!(placed(&sent), None);
     }
 
     #[test]
