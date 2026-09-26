@@ -2371,8 +2371,15 @@ impl App {
         }
 
         let layout = std::mem::take(&mut self.layout);
+        let mode = self.router.key_mode();
         let action = self.router.handle(event, &layout);
         self.layout = layout;
+
+        // Tab mode shows a message ahead of its keys, so one left from before
+        // would ride in with it and read as something the mode had said.
+        if mode != KeyMode::Tabs && self.router.key_mode() == KeyMode::Tabs {
+            self.status.clear();
+        }
 
         match action {
             Action::None => {}
@@ -4555,7 +4562,13 @@ impl App {
             "PREFIX".to_string()
         } else if self.router.key_mode() == KeyMode::Tabs {
             // The same goes for a mode, and it has keys of its own to spell out.
-            TAB_MODE_HELP.to_string()
+            // A message goes between the mode's name and its keys: `[`, `]`,
+            // `i` and `o` keep the mode on, and a refusal hidden behind the
+            // key list would make the key look dead.
+            match TAB_MODE_HELP.strip_prefix("TAB  ") {
+                Some(keys) if !self.status.is_empty() => format!("TAB  {}  {keys}", self.status),
+                _ => TAB_MODE_HELP.to_string(),
+            }
         } else {
             let (lead, help) = if !unreachable.is_empty() {
                 // Ahead of `self.status`, which may still hold whatever was
@@ -10193,6 +10206,58 @@ mod tests {
         key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         drawn(&mut app, &mut terminal);
         assert!(bottom_row(&terminal).starts_with(TAB_MODE_HELP));
+    }
+
+    #[test]
+    fn a_refusal_in_tab_mode_shows_ahead_of_its_keys() {
+        // `[` keeps the mode on, so a refusal hidden behind the key list
+        // would make the key look dead.
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        send_tabs(&mut app, &daemon, project, &[&panes]);
+        app.focus_pane(panes[0]);
+        let mut terminal = a_terminal();
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('['));
+        drawn(&mut app, &mut terminal);
+
+        let row = bottom_row(&terminal);
+        assert_eq!(app.router.key_mode(), KeyMode::Tabs, "still in the mode");
+        assert!(row.starts_with("TAB  no tab to the left  "), "{row:?}");
+        assert!(row.contains("n new"), "the keys still follow: {row:?}");
+    }
+
+    #[test]
+    fn entering_tab_mode_clears_an_old_message() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        app.status = "something from before".into();
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+        assert_eq!(app.router.key_mode(), KeyMode::Tabs);
+        assert!(app.status.is_empty(), "{:?}", app.status);
+    }
+
+    #[test]
+    fn the_tab_mode_row_is_drawn_like_the_armed_prefix() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_terminal();
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        drawn(&mut app, &mut terminal);
+
+        let badge = terminal
+            .backend()
+            .buffer()
+            .cell((0, 29))
+            .expect("the status row is drawn")
+            .clone();
+        assert_eq!(badge.symbol(), "T", "tab mode is on");
+        assert_eq!(badge.bg, app.theme.tab);
+        assert_eq!(badge.fg, app.theme.text);
     }
 
     #[test]

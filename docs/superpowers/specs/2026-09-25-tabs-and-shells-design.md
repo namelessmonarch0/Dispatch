@@ -212,7 +212,7 @@ Row 0, right of the `D I S P A T C H` corner:
 - **Status row.** It keeps `tab 2/3` when there is more than one tab:
   with no numbers in the row, it says what a digit will pick. Its key help
   gains `Ctrl t tabs`. While tab mode is on, the whole row lists the mode's
-  keys instead (see Keys).
+  keys instead (see Keys), with any status message shown ahead of them.
 
 **Which tab is shown** still follows the focus and is per client, as today.
 Choosing a tab (by click, digit or `Tab`) focuses the pane this client last
@@ -224,7 +224,11 @@ focused on it, or else its first member.
 
 `Ctrl t` enters tab mode. The status row then reads
 `TAB  n new  r rename  x close  ←→ switch  [ ] move pane  i o move tab  1-9 go  Esc done`,
-and until the mode ends, keys go to Dispatch, not to the pane:
+and until the mode ends, keys go to Dispatch, not to the pane. Entering the
+mode clears any old status message. A message set while the mode is on —
+a refusal from a key that keeps the mode, such as `no tab to the left` —
+shows between `TAB` and the key list, as
+`TAB  no tab to the left  n new  r rename  …`, in the same highlighted style:
 
 | Key | Action | Mode afterwards |
 |---|---|---|
