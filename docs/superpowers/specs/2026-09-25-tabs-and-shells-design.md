@@ -151,6 +151,10 @@ The subscribe replay sends one `Tabs` for **every** open project, even an
 empty one, after that project's `PaneSpawned` messages. The panes a
 snapshot names are therefore always already known.
 
+When the daemon opens a project, it also sends that project's (empty)
+`Tabs` straight after `ProjectOpened`, so a project opened after the replay
+reads as one that keeps tabs from the start.
+
 A refused operation gets `Error { error: ProtocolError::Other(text) }`, or
 `NoSuchPane`. The client shows it in the status row.
 

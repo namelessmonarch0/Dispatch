@@ -592,6 +592,11 @@ impl Daemon {
         // Every client hears about it: they are looking at the same fleet, and
         // a project one of them opened is one they can all spawn into.
         self.broadcast(ServerMessage::ProjectOpened { project });
+
+        // Its tabs too, empty as they are: a client reads a project with no
+        // tabs as one on a daemon too old to keep them, and would refuse every
+        // tab command until something else changed this project's tabs.
+        self.broadcast_tabs(id);
     }
 
     /// Forgets a project, once nothing is running in it.

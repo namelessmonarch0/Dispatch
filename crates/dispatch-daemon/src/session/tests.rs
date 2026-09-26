@@ -832,6 +832,7 @@ fn the_asker_alone_is_told_what_its_root_resolved_to() {
             [
                 ServerMessage::ProjectResolved { root, resolved },
                 ServerMessage::ProjectOpened { project },
+                ServerMessage::Tabs { .. },
             ] if root == Path::new("~") && *resolved == expected && project.root == expected
         ),
         "the asker hears how its root resolved, before the row arrives: {heard:#?}"
@@ -2351,6 +2352,35 @@ fn a_client_attaching_later_hears_every_projects_tabs_after_their_panes() {
         last_pane < first_tabs,
         "tabs come after every pane they name"
     );
+}
+
+#[test]
+fn a_project_opened_while_running_says_it_keeps_tabs() {
+    // A client reads a project with no tabs as one on a daemon too old for
+    // them, so a project opened after the subscribe replay has to say so too.
+    let (mut daemon, _, dir) = daemon("tabs-open");
+    let inbox = subscribed(&mut daemon, 1);
+    let fresh = dir.0.join("fresh");
+    std::fs::create_dir_all(&fresh).expect("temp dir is writable");
+
+    daemon.request_for_test(1, ClientMessage::OpenProject { root: fresh });
+
+    let seen = drain(&inbox);
+    let (opened, project) = seen
+        .iter()
+        .enumerate()
+        .find_map(|(at, m)| match m {
+            ServerMessage::ProjectOpened { project } => Some((at, project.id)),
+            _ => None,
+        })
+        .expect("the project was announced");
+    let tabs = seen
+        .iter()
+        .position(|m| {
+            matches!(m, ServerMessage::Tabs { project: p, tabs } if *p == project && tabs.is_empty())
+        })
+        .unwrap_or_else(|| panic!("the project's empty tabs were sent: {seen:#?}"));
+    assert!(opened < tabs, "the tabs follow the project they belong to");
 }
 
 #[test]
