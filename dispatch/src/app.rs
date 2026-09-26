@@ -9,7 +9,7 @@ use dispatch_client::Client;
 use dispatch_config::{HarnessRegistry, Launch};
 use dispatch_core::{
     AppState, Device, DeviceId, HarnessId, Pane as CorePane, PaneId, PaneStatus, Placement,
-    Project, ProjectId, ProjectSource, RequestId,
+    Project, ProjectId, ProjectSource, ProjectTabs, RequestId, TabId,
 };
 use dispatch_layout::{tile, tile_zoomed};
 use dispatch_proto::{ClientMessage, DelegateOutcome, PaneUpdate, ProjectUpdate, ServerMessage};
@@ -22,6 +22,7 @@ use dispatch_pty::{
 use crate::add_machine::{self, AddMachine, Checked, Step};
 use crate::approval::Approval;
 use crate::backend::{Backend, RemotePane};
+use crate::tabs::{self, TabView};
 use dispatch_config::machines::{self, Machine};
 use dispatch_tui::activity::{Tracker, Verdict};
 use dispatch_tui::browser::Browser;
@@ -38,14 +39,6 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Widget};
-
-/// How many panes are tiled at once.
-///
-/// Four is the most that stays readable in a terminal: past it every pane is
-/// too narrow for a wrapped line of code and too short for a prompt plus its
-/// answer. Panes beyond the fourth are not hidden — they go on the next tab,
-/// and all of them are always listed in the sidebar.
-const PANES_PER_TAB: usize = 4;
 
 /// The program's name as the top-left corner spells it, letter-spaced the
 /// way a label rather than a heading is.
@@ -607,6 +600,12 @@ pub struct App {
     last_tab: usize,
     /// Where the active tab's tint is sliding from, while it slides.
     tab_from: usize,
+    /// Where the next pane chosen in the picker goes, set by whatever opened
+    /// the picker.
+    placing: Placement,
+    /// The pane this client last focused on each tab, so coming back to a
+    /// tab lands where the user left it.
+    tab_focus: HashMap<TabId, PaneId>,
 }
 
 /// One attachment's device, connection generation, whether it is up, what it
@@ -672,6 +671,8 @@ impl App {
             closing: Vec::new(),
             last_tab: 0,
             tab_from: 0,
+            placing: Placement::Auto,
+            tab_focus: HashMap::new(),
         }
     }
 
@@ -1039,11 +1040,16 @@ impl App {
             .expect("a standalone client registers its own machine in `App::new`");
 
         let branch = dispatch_os::git::head(&root);
-        self.state.add_project(
+        let id = self.state.add_project(
             Project::new(root, source)
                 .with_branch(branch)
                 .with_device(device),
         );
+        // This client runs a standalone project's panes, so it keeps their
+        // tabs as well.
+        if self.state.project_tabs(id).is_none() {
+            self.state.set_project_tabs(id, ProjectTabs::new());
+        }
     }
 
     /// Which kept list a root opened on `device` belongs on.
@@ -1123,6 +1129,10 @@ impl App {
     /// Attached, this asks and returns: the pane appears when the daemon says it
     /// has started one, which is also how the other clients hear about it.
     pub fn spawn_pane(&mut self, harness: &str, area: Size) -> Result<()> {
+        // Taken whatever happens next, so a placement meant for this pane
+        // can never land a later one somewhere the user did not ask.
+        let place = std::mem::take(&mut self.placing);
+
         let Some(project_id) = self.state.selected_project() else {
             self.status = "no project selected".into();
             return Ok(());
@@ -1158,7 +1168,7 @@ impl App {
                 project: project_id,
                 harness: harness.to_string(),
                 size: (area.cols, area.rows),
-                place: Placement::Auto,
+                place,
             });
             self.status = format!("starting {display_name}…");
             return Ok(());
@@ -1179,6 +1189,7 @@ impl App {
             .state
             .spawn_pane(project_id, HarnessId::new(harness))
             .context("the selected project is registered")?;
+        self.state.place_pane(id, place);
 
         self.adopt(id, Backend::Local(session), &display_name)
     }
@@ -1877,14 +1888,18 @@ impl App {
                 false
             }
 
+            // The daemon's word on its own project's tabs, whole: whatever
+            // this client held before is replaced rather than merged.
+            ServerMessage::Tabs { project, tabs } => self
+                .state
+                .set_project_tabs(project, ProjectTabs::from_tabs(tabs)),
+
             // The handshake is done by the client, and nothing here pings.
             // `DelegateFinished` is for the delegate caller, not interface
-            // clients. `Tabs` is handled starting in a later change. Unknown
-            // messages from newer peers are ignored.
+            // clients. Unknown messages from newer peers are ignored.
             ServerMessage::Welcome { .. }
             | ServerMessage::Pong { .. }
             | ServerMessage::DelegateFinished { .. }
-            | ServerMessage::Tabs { .. }
             | ServerMessage::Unknown => false,
         }
     }
@@ -2288,22 +2303,25 @@ impl App {
         Ok(())
     }
 
-    /// Shows a tab by focusing its first pane.
+    /// Shows a tab by focusing a pane on it: the one this client last used
+    /// there, else its first.
     ///
-    /// Focusing is how a tab is shown at all, since the view follows the focus.
-    /// Out of range wraps to the first, so `^a 9` on a two-tab fleet lands
-    /// somewhere real rather than doing nothing.
+    /// Focusing is how a tab is shown at all, since the view follows the
+    /// focus. Out of range wraps to the first, so `^a 9` on a two-tab fleet
+    /// lands somewhere real rather than doing nothing.
     fn select_tab(&mut self, index: usize) {
-        let index = if index < self.tab_count() { index } else { 0 };
+        let views = self.tab_views();
+        let index = if index < views.len() { index } else { 0 };
+        let Some(view) = views.get(index) else {
+            return;
+        };
 
-        if let Some(first) = self
-            .tileable()
-            .chunks(PANES_PER_TAB)
-            .nth(index)
-            .and_then(<[PaneId]>::first)
-            .copied()
-        {
-            let _ = self.state.focus(first);
+        let remembered = view
+            .id
+            .and_then(|id| self.tab_focus.get(&id).copied())
+            .filter(|pane| view.panes.contains(pane));
+        if let Some(pane) = remembered.or_else(|| view.panes.first().copied()) {
+            let _ = self.state.focus(pane);
         }
     }
 
@@ -2864,7 +2882,16 @@ impl App {
         Ok(())
     }
 
+    /// Opens the picker for a pane on the tab on screen.
     fn open_harness_picker(&mut self) {
+        let place = self
+            .current_tab_id()
+            .map_or(Placement::Auto, |tab| Placement::Into { tab });
+        self.open_picker_placing(place);
+    }
+
+    /// Opens the picker for a pane that goes where `place` says.
+    fn open_picker_placing(&mut self, place: Placement) {
         let items: Vec<Item> = self
             .harnesses
             .all()
@@ -2876,6 +2903,7 @@ impl App {
             return;
         }
 
+        self.placing = place;
         self.overlay = Some(Overlay::Harness(Picker::new("New pane", items)));
     }
 
@@ -3379,6 +3407,18 @@ impl App {
         self.animations.sweep(now);
         self.notice_focus(now);
 
+        // Remembered once a frame rather than on each way focus can move:
+        // there are many ways, and the frame sees the result of all of them.
+        if let Some(focused) = self.state.focused_pane()
+            && let Some(tab) = self
+                .tab_views()
+                .into_iter()
+                .find(|view| view.panes.contains(&focused))
+                .and_then(|view| view.id)
+        {
+            self.tab_focus.insert(tab, focused);
+        }
+
         // One row across the top for the name and the tabs, one along the
         // bottom for status, and everything between for the sidebar and the
         // panes.
@@ -3600,11 +3640,14 @@ impl App {
         }
     }
 
-    /// How many tabs the tileable panes fill.
-    ///
-    /// Always at least one, so an empty project still has a tab to be on.
+    /// The tabs of the project on screen.
+    fn tab_views(&self) -> Vec<TabView> {
+        tabs::views(&self.state, self.state.selected_project(), &self.tileable())
+    }
+
+    /// How many tabs the project on screen has. Always at least one.
     fn tab_count(&self) -> usize {
-        self.tileable().len().div_ceil(PANES_PER_TAB).max(1)
+        self.tab_views().len()
     }
 
     /// The tab on screen: the one holding the focused pane.
@@ -3614,20 +3657,29 @@ impl App {
     /// all move focus without going anywhere near a tab — and a view showing
     /// one tab while typing went to another would be the worst bug here.
     fn current_tab(&self) -> usize {
-        let tileable = self.tileable();
+        let Some(focused) = self.state.focused_pane() else {
+            return 0;
+        };
+        self.tab_views()
+            .iter()
+            .position(|view| view.panes.contains(&focused))
+            .unwrap_or(0)
+    }
 
-        self.state
-            .focused_pane()
-            .and_then(|id| tileable.iter().position(|pane| *pane == id))
-            .map_or(0, |index| index / PANES_PER_TAB)
+    /// The id of the tab on screen, when the project keeps tabs.
+    fn current_tab_id(&self) -> Option<TabId> {
+        self.tab_views()
+            .into_iter()
+            .nth(self.current_tab())
+            .and_then(|view| view.id)
     }
 
     /// The panes on the tab being shown.
     fn panes_on_tab(&self) -> Vec<PaneId> {
-        self.tileable()
-            .chunks(PANES_PER_TAB)
+        self.tab_views()
+            .into_iter()
             .nth(self.current_tab())
-            .map(<[PaneId]>::to_vec)
+            .map(|view| view.panes)
             .unwrap_or_default()
     }
 
@@ -3816,18 +3868,17 @@ impl App {
         }
 
         let current = self.current_tab();
-        let tileable = self.tileable();
+        let views = self.tab_views();
         let sliding = self.animations.value(Target::Tab, now).is_some();
         let mut spans = Vec::new();
         // Where each tab sits in the row, for the sliding tint.
         let mut extents: Vec<(u16, u16)> = Vec::new();
         let mut column = area.x;
 
-        for index in 0..self.tab_count() {
-            let title = tileable
-                .chunks(PANES_PER_TAB)
-                .nth(index)
-                .and_then(<[PaneId]>::first)
+        for (index, view) in views.iter().enumerate() {
+            let title = view
+                .panes
+                .first()
                 .and_then(|id| self.state.pane(*id))
                 .map(|pane| truncate(&pane.title, TAB_TITLE));
 
@@ -3853,13 +3904,9 @@ impl App {
                 Style::default().fg(self.theme.faded)
             };
 
-            let panes = tileable
-                .chunks(PANES_PER_TAB)
-                .nth(index)
-                .unwrap_or_default();
             let rollup = sidebar::Rollup::of(
                 &self.state,
-                panes.iter().filter_map(|id| self.state.pane(*id)),
+                view.panes.iter().filter_map(|id| self.state.pane(*id)),
             );
 
             // The gap between two tabs belongs to neither.
@@ -4081,7 +4128,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::mpsc::{Receiver, Sender};
 
-    use dispatch_core::{PaneRole, Project, ProjectSource};
+    use dispatch_core::{PaneRole, Project, ProjectSource, Tab};
     use ratatui::style::Color;
 
     /// An `App` attached to a daemon that says only what a test tells it to,
@@ -4723,6 +4770,209 @@ mod tests {
             1,
             "focusing across the cap moves the view"
         );
+    }
+
+    /// `attached_app`, with a `shell` harness for the picker to offer.
+    fn attached_app_with_shell() -> (
+        App,
+        ProjectId,
+        Sender<ServerMessage>,
+        Receiver<ClientMessage>,
+    ) {
+        let (client, daemon, sent) = Client::for_test();
+        let shell = dispatch_config::HarnessDef {
+            id: "shell".to_string(),
+            display_name: "Shell".to_string(),
+            ..dispatch_config::HarnessDef::default()
+        };
+        let mut app = App::attached([shell].into_iter().collect(), client);
+
+        let project = Project::new("/tmp/attached", ProjectSource::LocalDir);
+        let id = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        (app, id, daemon, sent)
+    }
+
+    /// Sends `project`'s tabs as the daemon does, one tab per group, and
+    /// returns their ids.
+    fn send_tabs(
+        app: &mut App,
+        daemon: &Sender<ServerMessage>,
+        project: ProjectId,
+        groups: &[&[PaneId]],
+    ) -> Vec<TabId> {
+        let tabs: Vec<Tab> = groups
+            .iter()
+            .map(|panes| Tab {
+                id: TabId::new(),
+                name: None,
+                panes: panes.to_vec(),
+            })
+            .collect();
+        let ids = tabs.iter().map(|tab| tab.id).collect();
+        daemon
+            .send(ServerMessage::Tabs { project, tabs })
+            .expect("the app is listening");
+        app.poll_daemon();
+        ids
+    }
+
+    /// Where the last pane this app asked its daemon for was to go.
+    fn placed(sent: &Receiver<ClientMessage>) -> Option<Placement> {
+        sent.try_iter()
+            .filter_map(|message| match message {
+                ClientMessage::SpawnPane { place, .. } => Some(place),
+                _ => None,
+            })
+            .last()
+    }
+
+    fn a_terminal() -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("a test backend can be created")
+    }
+
+    #[test]
+    fn the_daemons_snapshot_decides_which_tab_each_pane_is_on() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+
+        send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+
+        assert_eq!(app.tab_count(), 2);
+        app.focus_pane(panes[1]);
+        assert_eq!(app.current_tab(), 1);
+        assert_eq!(app.panes_on_tab(), panes[1..].to_vec());
+    }
+
+    #[test]
+    fn a_new_pane_is_asked_into_the_tab_on_screen() {
+        let (mut app, project, daemon, sent) = attached_app_with_shell();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes]);
+
+        command(&mut app, 'n');
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(placed(&sent), Some(Placement::Into { tab: tabs[0] }));
+    }
+
+    #[test]
+    fn a_daemon_that_keeps_no_tabs_is_asked_for_no_particular_tab() {
+        let (mut app, project, daemon, sent) = attached_app_with_shell();
+        spawn_several(&mut app, &daemon, project, 1);
+
+        command(&mut app, 'n');
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(placed(&sent), Some(Placement::Auto));
+    }
+
+    #[test]
+    fn choosing_a_tab_goes_back_to_the_pane_last_used_there() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        send_tabs(&mut app, &daemon, project, &[&panes[..2], &panes[2..]]);
+        let mut terminal = a_terminal();
+
+        app.focus_pane(panes[1]);
+        drawn(&mut app, &mut terminal);
+        app.select_tab(1);
+        drawn(&mut app, &mut terminal);
+        assert_eq!(app.state.focused_pane(), Some(panes[2]));
+
+        app.select_tab(0);
+        assert_eq!(
+            app.state.focused_pane(),
+            Some(panes[1]),
+            "where the user left it, not the tab's first pane"
+        );
+    }
+
+    #[test]
+    fn a_pane_the_snapshot_has_not_placed_yet_is_still_shown() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let first = spawn_several(&mut app, &daemon, project, 1);
+        send_tabs(&mut app, &daemon, project, &[&first]);
+
+        let fresh = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        assert_eq!(app.tab_count(), 1);
+        app.focus_pane(fresh);
+        assert_eq!(app.panes_on_tab(), vec![first[0], fresh]);
+    }
+
+    #[test]
+    fn a_tab_whose_last_pane_exits_leaves_the_row() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 2);
+        send_tabs(&mut app, &daemon, project, &[&panes[..1], &panes[1..]]);
+        app.focus_pane(panes[1]);
+        let mut terminal = a_terminal();
+        drawn(&mut app, &mut terminal);
+
+        daemon
+            .send(ServerMessage::PaneChanged {
+                pane: panes[1],
+                update: PaneUpdate::Status {
+                    status: PaneStatus::Exited(0),
+                },
+            })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        assert_eq!(app.tab_count(), 1);
+        assert_eq!(app.current_tab(), 0);
+        assert_eq!(app.panes_on_tab(), vec![panes[0]]);
+        drawn(&mut app, &mut terminal);
+    }
+
+    #[test]
+    fn a_standalone_project_keeps_its_own_tabs() {
+        let shell = dispatch_config::HarnessDef {
+            id: "sh".to_string(),
+            display_name: "Sh".to_string(),
+            launch: Launch {
+                command: if cfg!(windows) { "cmd.exe" } else { "sh" }.to_string(),
+                ..Launch::default()
+            },
+            ..dispatch_config::HarnessDef::default()
+        };
+        let mut app = App::new([shell].into_iter().collect());
+        let root = scratch("standalone-tabs");
+        app.add_project(root.clone());
+        let project = app
+            .state
+            .selected_project()
+            .expect("the project is selected");
+        assert!(
+            app.state.project_tabs(project).is_some(),
+            "a standalone client keeps its own panes' tabs"
+        );
+
+        app.spawn_pane("sh", Size::new(80, 24))
+            .expect("the pane starts");
+        app.placing = Placement::NewAfter {
+            tab: app.current_tab_id(),
+        };
+        app.spawn_pane("sh", Size::new(80, 24))
+            .expect("the pane starts");
+
+        assert_eq!(
+            app.tab_count(),
+            2,
+            "the second pane opened a tab of its own"
+        );
+
+        // Real shells: stopped here rather than left to outlive the test.
+        for (_, mut pane) in app.panes.drain() {
+            pane.backend.terminate();
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

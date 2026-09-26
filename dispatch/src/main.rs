@@ -6,6 +6,7 @@ mod approval;
 mod backend;
 mod delegate;
 mod machine;
+mod tabs;
 mod terminal;
 
 use std::path::PathBuf;
