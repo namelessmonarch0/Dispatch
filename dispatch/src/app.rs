@@ -1247,8 +1247,16 @@ impl App {
             .map(|p| p.root.clone())
             .context("the selected project is registered")?;
 
-        let session = PtySession::spawn(&launch, &cwd, area)
-            .with_context(|| format!("failed to start {display_name}"))?;
+        // Told on the status row, as a daemon tells an attached client, rather
+        // than returned: an error here ends Dispatch, and every standalone
+        // agent with it, over what may be one mistyped `[shell] command`.
+        let session = match PtySession::spawn(&launch, &cwd, area) {
+            Ok(session) => session,
+            Err(error) => {
+                self.status = format!("failed to start {harness}: {error:#}");
+                return Ok(());
+            }
+        };
 
         let id = self
             .state
@@ -5637,6 +5645,36 @@ mod tests {
             pane.backend.terminate();
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_standalone_pane_that_fails_to_start_is_reported_not_fatal() {
+        // A typo in `[shell] command` is one Enter away, and Dispatch
+        // exiting over it would take every other standalone agent with it.
+        let broken = dispatch_config::HarnessDef {
+            id: "broken".to_string(),
+            display_name: "Broken".to_string(),
+            launch: Launch {
+                command: "/nonexistent/definitely-not-here".to_string(),
+                ..Launch::default()
+            },
+            ..dispatch_config::HarnessDef::default()
+        };
+        let mut app = App::new([broken].into_iter().collect());
+        let root = scratch("broken-harness");
+        app.add_project(root.clone());
+
+        let result = app.spawn_pane("broken", Size::new(80, 24));
+
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            app.status.starts_with("failed to start broken:"),
+            "{:?}",
+            app.status
+        );
+        assert!(app.panes.is_empty(), "nothing was adopted");
+        assert!(app.state.visible_panes().is_empty(), "nor added");
     }
 
     #[test]
