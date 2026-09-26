@@ -3027,9 +3027,14 @@ impl App {
     /// Opens the picker for a pane that goes where `place` says.
     fn open_picker_placing(&mut self, place: Placement) {
         let local = self.project_is_local();
+        // A daemon that predates tabs predates the built-in `shell` too: a
+        // Shell offered, and chosen by Enter, would only be refused as an
+        // unknown harness. Standalone, this machine starts it, and has one.
+        let old_daemon = !matches!(self.mode, Mode::Standalone) && !self.keeps_tabs();
         let mut items: Vec<Item> = self
             .harnesses
             .all()
+            .filter(|h| !(old_daemon && h.id == SHELL))
             .map(|h| {
                 if h.id == SHELL && !local {
                     // The picker is this machine's, but a shell runs where the
@@ -3854,11 +3859,25 @@ impl App {
             .is_some_and(|project| self.state.project_tabs(project).is_some())
     }
 
+    /// Why the selected project's tabs cannot be changed, if they cannot.
+    ///
+    /// With no project at all, the daemon is not what is missing, and
+    /// telling the user to upgrade it would send them the wrong way.
+    fn tabs_refused(&self) -> Option<&'static str> {
+        if self.state.selected_project().is_none() {
+            Some("no project selected")
+        } else if !self.keeps_tabs() {
+            Some(NEEDS_UPGRADE)
+        } else {
+            None
+        }
+    }
+
     /// The tab on screen, when its project keeps tabs; otherwise says why
     /// nothing can be done with it, and gives `None`.
     fn tab_to_change(&mut self) -> Option<TabId> {
-        if !self.keeps_tabs() {
-            self.status = NEEDS_UPGRADE.into();
+        if let Some(reason) = self.tabs_refused() {
+            self.status = reason.into();
             return None;
         }
         self.current_tab_id()
@@ -3924,8 +3943,8 @@ impl App {
     /// tabs has none on screen to change, but a new one is exactly what this
     /// opens the picker for.
     fn open_new_tab_picker(&mut self) {
-        if !self.keeps_tabs() {
-            self.status = NEEDS_UPGRADE.into();
+        if let Some(reason) = self.tabs_refused() {
+            self.status = reason.into();
             return;
         }
         self.open_picker_placing(Placement::NewAfter {
@@ -5369,6 +5388,27 @@ mod tests {
         (app, id, daemon, sent)
     }
 
+    /// `attached_app`, with `claude` as well as a shell: a daemon too old for
+    /// tabs is offered no shell, and needs something else to be asked for.
+    fn attached_app_with_claude() -> (
+        App,
+        ProjectId,
+        Sender<ServerMessage>,
+        Receiver<ClientMessage>,
+    ) {
+        let (client, daemon, sent) = Client::for_test();
+        let mut app = App::attached(registry_with_shell("/usr/bin/zsh"), client);
+
+        let project = Project::new("/tmp/attached", ProjectSource::LocalDir);
+        let id = project.id;
+        daemon
+            .send(ServerMessage::ProjectOpened { project })
+            .expect("the app is listening");
+        app.poll_daemon();
+
+        (app, id, daemon, sent)
+    }
+
     /// Sends `project`'s tabs as the daemon does, one tab per group, and
     /// returns their ids.
     fn send_tabs(
@@ -5535,7 +5575,7 @@ mod tests {
 
     #[test]
     fn a_daemon_that_keeps_no_tabs_is_asked_for_no_particular_tab() {
-        let (mut app, project, daemon, sent) = attached_app_with_shell();
+        let (mut app, project, daemon, sent) = attached_app_with_claude();
         spawn_several(&mut app, &daemon, project, 1);
 
         command(&mut app, 'n');
@@ -9910,6 +9950,19 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_command_with_no_project_says_so_rather_than_blaming_the_daemon() {
+        let (client, _daemon, _sent) = Client::for_test();
+        let mut app = App::attached(HarnessRegistry::default(), client);
+
+        app.open_new_tab_picker();
+        assert_eq!(app.status, "no project selected");
+
+        app.status.clear();
+        app.open_rename_tab();
+        assert_eq!(app.status, "no project selected");
+    }
+
+    #[test]
     fn renaming_asks_the_daemon_with_what_was_typed() {
         let (mut app, project, daemon, sent) = attached_app();
         let panes = spawn_several(&mut app, &daemon, project, 1);
@@ -10435,12 +10488,14 @@ mod tests {
         let (client, daemon, _sent) = Client::for_test();
         let mut app = App::new(registry_with_shell("/usr/bin/zsh"));
         app.attach_named(client, Some("box".into()), Vec::new());
+        let project = Project::new("/srv/app", ProjectSource::LocalDir);
+        let id = project.id;
         daemon
-            .send(ServerMessage::ProjectOpened {
-                project: Project::new("/srv/app", ProjectSource::LocalDir),
-            })
+            .send(ServerMessage::ProjectOpened { project })
             .expect("the app is listening");
         app.poll_daemon();
+        // A daemon that keeps tabs, and so has a shell to offer.
+        send_tabs(&mut app, &daemon, id, &[]);
 
         app.open_harness_picker();
 
@@ -10449,5 +10504,31 @@ mod tests {
         };
         assert_eq!(picker.items()[0].label, "Shell");
         assert_eq!(picker.items()[0].detail, None);
+    }
+
+    #[test]
+    fn a_daemon_too_old_for_tabs_is_not_offered_a_shell() {
+        // A daemon that predates tabs predates the built-in `shell` too, so
+        // a pre-selected Shell would make Enter fail with an unknown harness.
+        let (mut app, id, daemon, _sent) = attached_app_with_claude();
+
+        app.open_harness_picker();
+        let Some(Overlay::Harness(picker)) = &app.overlay else {
+            panic!("the picker is open");
+        };
+        let ids: Vec<&str> = picker.items().iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["claude"], "no shell, the others as they were");
+
+        app.overlay = None;
+        send_tabs(&mut app, &daemon, id, &[]);
+        app.open_harness_picker();
+        let Some(Overlay::Harness(picker)) = &app.overlay else {
+            panic!("the picker is open");
+        };
+        assert_eq!(
+            picker.items()[0].id,
+            SHELL,
+            "a daemon that keeps tabs has a shell"
+        );
     }
 }
