@@ -363,7 +363,10 @@ before the harness's own `env`:
   `KITTY_WINDOW_ID`, `KITTY_PID`, `KITTY_LISTEN_ON`, `WEZTERM_PANE`,
   `WEZTERM_UNIX_SOCKET`, `ALACRITTY_WINDOW_ID`, `ALACRITTY_SOCKET`,
   `WT_SESSION`, `WT_PROFILE_ID`, `VTE_VERSION`, `KONSOLE_VERSION`,
-  `KONSOLE_DBUS_SESSION`, `GHOSTTY_RESOURCES_DIR`, `GHOSTTY_BIN_DIR`.
+  `KONSOLE_DBUS_SESSION`, `GHOSTTY_RESOURCES_DIR`, `GHOSTTY_BIN_DIR`,
+  `KITTY_INSTALLATION_DIR`, `WEZTERM_EXECUTABLE` — and those of a
+  multiplexer Dispatch was started inside: `TMUX`, `TMUX_PANE`, `STY`,
+  `ZELLIJ`, `ZELLIJ_SESSION_NAME`, `ZELLIJ_PANE_ID`.
 - Then applies `launch.env`, so a harness can still set its own `TERM`.
 
 Dispatch draws each pane with its own emulator. Advertising the outer

@@ -105,11 +105,13 @@ const PANE_TERMINAL: [(&str, &str); 3] = [
     ("TERM_PROGRAM", "dispatch"),
 ];
 
-/// Variables naming the terminal Dispatch was started from.
+/// Variables naming the terminal Dispatch was started from, and any
+/// multiplexer it was started inside.
 ///
 /// Left in, they send a program's kitty- or iTerm-only tricks through an
-/// emulator that is neither.
-const HOST_TERMINAL: [&str; 18] = [
+/// emulator that is neither, or wrap its sequences for a tmux, screen or
+/// zellij that is not the one drawing it.
+const HOST_TERMINAL: [&str; 26] = [
     "TERM_SESSION_ID",
     "ITERM_SESSION_ID",
     "LC_TERMINAL",
@@ -128,6 +130,14 @@ const HOST_TERMINAL: [&str; 18] = [
     "KONSOLE_DBUS_SESSION",
     "GHOSTTY_RESOURCES_DIR",
     "GHOSTTY_BIN_DIR",
+    "TMUX",
+    "TMUX_PANE",
+    "STY",
+    "ZELLIJ",
+    "ZELLIJ_SESSION_NAME",
+    "ZELLIJ_PANE_ID",
+    "KITTY_INSTALLATION_DIR",
+    "WEZTERM_EXECUTABLE",
 ];
 
 /// Tells `command` it runs in Dispatch's terminal, not the one outside.

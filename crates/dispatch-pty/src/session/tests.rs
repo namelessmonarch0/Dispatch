@@ -404,6 +404,9 @@ fn a_pane_is_told_about_dispatchs_terminal_not_the_one_outside() {
     command.env("TERM", "xterm-kitty");
     command.env("KITTY_WINDOW_ID", "7");
     command.env("GHOSTTY_RESOURCES_DIR", "/usr/share/ghostty");
+    // A multiplexer outside counts too: a program that sees `TMUX` wraps its
+    // sequences for a tmux that is not the one drawing it.
+    command.env("TMUX", "/tmp/tmux-1000/default,1234,0");
 
     apply_pane_env(&mut command);
 
@@ -425,6 +428,7 @@ fn a_pane_is_told_about_dispatchs_terminal_not_the_one_outside() {
     );
     assert_eq!(command.get_env("KITTY_WINDOW_ID"), None);
     assert_eq!(command.get_env("GHOSTTY_RESOURCES_DIR"), None);
+    assert_eq!(command.get_env("TMUX"), None);
 }
 
 #[test]
