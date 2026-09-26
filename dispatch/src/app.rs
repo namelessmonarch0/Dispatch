@@ -30,6 +30,10 @@ use dispatch_tui::input::{
     Action, Direction, Event, InputRouter, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseEventKind,
 };
+// Only the tests read a `KeyMode` back; the status row that shows one to the
+// user is Task 11's.
+#[cfg(test)]
+use dispatch_tui::input::KeyMode;
 use dispatch_tui::motion::{Animations, SPIN_FRAME, TWEEN_FRAME};
 use dispatch_tui::theme::Role;
 use dispatch_tui::{Item, PaneWidget, Picker, Prompt, Sidebar, Theme, sidebar, truncate};
@@ -48,7 +52,6 @@ const APP_NAME: &str = "D I S P A T C H";
 const TAB_TITLE: usize = 16;
 
 /// What a tab command says on a project whose daemon keeps no tabs.
-#[allow(dead_code)] // wired to keys in the next change
 const NEEDS_UPGRADE: &str = "this machine's Dispatch needs upgrading for tabs";
 
 /// The border drawn around one pane, in `colour`, its title bold when
@@ -300,7 +303,6 @@ enum Overlay {
         prompt: Prompt,
     },
     /// A new name for a tab being typed.
-    #[allow(dead_code)] // constructed once open_rename_tab is wired to a key
     RenameTab {
         /// The tab being renamed.
         tab: TabId,
@@ -308,7 +310,6 @@ enum Overlay {
         prompt: Prompt,
     },
     /// Closing a tab, and every pane on it, waiting on a yes.
-    #[allow(dead_code)] // constructed once open_close_tab is wired to a key
     CloseTab {
         /// The tab to close.
         tab: TabId,
@@ -2248,6 +2249,15 @@ impl App {
 
     /// Acts on one input event.
     pub fn handle(&mut self, event: &Event, area: Size) -> Result<()> {
+        // A click ends tab mode whatever it lands on. The sidebar and the tab
+        // row are resolved here, before the router sees the event, so the
+        // router cannot end it for them.
+        if let Event::Mouse(mouse) = event
+            && matches!(mouse.kind, MouseEventKind::Down(_))
+        {
+            self.router.leave_mode();
+        }
+
         // An overlay takes the keyboard while it is open, so arrow keys choose
         // and approval keys decide rather than either reaching an agent.
         if self.overlay.is_some() {
@@ -2333,6 +2343,16 @@ impl App {
             Action::AddMachine => self.open_add_machine(),
             Action::ExpandChild => self.expand_child(),
             Action::CollapseChild => self.collapse_child(),
+            Action::NewTab => self.open_new_tab_picker(),
+            Action::RenameTab => self.open_rename_tab(),
+            Action::CloseTab => self.open_close_tab(),
+            Action::PreviousTab => self.select_previous_tab(),
+            Action::LastTab => self.select_last_tab(),
+            Action::MovePaneLeft => self.move_focused_pane(-1),
+            Action::MovePaneRight => self.move_focused_pane(1),
+            Action::MoveTabLeft => self.move_current_tab(-1),
+            Action::MoveTabRight => self.move_current_tab(1),
+            Action::FocusOrTab(direction) => self.focus_or_tab(direction),
         }
 
         Ok(())
@@ -3750,7 +3770,6 @@ impl App {
 
     /// The tab on screen, when its project keeps tabs; otherwise says why
     /// nothing can be done with it, and gives `None`.
-    #[allow(dead_code)] // wired to keys in the next change
     fn tab_to_change(&mut self) -> Option<TabId> {
         if !self.keeps_tabs() {
             self.status = NEEDS_UPGRADE.into();
@@ -3818,7 +3837,6 @@ impl App {
     /// Not routed through `tab_to_change`: an empty project that does keep
     /// tabs has none on screen to change, but a new one is exactly what this
     /// opens the picker for.
-    #[allow(dead_code)] // wired to keys in the next change
     fn open_new_tab_picker(&mut self) {
         if !self.keeps_tabs() {
             self.status = NEEDS_UPGRADE.into();
@@ -3834,7 +3852,6 @@ impl App {
     ///
     /// Refused here, with the reason, when the answer is already known, so a
     /// round trip to the daemon is not what tells the user a tab is full.
-    #[allow(dead_code)] // wired to keys in the next change
     fn move_focused_pane(&mut self, step: isize) {
         let Some(pane) = self.state.focused_pane() else {
             return;
@@ -3881,7 +3898,6 @@ impl App {
 
     /// Moves the tab on screen `step` places along the row. Past either end
     /// it stays where it is.
-    #[allow(dead_code)] // wired to keys in the next change
     fn move_current_tab(&mut self, step: isize) {
         let Some(tab) = self.tab_to_change() else {
             return;
@@ -3896,7 +3912,6 @@ impl App {
     }
 
     /// Opens the prompt that renames the tab on screen, holding its name.
-    #[allow(dead_code)] // wired to keys in the next change
     fn open_rename_tab(&mut self) {
         let Some(tab) = self.tab_to_change() else {
             return;
@@ -3941,7 +3956,6 @@ impl App {
     }
 
     /// Asks before closing the tab on screen: it can stop running agents.
-    #[allow(dead_code)] // wired to keys in the next change
     fn open_close_tab(&mut self) {
         let Some(tab) = self.tab_to_change() else {
             return;
@@ -3989,14 +4003,12 @@ impl App {
     }
 
     /// Shows the tab to the left, wrapping to the last.
-    #[allow(dead_code)] // wired to keys in the next change
     fn select_previous_tab(&mut self) {
         let count = self.tab_count();
         self.select_tab((self.current_tab() + count - 1) % count);
     }
 
     /// Shows the tab this client was on before the one on screen.
-    #[allow(dead_code)] // wired to keys in the next change
     fn select_last_tab(&mut self) {
         let Some(back) = self.tab_back else {
             return;
@@ -4012,7 +4024,6 @@ impl App {
 
     /// Moves focus left or right, going on to the neighbouring tab at the
     /// grid's edge, and staying put past the first or last tab.
-    #[allow(dead_code)] // wired to keys in the next change
     fn focus_or_tab(&mut self, direction: Direction) {
         let before = self.state.focused_pane();
         self.focus_direction(direction);
@@ -5195,6 +5206,106 @@ mod tests {
         app.focus_pane(panes[1]);
         assert_eq!(app.current_tab(), 1);
         assert_eq!(app.panes_on_tab(), panes[1..].to_vec());
+    }
+
+    fn key_with(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+        app.handle(
+            &Event::Key(KeyEvent::new(code, modifiers)),
+            Size::new(100, 30),
+        )
+        .expect("a keystroke is handled");
+    }
+
+    #[test]
+    fn ctrl_t_then_n_asks_for_a_new_tab_after_the_one_on_screen() {
+        let (mut app, project, daemon, sent) = attached_app_with_shell();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes]);
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            placed(&sent),
+            Some(Placement::NewAfter { tab: Some(tabs[0]) })
+        );
+    }
+
+    #[test]
+    fn a_tab_mode_key_that_opens_the_picker_hands_it_the_keyboard() {
+        let (mut app, project, daemon, _sent) = attached_app_with_shell();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        send_tabs(&mut app, &daemon, project, &[&panes]);
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('n'));
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(
+            matches!(app.overlay, Some(Overlay::Harness(_))),
+            "x went to the picker, not to closing a tab"
+        );
+    }
+
+    #[test]
+    fn a_click_ends_tab_mode() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        spawn_several(&mut app, &daemon, project, 1);
+        let mut terminal = a_terminal();
+        drawn(&mut app, &mut terminal);
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        click(&mut app, 2, 5);
+
+        assert_eq!(app.router.key_mode(), KeyMode::Normal);
+    }
+
+    #[test]
+    fn tab_mode_arrows_step_along_the_tabs() {
+        let (mut app, project, daemon, _sent) = attached_app();
+        let panes = spawn_several(&mut app, &daemon, project, 3);
+        send_tabs(
+            &mut app,
+            &daemon,
+            project,
+            &[&panes[..1], &panes[1..2], &panes[2..]],
+        );
+        app.focus_pane(panes[0]);
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+
+        assert_eq!(app.current_tab(), 2);
+        assert_eq!(app.router.key_mode(), KeyMode::Tabs, "still stepping");
+    }
+
+    #[test]
+    fn alt_n_opens_the_picker_for_this_tab() {
+        let (mut app, project, daemon, sent) = attached_app_with_shell();
+        let panes = spawn_several(&mut app, &daemon, project, 1);
+        let tabs = send_tabs(&mut app, &daemon, project, &[&panes]);
+
+        key_with(&mut app, KeyCode::Char('n'), KeyModifiers::ALT);
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(placed(&sent), Some(Placement::Into { tab: tabs[0] }));
+    }
+
+    #[test]
+    fn ctrl_t_twice_types_ctrl_t_into_the_pane() {
+        let (mut app, project, daemon, sent) = attached_app();
+        let pane = spawn_several(&mut app, &daemon, project, 1)[0];
+
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        key_with(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+        assert!(sent.try_iter().any(|message| matches!(
+            message,
+            ClientMessage::WritePane { pane: p, bytes } if p == pane && bytes == [0x14]
+        )));
     }
 
     #[test]

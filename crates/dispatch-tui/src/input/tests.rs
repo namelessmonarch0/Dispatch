@@ -278,3 +278,162 @@ fn a_paste_is_delivered_as_text() {
         Action::Paste("two words".into())
     );
 }
+
+fn ctrl_t() -> Event {
+    press_with(KeyCode::Char('t'), KeyModifiers::CONTROL)
+}
+
+fn alt(code: KeyCode) -> Event {
+    press_with(code, KeyModifiers::ALT)
+}
+
+fn mouse_down() -> Event {
+    Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton_::Left),
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+#[test]
+fn ctrl_t_enters_tab_mode_and_sends_nothing() {
+    let mut router = router();
+
+    assert_eq!(router.handle(&ctrl_t(), &[]), Action::None);
+    assert_eq!(router.key_mode(), KeyMode::Tabs);
+}
+
+#[test]
+fn every_tab_mode_key_is_bound_and_says_whether_the_mode_stays() {
+    let cases = [
+        (KeyCode::Char('n'), Action::NewTab, KeyMode::Normal),
+        (KeyCode::Char('r'), Action::RenameTab, KeyMode::Normal),
+        (KeyCode::Char('x'), Action::CloseTab, KeyMode::Normal),
+        (KeyCode::Left, Action::PreviousTab, KeyMode::Tabs),
+        (KeyCode::Char('h'), Action::PreviousTab, KeyMode::Tabs),
+        (KeyCode::Right, Action::NextTab, KeyMode::Tabs),
+        (KeyCode::Char('l'), Action::NextTab, KeyMode::Tabs),
+        (KeyCode::Char('['), Action::MovePaneLeft, KeyMode::Tabs),
+        (KeyCode::Char(']'), Action::MovePaneRight, KeyMode::Tabs),
+        (KeyCode::Char('i'), Action::MoveTabLeft, KeyMode::Tabs),
+        (KeyCode::Char('o'), Action::MoveTabRight, KeyMode::Tabs),
+        (KeyCode::Char('3'), Action::SelectTab(2), KeyMode::Normal),
+        (KeyCode::Tab, Action::LastTab, KeyMode::Normal),
+        (KeyCode::Esc, Action::None, KeyMode::Normal),
+        (KeyCode::Enter, Action::None, KeyMode::Normal),
+    ];
+
+    for (code, action, after) in cases {
+        let mut router = router();
+        router.handle(&ctrl_t(), &[]);
+
+        assert_eq!(
+            router.handle(&press(code), &[]),
+            action,
+            "tab mode then {code:?}"
+        );
+        assert_eq!(router.key_mode(), after, "the mode after {code:?}");
+    }
+}
+
+#[test]
+fn any_other_key_in_tab_mode_is_ignored_and_the_mode_stays() {
+    // A stray key must neither reach a pane nor drop the user out of what
+    // they were doing.
+    let mut router = router();
+    router.handle(&ctrl_t(), &[]);
+
+    for event in [
+        press(KeyCode::Char('q')),
+        press(KeyCode::Char('z')),
+        ctrl_a(),
+        alt(KeyCode::Char('n')),
+    ] {
+        assert_eq!(router.handle(&event, &[]), Action::None);
+    }
+    assert_eq!(router.key_mode(), KeyMode::Tabs);
+}
+
+#[test]
+fn ctrl_t_twice_sends_ctrl_t_to_the_pane() {
+    // Claude Code's task list and a shell's fzf both use it.
+    let mut router = router();
+    router.handle(&ctrl_t(), &[]);
+
+    assert_eq!(
+        router.handle(&ctrl_t(), &[]),
+        Action::SendKey(
+            Key::Char('t'),
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            }
+        )
+    );
+    assert_eq!(router.key_mode(), KeyMode::Normal);
+}
+
+#[test]
+fn a_click_ends_tab_mode() {
+    let mut router = router();
+    router.handle(&ctrl_t(), &[]);
+
+    router.handle(&mouse_down(), &[]);
+
+    assert_eq!(router.key_mode(), KeyMode::Normal);
+}
+
+#[test]
+fn tab_mode_does_not_start_while_the_prefix_is_armed() {
+    let mut router = router();
+    router.handle(&ctrl_a(), &[]);
+
+    assert_eq!(router.handle(&ctrl_t(), &[]), Action::None);
+    assert_eq!(router.key_mode(), KeyMode::Normal);
+}
+
+#[test]
+fn the_direct_alt_keys_reach_dispatch() {
+    let cases = [
+        (KeyCode::Char('n'), Action::NewPane),
+        (KeyCode::Char('i'), Action::MoveTabLeft),
+        (KeyCode::Char('o'), Action::MoveTabRight),
+        (KeyCode::Left, Action::FocusOrTab(Direction::Left)),
+        (KeyCode::Char('h'), Action::FocusOrTab(Direction::Left)),
+        (KeyCode::Right, Action::FocusOrTab(Direction::Right)),
+        (KeyCode::Char('l'), Action::FocusOrTab(Direction::Right)),
+        (KeyCode::Up, Action::FocusDirection(Direction::Up)),
+        (KeyCode::Char('k'), Action::FocusDirection(Direction::Up)),
+        (KeyCode::Down, Action::FocusDirection(Direction::Down)),
+        (KeyCode::Char('j'), Action::FocusDirection(Direction::Down)),
+    ];
+
+    for (code, expected) in cases {
+        let mut router = router();
+        assert_eq!(router.handle(&alt(code), &[]), expected, "Alt {code:?}");
+    }
+}
+
+#[test]
+fn an_alt_key_dispatch_does_not_bind_still_reaches_the_pane() {
+    let mut router = router();
+
+    assert_eq!(
+        router.handle(&alt(KeyCode::Char('b')), &[]),
+        Action::SendKey(
+            Key::Char('b'),
+            Modifiers {
+                alt: true,
+                ..Modifiers::NONE
+            }
+        )
+    );
+    assert!(matches!(
+        router.handle(
+            &press_with(KeyCode::Char('N'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+            &[]
+        ),
+        Action::SendKey(..)
+    ));
+}
